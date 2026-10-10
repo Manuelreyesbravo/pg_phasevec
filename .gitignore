@@ -4,3 +4,5 @@ regression.*
 dist/
 reader/muninn-reader
 .modelos/
+reader/probe-caps
+reader/probe-parity
