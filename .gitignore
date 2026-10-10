@@ -2,3 +2,5 @@ results/
 regression.*
 .testcluster/
 dist/
+reader/muninn-reader
+.modelos/

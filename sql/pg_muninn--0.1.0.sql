@@ -364,6 +364,17 @@ BEGIN
 END;
 $$;
 
+-- What a reader process must prove before it writes: the sha256 of the weights it loaded. A process
+-- that loaded other weights refuses to start, so nothing is recorded in a reader's name by a
+-- different model.
+CREATE FUNCTION muninn.reader_seal(p_reader text)
+RETURNS TABLE (model_sha text, adapter_sha text, dims int)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT r.model_sha, r.adapter_sha, r.dims FROM muninn.readers r WHERE r.name = p_reader;
+$$;
+
 -- A reading is accepted only if it is of the text the row says NOW, by the watch's reader.
 CREATE FUNCTION muninn.record(p_watch text, p_key text, p_reader text, p_text_hash bytea,
                               p_code64 bigint, p_code smallint[], p_familiarity real DEFAULT NULL)
@@ -534,7 +545,7 @@ REVOKE ALL ON FUNCTION muninn._watch(text), muninn._note(int, text, bytea), muni
     muninn.record_failure(text, text, text, bytea, text),
     muninn.next(text, int), muninn.coverage(text),
     muninn.find(text, bigint, smallint[], int, boolean, int), muninn.alike(text, text, int, boolean),
-    muninn._on_drop()
+    muninn._on_drop(), muninn.reader_seal(text)
   FROM PUBLIC;
 -- The watch trigger runs as whoever writes the table, so these two must be callable by anyone; they
 -- refuse to run outside a trigger.
