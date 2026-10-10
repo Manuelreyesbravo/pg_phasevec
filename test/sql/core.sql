@@ -83,6 +83,27 @@ SELECT muninn.reader_switch('docs', 'r2');
 SELECT state, n, share FROM muninn.coverage('docs') WHERE n > 0;
 SELECT * FROM muninn.find('docs', 1, ARRAY[90,10,0,0]::smallint[]);
 
+-- ------------------------------------------------ the manifest contract (a trained reader)
+\set m '{"reader":"vec","version":"0.1.0","base_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","adapter_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","heads_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","marker":"<v>","pooling":"none","read_at":"last_marker_token","mrl_dims":[4096,1024,256,64],"query_instruction":"Query: "}'
+-- the base must be sealed by whoever serves it
+SELECT muninn.reader_register(jsonb_set(:'m'::jsonb, '{base_sha256}', 'null'));
+-- not the marker contract
+SELECT muninn.reader_register(jsonb_set(:'m'::jsonb, '{pooling}', '"last"'));
+-- no 64-dim prefix: there would be no binary code
+SELECT muninn.reader_register(jsonb_set(:'m'::jsonb, '{mrl_dims}', '[4096,1024]'));
+-- a heads sha that is not a sha
+SELECT muninn.reader_register(jsonb_set(:'m'::jsonb, '{heads_sha256}', '"x"'));
+-- control: the same manifest, sealed, registers; it keeps the 1024 prefix and its heads
+SELECT muninn.reader_register(:'m'::jsonb) > 0 AS registered;
+SELECT name, dims, left(heads_sha, 4) AS heads, manifest->>'marker' AS marker FROM muninn.readers WHERE name = 'vec-0.1.0';
+SELECT left(model_sha, 4) AS model, left(adapter_sha, 4) AS adapter, dims, left(heads_sha, 4) AS heads,
+       manifest->>'query_instruction' AS instruction
+  FROM muninn.reader_seal('vec-0.1.0');
+-- the same weights cannot be registered twice under another version
+SELECT muninn.reader_register(jsonb_set(:'m'::jsonb, '{version}', '"0.1.1"'));
+-- different heads are a different reader
+SELECT muninn.reader_register(jsonb_set(jsonb_set(:'m'::jsonb, '{version}', '"0.1.1"'), '{heads_sha256}', to_jsonb(repeat('f', 64)))) > 0 AS other_heads;
+
 -- ------------------------------------------------ only the table's owner may watch it
 CREATE ROLE regress_muninn_stranger;
 GRANT USAGE ON SCHEMA muninn TO regress_muninn_stranger;

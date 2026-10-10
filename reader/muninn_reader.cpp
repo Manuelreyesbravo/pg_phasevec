@@ -11,14 +11,25 @@
 // No HTTP, no service in between: the model runs in this process, and the database is the only
 // authority on what to read and on whether a reading still holds.
 //
-//   muninn-reader --model M.gguf [--lora A.gguf] --reader NAME --register [--dims D]  register the reader
-//   muninn-reader --model M.gguf [--lora A.gguf] --reader NAME --watch W [--once]     read for a watch
-//   muninn-reader --model M.gguf [--lora A.gguf] --reader NAME --ask "question"       print a question's codes
+// Two ways to read:
+//   pooled    an off-the-shelf embedding model: llama.cpp pools the sequence (--pooling last|mean).
+//   contract  a reader trained for Muninn (--heads): the text is closed by the reader's marker, the
+//             state is taken at the marker's last token, and the reader's own heads turn it into the
+//             vector (projection, Matryoshka prefix) and into a familiarity score. Marker and query
+//             instruction come from the manifest sealed in the database, never from the command line.
+//
+//   muninn-reader --model M.gguf [--lora A.gguf] --reader NAME --register [--dims D]
+//   muninn-reader --model M.gguf --lora A.gguf --heads H.gguf --register --manifest manifest.json
+//   muninn-reader --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --watch W [--once]
+//   muninn-reader --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
+//   muninn-reader ... --reader NAME --ask-file questions.txt   one question per line, one code per line
 //
 // The database connection comes from the usual PG* environment variables (or --dsn).
 
-#include <llama.h>
+#include <ggml.h>
+#include <gguf.h>
 #include <libpq-fe.h>
+#include <llama.h>
 
 #include <algorithm>
 #include <array>
@@ -27,8 +38,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <sys/select.h>
 #include <vector>
@@ -36,7 +49,7 @@
 namespace {
 
 struct Options {
-    std::string model, lora, reader, watch, dsn, ask, query_prefix, pooling = "last";
+    std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, query_prefix, pooling = "last";
     int dims = 0, batch = 32, ctx = 512, gpu_layers = 99;
     bool once = false, do_register = false;
 };
@@ -56,10 +69,13 @@ Options parse(int argc, char **argv) {
         };
         if (a == "--model") o.model = next();
         else if (a == "--lora") o.lora = next();
+        else if (a == "--heads") o.heads = next();
+        else if (a == "--manifest") o.manifest = next();
         else if (a == "--reader") o.reader = next();
         else if (a == "--watch") o.watch = next();
         else if (a == "--dsn") o.dsn = next();
         else if (a == "--ask") o.ask = next();
+        else if (a == "--ask-file") o.ask_file = next();
         else if (a == "--query-prefix") o.query_prefix = next();
         else if (a == "--pooling") o.pooling = next();
         else if (a == "--dims") o.dims = std::stoi(next());
@@ -70,8 +86,13 @@ Options parse(int argc, char **argv) {
         else if (a == "--register") o.do_register = true;
         else die("unknown option " + a);
     }
-    if (o.model.empty() || o.reader.empty()) die("--model and --reader are required");
+    if (o.model.empty()) die("--model is required");
+    if (!o.manifest.empty() && (!o.do_register || o.heads.empty() || o.lora.empty()))
+        die("--manifest is for --register, with the --lora and --heads it names");
+    if (o.reader.empty() && o.manifest.empty()) die("--reader is required");
     if (o.pooling != "last" && o.pooling != "mean") die("--pooling is last or mean");
+    if (!o.heads.empty() && !o.query_prefix.empty())
+        die("a contract reader takes its query instruction from its manifest, not from --query-prefix");
     return o;
 }
 
@@ -91,25 +112,98 @@ std::string sha256_of(const std::string &path) {
     return std::string(hex.data());
 }
 
+// ------------------------------------------------------------------- the heads --
+
+// The two small heads a contract reader ships next to its adapter (vec-heads.gguf): a projection whose
+// prefixes are the Matryoshka dimensions, and a scalar familiarity head.
+struct Heads {
+    int in = 0, out = 0;
+    std::vector<float> proj, bias, fam;
+    float fam_bias = 0;
+
+    explicit Heads(const std::string &path) {
+        ggml_context *meta = nullptr;
+        gguf_init_params gp{false, &meta};
+        gguf_context *g = gguf_init_from_file(path.c_str(), gp);
+        if (!g || !meta) die("cannot read heads " + path);
+        auto tensor = [&](const char *name) {
+            ggml_tensor *t = ggml_get_tensor(meta, name);
+            if (!t) die(std::string("heads file has no tensor ") + name);
+            return t;
+        };
+        auto floats = [&](ggml_tensor *t) {
+            std::vector<float> v(ggml_nelements(t));
+            if (t->type == GGML_TYPE_F32) std::memcpy(v.data(), t->data, v.size() * sizeof(float));
+            else if (t->type == GGML_TYPE_F16) ggml_fp16_to_fp32_row((const ggml_fp16_t *)t->data, v.data(), (int64_t)v.size());
+            else die(std::string("unsupported tensor type in heads: ") + ggml_get_name(t));
+            return v;
+        };
+        ggml_tensor *w = tensor("vec.proj.weight");
+        in = (int)w->ne[0];
+        out = (int)w->ne[1];
+        proj = floats(w);
+        bias = floats(tensor("vec.proj.bias"));
+        fam = floats(tensor("fam.weight"));
+        std::vector<float> fb = floats(tensor("fam.bias"));
+        if ((int)bias.size() != out || (int)fam.size() != in || fb.size() != 1) die("heads have inconsistent shapes");
+        fam_bias = fb[0];
+        int64_t key = gguf_find_key(g, "muninn.layer");
+        if (key >= 0 && gguf_get_val_i32(g, key) != -1)
+            die("these heads read an intermediate layer; this reader serves layer -1 only");
+        gguf_free(g);
+        ggml_free(meta);
+    }
+
+    // The first `dims` outputs of the projection: a Matryoshka prefix needs no more rows than that.
+    std::vector<float> project(const float *h, int dims) const {
+        std::vector<float> v(dims);
+        for (int o = 0; o < dims; o++) {
+            const float *row = proj.data() + (size_t)o * in;
+            double acc = bias[o];
+            for (int i = 0; i < in; i++) acc += (double)row[i] * h[i];
+            v[o] = (float)acc;
+        }
+        return v;
+    }
+
+    float familiarity(const float *h) const {
+        double acc = fam_bias;
+        for (int i = 0; i < in; i++) acc += (double)fam[i] * h[i];
+        return (float)(1.0 / (1.0 + std::exp(-acc)));
+    }
+};
+
 // ------------------------------------------------------------------- the model --
+
+struct Reading {
+    std::vector<float> v;   // unit vector, `dims` long; empty if nothing could be read
+    std::optional<float> familiarity;
+};
 
 struct Reader {
     llama_model *model = nullptr;
     llama_context *ctx = nullptr;
     const llama_vocab *vocab = nullptr;
+    std::unique_ptr<Heads> heads;
     int n_embd = 0;
     int dims = 0;
     int max_tokens = 512;
+    std::vector<llama_token> marker;   // contract readers only, set from the sealed manifest
+    std::string query_instruction;
 
     explicit Reader(const Options &o) {
         llama_backend_init();
+        llama_log_set([](ggml_log_level level, const char *text, void *) {
+            if (level >= GGML_LOG_LEVEL_ERROR) std::fputs(text, stderr);
+        }, nullptr);
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = o.gpu_layers;
         model = llama_model_load_from_file(o.model.c_str(), mp);
         if (!model) die("cannot load " + o.model);
         auto cp = llama_context_default_params();
         cp.embeddings = true;
-        cp.pooling_type = o.pooling == "mean" ? LLAMA_POOLING_TYPE_MEAN : LLAMA_POOLING_TYPE_LAST;
+        cp.pooling_type = !o.heads.empty() ? LLAMA_POOLING_TYPE_NONE
+                        : o.pooling == "mean" ? LLAMA_POOLING_TYPE_MEAN : LLAMA_POOLING_TYPE_LAST;
         cp.n_ctx = o.ctx;
         cp.n_batch = o.ctx;
         cp.n_ubatch = o.ctx;
@@ -124,8 +218,14 @@ struct Reader {
         }
         vocab = llama_model_get_vocab(model);
         n_embd = llama_model_n_embd(model);
-        dims = o.dims > 0 ? o.dims : n_embd;
-        if (dims > n_embd) die("--dims is larger than the model's embedding size");
+        int width = n_embd;
+        if (!o.heads.empty()) {
+            heads = std::make_unique<Heads>(o.heads);
+            if (heads->in != n_embd) die("the heads expect a model of width " + std::to_string(heads->in));
+            width = heads->out;
+        }
+        dims = o.dims > 0 ? o.dims : std::min(width, heads ? 1024 : width);
+        if (dims > width) die("--dims is larger than what the reader produces");
         if (dims < 64) die("a reading needs at least 64 dimensions for its 64-bit code");
         max_tokens = o.ctx;
     }
@@ -134,46 +234,71 @@ struct Reader {
         if (model) llama_model_free(model);
     }
 
-    // The unit vector of a text, truncated to `dims` and renormalized (Matryoshka). Empty if the text
-    // has no tokens or the model gives nothing.
-    std::vector<float> read(const std::string &text) {
-        std::vector<llama_token> toks(max_tokens);
-        int n = llama_tokenize(vocab, text.data(), (int32_t)text.size(), toks.data(), max_tokens, true, false);
-        if (n < 0) {
-            // too long: keep the head, which is where a recipe puts what matters
-            toks.resize(-n);
-            n = llama_tokenize(vocab, text.data(), (int32_t)text.size(), toks.data(), (int32_t)toks.size(), true, false);
-            if (n < 0) return {};
-            toks.resize(std::min(n, max_tokens));
-            n = (int)toks.size();
-        } else {
-            toks.resize(n);
-        }
-        if (n == 0) return {};
+    std::vector<llama_token> tokenize(const std::string &text, bool special) const {
+        int n = -llama_tokenize(vocab, text.data(), (int32_t)text.size(), nullptr, 0, special, false);
+        std::vector<llama_token> t(n > 0 ? n : 0);
+        if (n > 0) llama_tokenize(vocab, text.data(), (int32_t)text.size(), t.data(), n, special, false);
+        return t;
+    }
 
-        llama_memory_clear(llama_get_memory(ctx), true);
-        llama_batch b = llama_batch_init(n, 0, 1);
-        for (int i = 0; i < n; i++) {
-            b.token[i] = toks[i];
-            b.pos[i] = i;
-            b.n_seq_id[i] = 1;
-            b.seq_id[i][0] = 0;
-            b.logits[i] = (i == n - 1);
-        }
-        b.n_tokens = n;
-        int rc = llama_decode(ctx, b);
-        llama_batch_free(b);
-        if (rc != 0) return {};
+    void set_contract(const std::string &marker_text, const std::string &instruction) {
+        marker = tokenize(marker_text, false);
+        if (marker.empty()) die("the reader's marker has no tokens");
+        query_instruction = instruction;
+    }
 
-        const float *e = llama_get_embeddings_seq(ctx, 0);
-        if (!e) return {};
-        std::vector<float> v(e, e + dims);
+    static std::vector<float> unit(std::vector<float> v) {
         double norm = 0;
         for (float x : v) norm += (double)x * x;
         norm = std::sqrt(norm);
         if (norm == 0) return {};
         for (float &x : v) x = (float)(x / norm);
         return v;
+    }
+
+    bool decode(const std::vector<llama_token> &toks, bool output_all_last) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        int n = (int)toks.size();
+        llama_batch b = llama_batch_init(n, 0, 1);
+        for (int i = 0; i < n; i++) {
+            b.token[i] = toks[i];
+            b.pos[i] = i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = output_all_last && i == n - 1;
+        }
+        b.n_tokens = n;
+        int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        return rc == 0;
+    }
+
+    // A document piece, or a question when `query` is set.
+    Reading read(const std::string &text, bool query = false) {
+        if (heads) return read_contract(query ? query_instruction + text : text);
+        auto toks = tokenize(text, true);
+        if (toks.empty()) return {};
+        // too long: keep the head, which is where a recipe puts what matters
+        if ((int)toks.size() > max_tokens) toks.resize(max_tokens);
+        if (!decode(toks, true)) return {};
+        const float *e = llama_get_embeddings_seq(ctx, 0);
+        if (!e) return {};
+        return {unit(std::vector<float>(e, e + dims)), std::nullopt};
+    }
+
+    // The contract: the piece tokenized without special tokens, closed by the marker, read at the
+    // marker's last token (layer -1, the final normed state), turned into a vector by the heads.
+    Reading read_contract(const std::string &text) {
+        if (marker.empty()) die("internal: contract reader without its manifest");
+        auto toks = tokenize(text, false);
+        if (toks.empty()) return {};
+        size_t room = (size_t)max_tokens - marker.size();
+        if (toks.size() > room) toks.resize(room);
+        toks.insert(toks.end(), marker.begin(), marker.end());
+        if (!decode(toks, true)) return {};
+        const float *h = llama_get_embeddings_ith(ctx, -1);
+        if (!h) return {};
+        return {unit(heads->project(h, dims)), heads->familiarity(h)};
     }
 };
 
@@ -227,17 +352,45 @@ struct Db {
     }
 };
 
-void check_seal(Db &db, const Options &o, const Reader &rd, const std::string &model_sha, const std::string &adapter_sha) {
+struct Seal {
+    std::string model_sha, adapter_sha, heads_sha;
+};
+
+// Proves the loaded weights are the registered ones and, for a contract reader, takes its marker and
+// query instruction from the sealed manifest.
+void check_seal(Db &db, const Options &o, Reader &rd, const Seal &have) {
     PGresult *r = nullptr;
-    if (auto err = db.exec("SELECT model_sha, coalesce(adapter_sha, ''), dims FROM muninn.reader_seal($1)", {o.reader}, &r))
+    if (auto err = db.exec("SELECT model_sha, coalesce(adapter_sha, ''), dims, coalesce(heads_sha, ''), "
+                           "coalesce(manifest->>'marker', ''), coalesce(manifest->>'query_instruction', '') "
+                           "FROM muninn.reader_seal($1)", {o.reader}, &r))
         die("cannot read the seal of reader " + o.reader + ": " + *err);
     if (PQntuples(r) != 1) die("no reader named " + o.reader + " (register it with --register)");
-    std::string m = PQgetvalue(r, 0, 0), a = PQgetvalue(r, 0, 1);
+    std::string m = PQgetvalue(r, 0, 0), a = PQgetvalue(r, 0, 1), h = PQgetvalue(r, 0, 3);
     int dims = std::atoi(PQgetvalue(r, 0, 2));
+    std::string marker = PQgetvalue(r, 0, 4), instruction = PQgetvalue(r, 0, 5);
     PQclear(r);
-    if (m != model_sha || a != adapter_sha)
+    if (m != have.model_sha || a != have.adapter_sha || h != have.heads_sha)
         die("the weights loaded are not the ones reader " + o.reader + " was registered with: refusing to read in its name");
     if (dims != rd.dims) die("reader " + o.reader + " was registered with " + std::to_string(dims) + " dimensions");
+    if (rd.heads) {
+        if (marker.empty()) die("reader " + o.reader + " has heads but its manifest names no marker");
+        rd.set_contract(marker, instruction);
+    }
+}
+
+std::string read_file(const std::string &path) {
+    std::ifstream f(path);
+    if (!f) die("cannot read " + path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+std::string familiarity_param(const Reading &r) {
+    if (!r.familiarity) return "";
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.6g", *r.familiarity);
+    return buf;
 }
 
 void wait_for_notify(Db &db, int seconds) {
@@ -255,32 +408,65 @@ void wait_for_notify(Db &db, int seconds) {
 
 int main(int argc, char **argv) {
     Options o = parse(argc, argv);
-    std::string model_sha = sha256_of(o.model);
-    std::string adapter_sha = o.lora.empty() ? "" : sha256_of(o.lora);
+    Seal have{sha256_of(o.model), o.lora.empty() ? "" : sha256_of(o.lora),
+              o.heads.empty() ? "" : sha256_of(o.heads)};
     Reader rd(o);
-
-    if (!o.ask.empty()) {
-        auto v = rd.read(o.query_prefix + o.ask);
-        if (v.empty()) die("the question has no tokens");
-        std::printf("%lld\t%s\n", (long long)code64(v), code_literal(v).c_str());
-        return 0;
-    }
-
     Db db(o.dsn);
+
     if (o.do_register) {
         PGresult *r = nullptr;
+        if (!o.manifest.empty()) {
+            // The manifest names adapter and heads; the base is sealed here, from the file loaded.
+            if (auto err = db.exec("SELECT $1::jsonb->>'adapter_sha256' = $2 AND $1::jsonb->>'heads_sha256' = $3",
+                                   {read_file(o.manifest), have.adapter_sha, have.heads_sha}, &r))
+                die("cannot read the manifest: " + *err);
+            bool match = std::string(PQgetvalue(r, 0, 0)) == "t";
+            PQclear(r);
+            if (!match) die("the --lora/--heads loaded are not the ones the manifest names: refusing to register");
+            if (auto err = db.exec("SELECT muninn.reader_register(jsonb_set($1::jsonb, '{base_sha256}', to_jsonb($2::text))), "
+                                   "($1::jsonb->>'reader') || '-' || ($1::jsonb->>'version')",
+                                   {read_file(o.manifest), have.model_sha}, &r))
+                die("cannot register: " + *err);
+            std::printf("registered reader %s (base %s, adapter %s, heads %s)\n", PQgetvalue(r, 0, 1),
+                        have.model_sha.substr(0, 12).c_str(), have.adapter_sha.substr(0, 12).c_str(),
+                        have.heads_sha.substr(0, 12).c_str());
+            PQclear(r);
+            return 0;
+        }
+        if (rd.heads) die("a reader with heads registers through its --manifest");
         if (auto err = db.exec("SELECT muninn.reader_register($1, $2, $3::int, nullif($4, ''), "
                                "jsonb_build_object('pooling', $5::text, 'ctx', $6::int, 'query_prefix', $7::text))",
-                               {o.reader, model_sha, std::to_string(rd.dims), adapter_sha, o.pooling,
+                               {o.reader, have.model_sha, std::to_string(rd.dims), have.adapter_sha, o.pooling,
                                 std::to_string(o.ctx), o.query_prefix}, &r))
             die("cannot register: " + *err);
-        std::printf("registered reader %s (model %s, %d dimensions)\n", o.reader.c_str(), model_sha.substr(0, 12).c_str(), rd.dims);
+        std::printf("registered reader %s (model %s, %d dimensions)\n", o.reader.c_str(),
+                    have.model_sha.substr(0, 12).c_str(), rd.dims);
         PQclear(r);
         return 0;
     }
 
+    check_seal(db, o, rd, have);
+
+    if (!o.ask.empty()) {
+        Reading q = rd.read(o.query_prefix + o.ask, true);
+        if (q.v.empty()) die("the question has no tokens");
+        std::printf("%lld\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str());
+        return 0;
+    }
+    if (!o.ask_file.empty()) {
+        // The model loads once; each line is a question and gets its codes on the same line number.
+        std::ifstream f(o.ask_file);
+        if (!f) die("cannot read " + o.ask_file);
+        std::string line;
+        while (std::getline(f, line)) {
+            Reading q = line.empty() ? Reading{} : rd.read(o.query_prefix + line, true);
+            if (q.v.empty()) std::printf("\t\n");
+            else std::printf("%lld\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str());
+        }
+        return 0;
+    }
+
     if (o.watch.empty()) die("--watch, --register or --ask is required");
-    check_seal(db, o, rd, model_sha, adapter_sha);
     if (auto err = db.exec("LISTEN muninn", {})) die("cannot listen: " + *err);
 
     long read_ok = 0, refused = 0, failed = 0;
@@ -294,15 +480,16 @@ int main(int argc, char **argv) {
             std::string key = PQgetvalue(r, i, 0);
             std::string body = PQgetisnull(r, i, 1) ? "" : PQgetvalue(r, i, 1);
             std::string hash = PQgetvalue(r, i, 2);
-            auto v = body.empty() ? std::vector<float>{} : rd.read(body);
+            Reading rdg = body.empty() ? Reading{} : rd.read(body);
             std::optional<std::string> err;
-            if (v.empty()) {
+            if (rdg.v.empty()) {
                 err = db.exec("SELECT muninn.record_failure($1, $2, $3, $4::bytea, $5)",
                               {o.watch, key, o.reader, hash, body.empty() ? "empty text" : "the model produced no reading"});
                 if (!err) failed++;
             } else {
-                err = db.exec("SELECT muninn.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[])",
-                              {o.watch, key, o.reader, hash, std::to_string(code64(v)), code_literal(v)});
+                err = db.exec("SELECT muninn.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[], nullif($7, '')::real)",
+                              {o.watch, key, o.reader, hash, std::to_string(code64(rdg.v)), code_literal(rdg.v),
+                               familiarity_param(rdg)});
                 if (!err) read_ok++;
             }
             if (err) {

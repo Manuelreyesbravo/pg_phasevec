@@ -49,11 +49,12 @@ CREATE TABLE muninn.readers (
     name          text NOT NULL UNIQUE CHECK (name <> ''),
     model_sha     text NOT NULL CHECK (model_sha ~ '^[0-9a-f]{64}$'),
     adapter_sha   text CHECK (adapter_sha ~ '^[0-9a-f]{64}$'),
+    heads_sha     text CHECK (heads_sha ~ '^[0-9a-f]{64}$'),
     dims          int  NOT NULL CHECK (dims BETWEEN 1 AND 8192),
     manifest      jsonb NOT NULL DEFAULT '{}',
     registered_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
     registered_by text NOT NULL DEFAULT current_user,
-    UNIQUE (model_sha, adapter_sha)
+    UNIQUE NULLS NOT DISTINCT (model_sha, adapter_sha, heads_sha)
 );
 COMMENT ON TABLE muninn.readers IS
     'Sealed readers: a model is identified by the sha256 of its weights (and of its adapter). Readings by different readers are never compared.';
@@ -258,6 +259,67 @@ AS $$
     RETURNING id;
 $$;
 
+-- A reader trained against the vec contract arrives as its manifest (train_vec_branch.py export).
+-- The manifest names the adapter and heads by sha256; the base model's sha256 is filled in by
+-- whoever serves it (muninn-reader --register --manifest hashes the GGUF it actually loaded), so a
+-- manifest still carrying base_sha256 = null is refused: an unsealed base is not a reader.
+CREATE FUNCTION muninn.reader_register(p_manifest jsonb)
+RETURNS int
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    hex  constant text := '^[0-9a-f]{64}$';
+    dims int;
+BEGIN
+    IF jsonb_typeof(p_manifest) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'muninn: a manifest is a JSON object';
+    END IF;
+    IF coalesce(p_manifest->>'reader', '') = '' OR coalesce(p_manifest->>'version', '') = '' THEN
+        RAISE EXCEPTION 'muninn: the manifest needs reader and version';
+    END IF;
+    IF coalesce(p_manifest->>'base_sha256', '') !~ hex THEN
+        RAISE EXCEPTION 'muninn: base_sha256 is not sealed'
+            USING HINT = 'Register through muninn-reader --register --manifest, which hashes the GGUF it serves.';
+    END IF;
+    IF coalesce(p_manifest->>'adapter_sha256', '') !~ hex THEN
+        RAISE EXCEPTION 'muninn: adapter_sha256 must be a sha256';
+    END IF;
+    IF p_manifest ? 'heads_sha256' AND coalesce(p_manifest->>'heads_sha256', '') !~ hex THEN
+        RAISE EXCEPTION 'muninn: heads_sha256 must be a sha256';
+    END IF;
+    IF coalesce(p_manifest->>'marker', '') = '' OR p_manifest->>'pooling' IS DISTINCT FROM 'none'
+       OR p_manifest->>'read_at' IS DISTINCT FROM 'last_marker_token' THEN
+        RAISE EXCEPTION 'muninn: this manifest is not of the marker contract (marker, pooling none, read_at last_marker_token)';
+    END IF;
+    IF jsonb_typeof(p_manifest->'mrl_dims') IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'muninn: the manifest needs mrl_dims';
+    END IF;
+    -- A reading keeps the 1024-dim prefix when the reader has one (the rerank code), else its widest.
+    SELECT CASE WHEN bool_or(d::int = 1024) THEN 1024 ELSE max(d::int) END INTO dims
+      FROM jsonb_array_elements_text(p_manifest->'mrl_dims') d;
+    IF dims IS NULL OR dims < 64 OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(p_manifest->'mrl_dims') d
+                                                WHERE d::int = 64) THEN
+        RAISE EXCEPTION 'muninn: mrl_dims must include 64 (the binary code) and at least one prefix to keep';
+    END IF;
+    RETURN muninn._reader_insert(
+        (p_manifest->>'reader') || '-' || (p_manifest->>'version'),
+        p_manifest->>'base_sha256', dims, p_manifest->>'adapter_sha256',
+        p_manifest->>'heads_sha256', p_manifest);
+END;
+$$;
+
+CREATE FUNCTION muninn._reader_insert(p_name text, p_model_sha text, p_dims int, p_adapter_sha text,
+                                      p_heads_sha text, p_manifest jsonb)
+RETURNS int
+LANGUAGE sql
+SET search_path = pg_catalog, pg_temp
+AS $$
+    INSERT INTO muninn.readers (name, model_sha, adapter_sha, heads_sha, dims, manifest)
+    VALUES (p_name, lower(p_model_sha), lower(p_adapter_sha), lower(p_heads_sha), p_dims, p_manifest)
+    RETURNING id;
+$$;
+
 -- Creating a watch installs a trigger on the table, so only the table's owner may do it, and it
 -- writes muninn.watches, which only the DBA is granted. Runs as its caller: the recipe is evaluated
 -- here, for the rows already in the table, with the owner's rights and nobody else's.
@@ -368,11 +430,11 @@ $$;
 -- that loaded other weights refuses to start, so nothing is recorded in a reader's name by a
 -- different model.
 CREATE FUNCTION muninn.reader_seal(p_reader text)
-RETURNS TABLE (model_sha text, adapter_sha text, dims int)
+RETURNS TABLE (model_sha text, adapter_sha text, dims int, heads_sha text, manifest jsonb)
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
-    SELECT r.model_sha, r.adapter_sha, r.dims FROM muninn.readers r WHERE r.name = p_reader;
+    SELECT r.model_sha, r.adapter_sha, r.dims, r.heads_sha, r.manifest FROM muninn.readers r WHERE r.name = p_reader;
 $$;
 
 -- A reading is accepted only if it is of the text the row says NOW, by the watch's reader.
@@ -539,7 +601,8 @@ CREATE EVENT TRIGGER muninn_watch_source_dropped ON sql_drop
 -- ---------------------------------------------------------------- privileges --
 -- Readers and askers are granted by the DBA. Nothing is open by default.
 REVOKE ALL ON FUNCTION muninn._watch(text), muninn._note(int, text, bytea), muninn._forget(int, text),
-    muninn._todo(text, int), muninn.reader_register(text, text, int, text, jsonb),
+    muninn._todo(text, int), muninn.reader_register(text, text, int, text, jsonb), muninn.reader_register(jsonb),
+    muninn._reader_insert(text, text, int, text, text, jsonb),
     muninn.watch(text, regclass, name, text, text, numeric, real), muninn.reader_switch(text, text),
     muninn.record(text, text, text, bytea, bigint, smallint[], real),
     muninn.record_failure(text, text, text, bytea, text),
