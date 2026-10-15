@@ -121,6 +121,23 @@ SELECT muninn.watch('w2', 'docs'::regclass, 'id', 'r.missing_column', 'r1');
 
 DROP OWNED BY regress_muninn_stranger;
 DROP ROLE regress_muninn_stranger;
+
+-- ------------------------------------------------ a reading the reader did not recognize is doubtful
+-- The seventh state: the text is current and the reading is the reader's, but its familiarity is
+-- under the watch's doubt_below. It still counts as covered and is still found, marked as such.
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes VALUES (1, 'known'), (2, 'invented');
+SELECT muninn.watch('notes', 'notes'::regclass, 'id', 'r.body', 'r1', 0.95, 0.5) > 0 AS watch;
+SELECT count(muninn.record('notes', n.key, 'r1', n.text_hash,
+                           CASE n.key WHEN '1' THEN 1 ELSE 2 END,
+                           CASE n.key WHEN '1' THEN ARRAY[100,0,0,0] ELSE ARRAY[90,10,0,0] END::smallint[],
+                           CASE n.key WHEN '1' THEN 0.9 ELSE 0.2 END::real)) AS recorded
+  FROM muninn.next('notes') n;
+-- control: the familiar reading is fresh; the other one, under 0.5, is doubtful
+SELECT key, state FROM muninn.reading_states WHERE watch = 'notes' ORDER BY key;
+SELECT state, n, share FROM muninn.coverage('notes') WHERE n > 0;
+SELECT key, state FROM muninn.find('notes', 2, ARRAY[90,10,0,0]::smallint[]) ORDER BY key;
+DROP TABLE notes;
 -- ------------------------------------------------ dropping the table drops its watch
 SELECT count(*) AS watches_before FROM muninn.watches;
 DROP TABLE docs;
