@@ -305,6 +305,7 @@ struct Heads {
 struct Reading {
     std::vector<float> v;   // unit vector, `dims` long; empty if nothing could be read
     std::optional<float> familiarity;
+    int tokens_read = 0, tokens_total = 0;   // of the text itself, marker and instruction aside
 };
 
 struct Reader {
@@ -405,12 +406,13 @@ struct Reader {
         if (heads) return read_contract(query ? query_instruction + text : text);
         auto toks = tokenize(text, true);
         if (toks.empty()) return {};
-        // too long: keep the head, which is where a recipe puts what matters
-        if ((int)toks.size() > max_tokens) toks.resize(max_tokens);
+        // too long: keep the head, which is where a recipe puts what matters, and say so
+        int total = (int)toks.size();
+        if (total > max_tokens) toks.resize(max_tokens);
         if (!decode(toks, true)) return {};
         const float *e = llama_get_embeddings_seq(ctx, 0);
         if (!e) return {};
-        return {unit(std::vector<float>(e, e + dims)), std::nullopt};
+        return {unit(std::vector<float>(e, e + dims)), std::nullopt, (int)toks.size(), total};
     }
 
     // The contract: the piece tokenized without special tokens, closed by the marker, read at the
@@ -420,12 +422,14 @@ struct Reader {
         auto toks = tokenize(text, false);
         if (toks.empty()) return {};
         size_t room = (size_t)max_tokens - marker.size();
+        int total = (int)toks.size();
         if (toks.size() > room) toks.resize(room);
+        int kept = (int)toks.size();
         toks.insert(toks.end(), marker.begin(), marker.end());
         if (!decode(toks, true)) return {};
         const float *h = llama_get_embeddings_ith(ctx, -1);
         if (!h) return {};
-        return {unit(heads->project(h, dims)), heads->familiarity(h)};
+        return {unit(heads->project(h, dims)), heads->familiarity(h), kept, total};
     }
 
     // A document read in place ("late chunking"): every piece tokenized without special tokens and
@@ -781,9 +785,10 @@ int main(int argc, char **argv) {
                 if (!err) failed++;
             } else {
                 err = db.exec("SELECT muninn.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[], "
-                              "nullif($7, '')::real, nullif($8, '')::bit(256))",
+                              "nullif($7, '')::real, nullif($8, '')::bit(256), $9::int, $10::int)",
                               {o.watch, key, o.reader, hash, std::to_string(code64(rdg.v)), code_literal(rdg.v),
-                               familiarity_param(rdg), code256(rdg.v)});
+                               familiarity_param(rdg), code256(rdg.v), std::to_string(rdg.tokens_read),
+                               std::to_string(rdg.tokens_total)});
                 if (!err) read_ok++;
             }
             if (err) {
