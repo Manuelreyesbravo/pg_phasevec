@@ -56,6 +56,7 @@
 #include <string>
 #include <chrono>
 #include <csignal>
+#include <poll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -700,47 +701,96 @@ std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line
     return head + body.substr(1);
 }
 
-// The asker: the weights stay loaded, questions arrive on a unix socket only its owner can open, and
-// are answered one at a time (one llama context). A connection may carry many questions.
-int serve(Db &db, const Options &o, Reader &rd) {
-    std::signal(SIGPIPE, SIG_IGN);
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (o.serve.size() >= sizeof addr.sun_path) die("socket path too long: " + o.serve);
-    std::strncpy(addr.sun_path, o.serve.c_str(), sizeof addr.sun_path - 1);
-    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (ls < 0) die("cannot create a socket");
-    unlink(o.serve.c_str());
-    mode_t old = umask(0177);
-    if (bind(ls, (sockaddr *)&addr, sizeof addr) < 0) die("cannot bind " + o.serve);
-    umask(old);
-    if (listen(ls, 16) < 0) die("cannot listen on " + o.serve);
-    std::fprintf(stderr, "muninn-reader: answering on %s for watch %s (reader %s)\n", o.serve.c_str(),
-                 o.watch.c_str(), o.reader.c_str());
-    for (;;) {
-        int c = accept(ls, nullptr, nullptr);
-        if (c < 0) continue;
+// The asker lives in the reading process: one model in memory (the CPU backend repacks the weights
+// into anonymous memory, so a second process would cost another 5 GB). Questions arrive on a unix
+// socket only its owner can open and are answered between rows, ahead of the next one; when the
+// queue is empty the process waits on the database's NOTIFY and on the questions at once. A
+// connection may carry many questions.
+struct Asker {
+    struct Client {
+        int fd;
         std::string buf;
-        char chunk[4096];
-        for (;;) {
-            ssize_t n = recv(c, chunk, sizeof chunk, 0);
-            if (n <= 0) break;
-            buf.append(chunk, (size_t)n);
-            size_t nl;
-            while ((nl = buf.find('\n')) != std::string::npos) {
-                std::string line = buf.substr(0, nl);
-                buf.erase(0, nl + 1);
-                if (line.empty()) continue;
-                std::string out = answer(db, o, rd, line) + "\n";
-                if (send(c, out.data(), out.size(), 0) < 0) break;
+    };
+    int ls = -1;
+    std::vector<Client> clients;
+
+    void open(const std::string &path) {
+        std::signal(SIGPIPE, SIG_IGN);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        if (path.size() >= sizeof addr.sun_path) die("socket path too long: " + path);
+        std::strncpy(addr.sun_path, path.c_str(), sizeof addr.sun_path - 1);
+        ls = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (ls < 0) die("cannot create a socket");
+        unlink(path.c_str());
+        mode_t old = umask(0177);
+        if (bind(ls, (sockaddr *)&addr, sizeof addr) < 0) die("cannot bind " + path);
+        umask(old);
+        if (listen(ls, 16) < 0) die("cannot listen on " + path);
+    }
+
+    // Waits up to timeout_ms for questions (and for the database socket when watch_db), answering
+    // every complete line that arrived. True when the database socket became readable.
+    bool step(Db &db, const Options &o, Reader &rd, int timeout_ms, bool watch_db) {
+        std::vector<pollfd> fds;
+        fds.push_back({ls, POLLIN, 0});
+        for (auto &c : clients) fds.push_back({c.fd, POLLIN, 0});
+        if (watch_db) fds.push_back({PQsocket(db.c), POLLIN, 0});
+        if (poll(fds.data(), fds.size(), timeout_ms) <= 0) return false;
+        bool db_ready = watch_db && (fds.back().revents & POLLIN);
+        for (size_t i = 0; i < clients.size(); i++) {
+            if (!(fds[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            Client &c = clients[i];
+            char chunk[4096];
+            ssize_t n = recv(c.fd, chunk, sizeof chunk, 0);
+            bool keep = n > 0;
+            if (keep) {
+                c.buf.append(chunk, (size_t)n);
+                size_t nl;
+                while (keep && (nl = c.buf.find('\n')) != std::string::npos) {
+                    std::string line = c.buf.substr(0, nl);
+                    c.buf.erase(0, nl + 1);
+                    if (line.empty()) continue;
+                    std::string out = answer(db, o, rd, line) + "\n";
+                    keep = send(c.fd, out.data(), out.size(), 0) >= 0;
+                }
+                keep = keep && c.buf.size() <= (1 << 20);   // a question is not a megabyte
             }
-            if (buf.size() > (1 << 20)) break;   // a question is not a megabyte
+            if (!keep) {
+                close(c.fd);
+                c.fd = -1;
+            }
         }
-        close(c);
-        if (PQstatus(db.c) != CONNECTION_OK) die("lost the database connection");
+        clients.erase(std::remove_if(clients.begin(), clients.end(), [](const Client &c) { return c.fd < 0; }),
+                      clients.end());
+        if (fds[0].revents & POLLIN)
+            for (int fd; (fd = accept(ls, nullptr, nullptr)) >= 0;) clients.push_back({fd, {}});
+        return db_ready;
+    }
+};
+
+// The idle wait: until a NOTIFY says there is something to read, or 30 s pass, whichever first.
+// With an asker, questions are answered meanwhile. A NOTIFY can also arrive while a question's
+// query runs (libpq then queues it), so the queue is checked after each step too.
+void wait_for_work(Db &db, const Options &o, Reader &rd, Asker *asker) {
+    if (!asker) {
+        wait_for_notify(db, 30);
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        int left = 30000 - (int)ms_since(t0);
+        if (left <= 0) return;
+        bool db_ready = asker->step(db, o, rd, left, true);
+        if (db_ready) PQconsumeInput(db.c);
+        bool notified = false;
+        while (PGnotify *n = PQnotifies(db.c)) {
+            PQfreemem(n);
+            notified = true;
+        }
+        if (notified) return;
     }
 }
-
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -797,10 +847,9 @@ int main(int argc, char **argv) {
 
     check_seal(db, o, rd, have);
 
-    if (!o.serve.empty()) {
-        if (o.watch.empty()) die("--serve answers questions on a --watch");
-        return serve(db, o, rd);
-    }
+    if (!o.serve.empty() && (o.watch.empty() || o.once || o.audit > 0 || !o.ask.empty() || !o.ask_file.empty() ||
+                             !o.ask_doc.empty()))
+        die("--serve answers questions while the process reads its --watch: not with --once, --audit or --ask*");
     if (!o.ask.empty()) {
         Reading q = rd.read(o.query_prefix + o.ask, true);
         if (q.v.empty()) die("the question has no tokens");
@@ -882,6 +931,13 @@ int main(int argc, char **argv) {
         return broken ? 2 : 0;
     }
     if (auto err = db.exec("LISTEN muninn", {})) die("cannot listen: " + *err);
+    std::unique_ptr<Asker> asker;
+    if (!o.serve.empty()) {
+        asker = std::make_unique<Asker>();
+        asker->open(o.serve);
+        std::fprintf(stderr, "muninn-reader: answering on %s for watch %s (reader %s) between rows\n",
+                     o.serve.c_str(), o.watch.c_str(), o.reader.c_str());
+    }
 
     long read_ok = 0, refused = 0, failed = 0;
     for (;;) {
@@ -891,6 +947,7 @@ int main(int argc, char **argv) {
             die("cannot ask what to read: " + *err);
         int rows = PQntuples(r);
         for (int i = 0; i < rows; i++) {
+            if (asker) asker->step(db, o, rd, 0, false);   // a waiting question goes before the next row
             std::string key = PQgetvalue(r, i, 0);
             std::string body = PQgetisnull(r, i, 1) ? "" : PQgetvalue(r, i, 1);
             std::string hash = PQgetvalue(r, i, 2);
@@ -918,7 +975,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "muninn-reader: %s: %ld read, %ld failed, %ld refused; queue empty\n",
                          o.watch.c_str(), read_ok, failed, refused);
             if (o.once) break;
-            wait_for_notify(db, 30);
+            wait_for_work(db, o, rd, asker.get());
         }
     }
     return 0;
