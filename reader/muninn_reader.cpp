@@ -656,19 +656,21 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// One question: {"q": text, "k": 10, "m": 200, "partial": false}. The question is read by this
+// One question: {"q": text, "k": 10, "m": 200, "partial": false, "codes": false}; with codes the
+// answer also carries the question's code64, int8 code and code256. The question is read by this
 // process, which proved its seal and compute, so it is comparable with the watch's readings; find
 // refuses below the watch's declared coverage unless partial is asked for, and that refusal comes
 // back as {"error": ...}: the caller fails cleanly instead of reading a half-read corpus as whole.
 std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line) {
     PGresult *r = nullptr;
     if (auto err = db.exec("SELECT j->>'q', coalesce((j->>'k')::int, 10), coalesce((j->>'m')::int, 200), "
-                           "coalesce((j->>'partial')::boolean, false) FROM (SELECT $1::jsonb AS j) x",
+                           "coalesce((j->>'partial')::boolean, false), coalesce((j->>'codes')::boolean, false) "
+                           "FROM (SELECT $1::jsonb AS j) x",
                            {line}, &r))
         return json_error(db, "a question is one JSON object per line: {\"q\": text, \"k\": 10, \"m\": 200, \"partial\": false}");
     bool no_q = PQgetisnull(r, 0, 0);
     std::string q = no_q ? "" : PQgetvalue(r, 0, 0), k = PQgetvalue(r, 0, 1), m = PQgetvalue(r, 0, 2);
-    std::string partial = PQgetvalue(r, 0, 3);
+    std::string partial = PQgetvalue(r, 0, 3), codes = PQgetvalue(r, 0, 4);
     PQclear(r);
     if (q.empty()) return json_error(db, "the question (q) is empty");
 
@@ -679,13 +681,17 @@ std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line
 
     auto t1 = std::chrono::steady_clock::now();
     if (auto err = db.exec(
-            "SELECT jsonb_build_object('watch', $1::text, 'reader', $2::text, "
+            "SELECT (jsonb_build_object('watch', $1::text, 'reader', $2::text, "
             "  'hits', coalesce((SELECT jsonb_agg(jsonb_build_object('key', f.key, 'score', f.score, 'hamming', f.hamming, "
             "      'state', f.state, 'familiarity', f.familiarity, 'read_at', f.read_at, 'truncated', f.truncated) "
             "      ORDER BY f.score DESC, f.key) "
             "    FROM muninn.find($1, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, nullif($8, '')::bit(256)) f), '[]'::jsonb), "
-            "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM muninn.coverage($1) c))::text",
-            {o.watch, o.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial, m, code256(rq.v)}, &r)) {
+            "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM muninn.coverage($1) c)) "
+            // the question's own codes, on request: to audit an answer or to run find by hand
+            "|| CASE WHEN $9::boolean THEN jsonb_build_object('code64', $3::bigint, 'code', to_jsonb($4::smallint[]), "
+            "     'code256', nullif($8, '')) ELSE '{}'::jsonb END)::text",
+            {o.watch, o.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial, m, code256(rq.v), codes},
+            &r)) {
         // The message and its hint, as the caller should read them; the PL/pgSQL context is ours.
         std::string msg = *err;
         if (msg.rfind("ERROR:  ", 0) == 0) msg.erase(0, 8);
