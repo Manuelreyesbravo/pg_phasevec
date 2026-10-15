@@ -230,7 +230,7 @@ SELECT left(model_sha, 4) AS model, left(adapter_sha, 4) AS adapter, dims, left(
 
 -- the same weights cannot be registered twice under another version
 SELECT muninn.reader_register(jsonb_set(:'m'::jsonb, '{version}', '"0.1.1"'));
-ERROR:  duplicate key value violates unique constraint "readers_model_sha_adapter_sha_heads_sha_key"
+ERROR:  duplicate key value violates unique constraint "readers_seal_key"
 -- different heads are a different reader
 SELECT muninn.reader_register(jsonb_set(jsonb_set(:'m'::jsonb, '{version}', '"0.1.1"'), '{heads_sha256}', to_jsonb(repeat('f', 64)))) > 0 AS other_heads;
  other_heads 

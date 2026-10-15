@@ -18,17 +18,24 @@
 //             vector (projection, Matryoshka prefix) and into a familiarity score. Marker and query
 //             instruction come from the manifest sealed in the database, never from the command line.
 //
-//   muninn-reader --model M.gguf [--lora A.gguf] --reader NAME --register [--dims D]
-//   muninn-reader --model M.gguf --lora A.gguf --heads H.gguf --register --manifest manifest.json
-//   muninn-reader --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --watch W [--once]
-//   muninn-reader --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
+//   muninn-reader --backend B --model M.gguf [--lora A.gguf] --reader NAME --register [--dims D]
+//   muninn-reader --backend B --model M.gguf --lora A.gguf --heads H.gguf --register --manifest manifest.json
+//   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --watch W [--once]
+//   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
 //   muninn-reader ... --reader NAME --ask-file questions.txt   one question per line, one code per line
+//   muninn-reader --backend B --print-compute                  the compute signature this process detects
+//
+// --backend cpu|cuda is always given and pins what the reader computes on: cpu hides every GPU from
+// llama.cpp, cuda puts every layer on the GPU. There is no partial offload. The reader is sealed with
+// that compute (pg_muninn 0.4.0) and refuses to read in a reader's name on any other.
 //
 // The database connection comes from the usual PG* environment variables (or --dsn).
 
+#include <ggml-backend.h>
 #include <ggml.h>
 #include <gguf.h>
 #include <libpq-fe.h>
+#include <link.h>
 #include <llama.h>
 
 #include <algorithm>
@@ -50,8 +57,9 @@ namespace {
 
 struct Options {
     std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, ask_doc, query_prefix, pooling = "last";
-    int dims = 0, batch = 32, ctx = 512, gpu_layers = 99, audit = 0;
-    bool once = false, do_register = false;
+    std::string backend;   // cpu | cuda: pinned by the process, never inherited from the environment
+    int dims = 0, batch = 32, ctx = 512, threads = 4, audit = 0;
+    bool once = false, do_register = false, print_compute = false;
 };
 
 [[noreturn]] void die(const std::string &msg) {
@@ -82,12 +90,19 @@ Options parse(int argc, char **argv) {
         else if (a == "--dims") o.dims = std::stoi(next());
         else if (a == "--batch") o.batch = std::stoi(next());
         else if (a == "--ctx") o.ctx = std::stoi(next());
-        else if (a == "--gpu-layers") o.gpu_layers = std::stoi(next());
+        else if (a == "--backend") o.backend = next();
+        else if (a == "--threads") o.threads = std::stoi(next());
+        else if (a == "--print-compute") o.print_compute = true;
+        else if (a == "--gpu-layers")
+            die("--gpu-layers is gone: a partial offload has no reproducible compute; use --backend cpu|cuda");
         else if (a == "--once") o.once = true;
         else if (a == "--audit") o.audit = std::stoi(next());
         else if (a == "--register") o.do_register = true;
         else die("unknown option " + a);
     }
+    if (o.backend != "cpu" && o.backend != "cuda") die("--backend cpu|cuda is required: the reader pins what it computes on");
+    if (o.threads < 1) die("--threads must be at least 1");
+    if (o.print_compute) return o;
     if (o.model.empty()) die("--model is required");
     if (!o.manifest.empty() && (!o.do_register || o.heads.empty() || o.lora.empty()))
         die("--manifest is for --register, with the --lora and --heads it names");
@@ -112,6 +127,116 @@ std::string sha256_of(const std::string &path) {
     std::array<char, 65> hex{};
     if (std::fscanf(p.get(), "%64s", hex.data()) != 1) die("cannot hash " + path);
     return std::string(hex.data());
+}
+
+// ------------------------------------------------------------ the compute --
+
+// What the same weights are computed on changes the reading: CPU and GPU kernels round differently,
+// and a 256-bit code can flip a few bits between them. So a reader is sealed with its compute too,
+// and this is detected here, in the process, from what llama.cpp actually sees and loaded, never
+// taken from a flag on trust.
+//
+// The number of threads is not part of it: measured (ygg mun_sello_hilos, 2026-10-15), 220 texts read
+// on the CPU with 4 threads and re-read with 8 and with 16 give the same 256-bit code, every one. If
+// that ever changes, the threads must enter the signature, or the signature lies.
+struct Compute {
+    std::string backend, device, system_info, libs;
+};
+
+// Before llama.cpp initialises anything: with --backend cpu no GPU may be visible at all, or
+// llama.cpp would still send the large matrix products of a batch to it (op offload).
+void pin_backend(const Options &o) {
+    if (o.backend == "cpu") setenv("CUDA_VISIBLE_DEVICES", "", 1);
+    llama_backend_init();
+    llama_log_set([](ggml_log_level level, const char *text, void *) {
+        if (level >= GGML_LOG_LEVEL_ERROR) std::fputs(text, stderr);
+    }, nullptr);
+}
+
+// The libraries that compute: llama.cpp and ggml always, and for cuda also the CUDA runtime, cuBLAS
+// and the driver, whose kernels the GPU runs.
+std::vector<std::string> compute_libraries(const std::string &backend) {
+    std::vector<std::string> prefixes = {"libllama.", "libggml.", "libggml-base.", "libggml-cpu"};
+    if (backend == "cuda")
+        for (const char *p : {"libggml-cuda.", "libcudart.", "libcublas.", "libcublasLt.", "libcuda."}) prefixes.push_back(p);
+    std::vector<std::string> found;
+    struct Ctx { const std::vector<std::string> *prefixes; std::vector<std::string> *found; } c{&prefixes, &found};
+    dl_iterate_phdr([](dl_phdr_info *info, size_t, void *data) {
+        auto *c = static_cast<Ctx *>(data);
+        std::string path = info->dlpi_name ? info->dlpi_name : "";
+        std::string base = path.substr(path.find_last_of('/') + 1);
+        for (auto &p : *c->prefixes)
+            if (base.rfind(p, 0) == 0) c->found->push_back(path);
+        return 0;
+    }, &c);
+    std::sort(found.begin(), found.end(), [](const std::string &a, const std::string &b) {
+        return a.substr(a.find_last_of('/') + 1) < b.substr(b.find_last_of('/') + 1);
+    });
+    found.erase(std::unique(found.begin(), found.end()), found.end());
+    return found;
+}
+
+// One sha256 over the contents of the libraries, in a fixed order.
+std::string sha256_of_all(const std::vector<std::string> &paths) {
+    std::string cmd = "cat --";
+    for (auto &path : paths) {
+        if (path.find('\'') != std::string::npos) die("refusing a path with a quote in it: " + path);
+        cmd += " '" + path + "'";
+    }
+    cmd += " | sha256sum";
+    std::unique_ptr<FILE, int (*)(FILE *)> p(popen(cmd.c_str(), "r"), pclose);
+    if (!p) die("cannot run sha256sum");
+    std::array<char, 65> hex{};
+    if (std::fscanf(p.get(), "%64s", hex.data()) != 1) die("cannot hash the compute libraries");
+    return std::string(hex.data());
+}
+
+// The kernels a ggml backend was built with (CPU: AVX512 = 1, ...; CUDA: ARCHS = 1200, ...).
+std::string backend_features(ggml_backend_reg_t reg) {
+    std::string s = ggml_backend_reg_name(reg);
+    auto get = (ggml_backend_get_features_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    if (get)
+        for (ggml_backend_feature *f = get(reg); f && f->name; f++) s += std::string(" ") + f->name + "=" + f->value;
+    return s;
+}
+
+Compute detect_compute(const Options &o) {
+    Compute c;
+    c.backend = o.backend;
+    std::vector<std::string> gpus, cpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        auto t = ggml_backend_dev_type(d);
+        std::string desc = ggml_backend_dev_description(d);
+        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) cpus.push_back(desc);
+        else gpus.push_back(desc);
+    }
+    if (o.backend == "cpu" && !gpus.empty())
+        die("--backend cpu, but llama.cpp still sees a device: " + gpus.front());
+    if (o.backend == "cuda" && gpus.empty()) die("--backend cuda, but llama.cpp sees no GPU");
+    if (cpus.empty()) die("llama.cpp sees no CPU device");
+    // The CPU takes part either way (embeddings lookup, what is not offloaded); the GPU only on cuda.
+    c.device = o.backend == "cuda" ? gpus.front() + " + " + cpus.front() : cpus.front();
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        std::string name = ggml_backend_reg_name(reg);
+        if (name == "CPU" || (o.backend == "cuda" && name == "CUDA"))
+            c.system_info += (c.system_info.empty() ? "" : " | ") + backend_features(reg);
+    }
+    auto libs = compute_libraries(o.backend);
+    if (libs.empty()) die("cannot find the llama.cpp libraries this process loaded");
+    c.libs = sha256_of_all(libs);
+    return c;
+}
+
+// The signature as jsonb, built by the database so nothing is escaped by hand here.
+constexpr const char *kComputeJson =
+    "jsonb_build_object('backend', $%d::text, 'device', $%d::text, 'system_info', $%d::text, 'libs', $%d::text)";
+
+std::string compute_json(int first) {
+    char buf[256];
+    std::snprintf(buf, sizeof buf, kComputeJson, first, first + 1, first + 2, first + 3);
+    return buf;
 }
 
 // ------------------------------------------------------------------- the heads --
@@ -193,16 +318,16 @@ struct Reader {
     std::vector<llama_token> marker;   // contract readers only, set from the sealed manifest
     std::string query_instruction;
 
+    // The backend was pinned before this (pin_backend), so cuda means every layer on the GPU and cpu
+    // means no GPU is visible at all. Nothing is left to llama.cpp's judgement of the free VRAM.
     explicit Reader(const Options &o) {
-        llama_backend_init();
-        llama_log_set([](ggml_log_level level, const char *text, void *) {
-            if (level >= GGML_LOG_LEVEL_ERROR) std::fputs(text, stderr);
-        }, nullptr);
         auto mp = llama_model_default_params();
-        mp.n_gpu_layers = o.gpu_layers;
+        mp.n_gpu_layers = o.backend == "cuda" ? 999 : 0;
         model = llama_model_load_from_file(o.model.c_str(), mp);
-        if (!model) die("cannot load " + o.model);
+        if (!model) die("cannot load " + o.model + (o.backend == "cuda" ? " entirely on the GPU" : ""));
         auto cp = llama_context_default_params();
+        cp.op_offload = o.backend == "cuda";
+        cp.n_threads = cp.n_threads_batch = o.threads;
         cp.embeddings = true;
         cp.pooling_type = !o.heads.empty() ? LLAMA_POOLING_TYPE_NONE
                         : o.pooling == "mean" ? LLAMA_POOLING_TYPE_MEAN : LLAMA_POOLING_TYPE_LAST;
@@ -430,6 +555,27 @@ struct Seal {
     std::string model_sha, adapter_sha, heads_sha;
 };
 
+// Proves this process computes on what the reader was sealed with. Runs before the model is loaded,
+// so a process on the wrong backend is turned away without touching the weights or the GPU.
+void check_compute(Db &db, const Options &o, const Compute &have) {
+    PGresult *r = nullptr;
+    std::string sql = "SELECT muninn.reader_compute_matches($1, " + compute_json(2) + "), "
+                      "coalesce(muninn.reader_compute($1)->>'backend', ''), coalesce(muninn.reader_compute($1)->>'device', ''), "
+                      "EXISTS (SELECT 1 FROM muninn.reader_seal($1))";
+    if (auto err = db.exec(sql.c_str(), {o.reader, have.backend, have.device, have.system_info, have.libs}, &r))
+        die("cannot read the compute seal of reader " + o.reader + ": " + *err);
+    bool matches = std::string(PQgetvalue(r, 0, 0)) == "t", exists = std::string(PQgetvalue(r, 0, 3)) == "t";
+    std::string backend = PQgetvalue(r, 0, 1), device = PQgetvalue(r, 0, 2);
+    PQclear(r);
+    if (matches) return;
+    if (!exists) die("no reader named " + o.reader + " (register it with --register)");
+    if (backend.empty())
+        die("reader " + o.reader + " was registered without its compute (before pg_muninn 0.4.0): register it again "
+            "with --register --backend, and switch the watch to it with muninn.reader_switch()");
+    die("this process computes on " + have.backend + " (" + have.device + "), but reader " + o.reader +
+        " was sealed on " + backend + " (" + device + ") or with other kernels or libraries: refusing to read in its name");
+}
+
 // Proves the loaded weights are the registered ones and, for a contract reader, takes its marker and
 // query instruction from the sealed manifest.
 void check_seal(Db &db, const Options &o, Reader &rd, const Seal &have) {
@@ -482,12 +628,22 @@ void wait_for_notify(Db &db, int seconds) {
 
 int main(int argc, char **argv) {
     Options o = parse(argc, argv);
+    pin_backend(o);
+    Compute compute = detect_compute(o);
+    if (o.print_compute) {
+        std::printf("backend\t%s\ndevice\t%s\nsystem_info\t%s\nlibs\t%s\n", compute.backend.c_str(),
+                    compute.device.c_str(), compute.system_info.c_str(), compute.libs.c_str());
+        for (auto &lib : compute_libraries(o.backend)) std::printf("lib\t%s\n", lib.c_str());
+        return 0;
+    }
+    Db db(o.dsn);
+    if (!o.do_register) check_compute(db, o, compute);
     Seal have{sha256_of(o.model), o.lora.empty() ? "" : sha256_of(o.lora),
               o.heads.empty() ? "" : sha256_of(o.heads)};
     Reader rd(o);
-    Db db(o.dsn);
 
     if (o.do_register) {
+        const std::vector<std::string> cv = {compute.backend, compute.device, compute.system_info, compute.libs};
         PGresult *r = nullptr;
         if (!o.manifest.empty()) {
             // The manifest names adapter and heads; the base is sealed here, from the file loaded.
@@ -497,24 +653,27 @@ int main(int argc, char **argv) {
             bool match = std::string(PQgetvalue(r, 0, 0)) == "t";
             PQclear(r);
             if (!match) die("the --lora/--heads loaded are not the ones the manifest names: refusing to register");
-            if (auto err = db.exec("SELECT muninn.reader_register(jsonb_set($1::jsonb, '{base_sha256}', to_jsonb($2::text))), "
-                                   "($1::jsonb->>'reader') || '-' || ($1::jsonb->>'version')",
-                                   {read_file(o.manifest), have.model_sha}, &r))
-                die("cannot register: " + *err);
-            std::printf("registered reader %s (base %s, adapter %s, heads %s)\n", PQgetvalue(r, 0, 1),
+            std::vector<std::string> params = {read_file(o.manifest), have.model_sha};
+            params.insert(params.end(), cv.begin(), cv.end());
+            std::string sql = "SELECT muninn.reader_register(jsonb_set($1::jsonb, '{base_sha256}', to_jsonb($2::text)), " +
+                              compute_json(3) + "), ($1::jsonb->>'reader') || '-' || ($1::jsonb->>'version') || '@' || $3";
+            if (auto err = db.exec(sql.c_str(), params, &r)) die("cannot register: " + *err);
+            std::printf("registered reader %s (base %s, adapter %s, heads %s; %s on %s)\n", PQgetvalue(r, 0, 1),
                         have.model_sha.substr(0, 12).c_str(), have.adapter_sha.substr(0, 12).c_str(),
-                        have.heads_sha.substr(0, 12).c_str());
+                        have.heads_sha.substr(0, 12).c_str(), compute.backend.c_str(), compute.device.c_str());
             PQclear(r);
             return 0;
         }
         if (rd.heads) die("a reader with heads registers through its --manifest");
-        if (auto err = db.exec("SELECT muninn.reader_register($1, $2, $3::int, nullif($4, ''), "
-                               "jsonb_build_object('pooling', $5::text, 'ctx', $6::int, 'query_prefix', $7::text))",
-                               {o.reader, have.model_sha, std::to_string(rd.dims), have.adapter_sha, o.pooling,
-                                std::to_string(o.ctx), o.query_prefix}, &r))
-            die("cannot register: " + *err);
-        std::printf("registered reader %s (model %s, %d dimensions)\n", o.reader.c_str(),
-                    have.model_sha.substr(0, 12).c_str(), rd.dims);
+        std::vector<std::string> params = {o.reader, have.model_sha, std::to_string(rd.dims), have.adapter_sha,
+                                           o.pooling, std::to_string(o.ctx), o.query_prefix};
+        params.insert(params.end(), cv.begin(), cv.end());
+        std::string sql = "SELECT muninn.reader_register($1, $2, $3::int, nullif($4, ''), "
+                          "jsonb_build_object('pooling', $5::text, 'ctx', $6::int, 'query_prefix', $7::text), " +
+                          compute_json(8) + ")";
+        if (auto err = db.exec(sql.c_str(), params, &r)) die("cannot register: " + *err);
+        std::printf("registered reader %s (model %s, %d dimensions; %s on %s)\n", o.reader.c_str(),
+                    have.model_sha.substr(0, 12).c_str(), rd.dims, compute.backend.c_str(), compute.device.c_str());
         PQclear(r);
         return 0;
     }
