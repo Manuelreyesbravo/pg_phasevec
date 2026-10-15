@@ -179,6 +179,40 @@ SELECT muninn.record('docs', '2', 'r2', (SELECT text_hash FROM muninn.sources WH
                      2, ARRAY[0,100,0,0]::smallint[], NULL, repeat('1', 256)::bit(256));
 SELECT count(*) AS mismatches FROM muninn.coverage_check('wide');
 DROP TABLE wide;
+
+-- ------------------------------------------------ the reader on its own: queue, audits, dupes (0.3.0)
+CREATE TABLE q3 (id int PRIMARY KEY, body text);
+INSERT INTO q3 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four');
+SELECT muninn.watch('q3', 'q3'::regclass, 'id', 'r.body', 'r1') > 0 AS watch;
+SELECT count(muninn.record('q3', n.key, 'r1', n.text_hash, n.key::bigint,
+                           CASE WHEN n.key IN ('1', '2') THEN ARRAY[100,0,0,0] ELSE ARRAY[0,0,n.key::int * 10,100] END::smallint[]))
+  FROM muninn.next('q3') n WHERE n.key <> '4';
+SELECT muninn.record_failure('q3', '4', 'r1', (SELECT text_hash FROM muninn.sources WHERE key = '4' AND watch = (SELECT id FROM muninn.watches WHERE name = 'q3')), 'no tokens');
+-- a failed reading of the current text is not handed out again...
+SELECT count(*) AS to_read FROM muninn.next('q3');
+-- ...but once its text changes it is, exactly as in 0.1.0
+UPDATE q3 SET body = 'four, now readable' WHERE id = 4;
+SELECT key FROM muninn.next('q3');
+-- a re-reading that reproduces the reading holds
+SELECT muninn.record_audit('q3', '1', 'r1', (SELECT text_hash FROM muninn.readings WHERE key = '1' AND watch = (SELECT id FROM muninn.watches WHERE name = 'q3')),
+                           ARRAY[100,0,0,0]::smallint[], NULL) AS holds;
+-- control: a re-reading that does not is recorded as a broken assertion
+SELECT muninn.record_audit('q3', '2', 'r1', (SELECT text_hash FROM muninn.readings WHERE key = '2' AND watch = (SELECT id FROM muninn.watches WHERE name = 'q3')),
+                           ARRAY[0,100,0,0]::smallint[], NULL) AS holds;
+SELECT key, same_code256, round(cosine::numeric, 3) AS cosine, holds FROM muninn.audits ORDER BY id;
+-- a row that changed is not audited: there is no reading of its current text
+UPDATE q3 SET body = 'one, edited' WHERE id = 1;
+SELECT muninn.record_audit('q3', '1', 'r1', (SELECT text_hash FROM muninn.sources WHERE key = '1' AND watch = (SELECT id FROM muninn.watches WHERE name = 'q3')),
+                           ARRAY[100,0,0,0]::smallint[], NULL) AS holds;
+SELECT key FROM muninn.audit_sample('q3', 10) ORDER BY key;
+-- dupes counts only fresh readings: 1 back to the text it was read from is fresh again; 1 and 2
+-- share a code, 3 is not alike
+UPDATE q3 SET body = 'one' WHERE id = 1;
+SELECT key_a, key_b, round(cosine::numeric, 3) AS cosine FROM muninn.dupes('q3', 0.98);
+-- control: with a lower threshold the dissimilar pair appears too
+SELECT count(*) AS pairs FROM muninn.dupes('q3', -1);
+SELECT count(*) AS mismatches FROM muninn.coverage_check('q3');
+DROP TABLE q3;
 -- ------------------------------------------------ dropping the table drops its watch
 SELECT count(*) AS watches_before FROM muninn.watches;
 DROP TABLE docs;

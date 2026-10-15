@@ -50,7 +50,7 @@ namespace {
 
 struct Options {
     std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, query_prefix, pooling = "last";
-    int dims = 0, batch = 32, ctx = 512, gpu_layers = 99;
+    int dims = 0, batch = 32, ctx = 512, gpu_layers = 99, audit = 0;
     bool once = false, do_register = false;
 };
 
@@ -83,6 +83,7 @@ Options parse(int argc, char **argv) {
         else if (a == "--ctx") o.ctx = std::stoi(next());
         else if (a == "--gpu-layers") o.gpu_layers = std::stoi(next());
         else if (a == "--once") o.once = true;
+        else if (a == "--audit") o.audit = std::stoi(next());
         else if (a == "--register") o.do_register = true;
         else die("unknown option " + a);
     }
@@ -479,6 +480,33 @@ int main(int argc, char **argv) {
     }
 
     if (o.watch.empty()) die("--watch, --register or --ask is required");
+
+    if (o.audit > 0) {
+        // The self-audit (0.3.0): re-read a sample of this reader's own fresh readings, as they are
+        // now, and let the database say whether each one reproduces. Nothing is recorded as a
+        // reading; a reading that does not reproduce stays in muninn.audits as a broken assertion.
+        PGresult *r = nullptr;
+        if (auto err = db.exec("SELECT key, body, text_hash::text FROM muninn.audit_sample($1, $2::int)",
+                               {o.watch, std::to_string(o.audit)}, &r))
+            die("cannot ask for an audit sample: " + *err);
+        long holds = 0, broken = 0, skipped = 0;
+        for (int i = 0; i < PQntuples(r); i++) {
+            std::string key = PQgetvalue(r, i, 0), body = PQgetvalue(r, i, 1), hash = PQgetvalue(r, i, 2);
+            Reading again = rd.read(body);
+            PGresult *a = nullptr;
+            if (auto err = db.exec("SELECT muninn.record_audit($1, $2, $3, $4::bytea, $5::smallint[], nullif($6, '')::bit(256))",
+                                   {o.watch, key, o.reader, hash, code_literal(again.v), code256(again.v)}, &a))
+                die("cannot record an audit: " + *err);
+            if (PQgetisnull(a, 0, 0)) skipped++;
+            else if (std::string(PQgetvalue(a, 0, 0)) == "t") holds++;
+            else broken++;
+            PQclear(a);
+        }
+        PQclear(r);
+        std::printf("audit %s: %ld hold, %ld broken, %ld skipped (changed meanwhile)\n",
+                    o.watch.c_str(), holds, broken, skipped);
+        return broken ? 2 : 0;
+    }
     if (auto err = db.exec("LISTEN muninn", {})) die("cannot listen: " + *err);
 
     long read_ok = 0, refused = 0, failed = 0;

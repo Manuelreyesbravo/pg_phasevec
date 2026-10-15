@@ -94,5 +94,31 @@ SELECT state, n FROM muninn.coverage('up') WHERE n > 0;
  foreign | 6
 (2 rows)
 
+-- 0.2.0 -> 0.3.0: the queue now comes from kstate; it hands out the same rows the 0.2.0 one did
+SELECT count(*) AS to_read_020 FROM muninn.next('up', 100);
+ to_read_020 
+-------------
+           9
+(1 row)
+
+ALTER EXTENSION pg_muninn UPDATE TO '0.3.0';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_muninn';
+ extversion 
+------------
+ 0.3.0
+(1 row)
+
+SELECT count(*) AS to_read_030 FROM muninn.next('up', 100);
+ to_read_030 
+-------------
+           9
+(1 row)
+
+SELECT count(*) AS mismatches FROM muninn.coverage_check('up');
+ mismatches 
+------------
+          0
+(1 row)
+
 DROP TABLE up;
 DROP EXTENSION pg_muninn;

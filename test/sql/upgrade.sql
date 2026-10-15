@@ -28,5 +28,12 @@ SELECT muninn.reader_switch('up', 'u2');
 SELECT count(*) AS mismatches FROM muninn.coverage_check('up');
 SELECT state, n FROM muninn.coverage('up') WHERE n > 0;
 
+-- 0.2.0 -> 0.3.0: the queue now comes from kstate; it hands out the same rows the 0.2.0 one did
+SELECT count(*) AS to_read_020 FROM muninn.next('up', 100);
+ALTER EXTENSION pg_muninn UPDATE TO '0.3.0';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_muninn';
+SELECT count(*) AS to_read_030 FROM muninn.next('up', 100);
+SELECT count(*) AS mismatches FROM muninn.coverage_check('up');
+
 DROP TABLE up;
 DROP EXTENSION pg_muninn;
