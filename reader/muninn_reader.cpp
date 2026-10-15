@@ -49,7 +49,7 @@
 namespace {
 
 struct Options {
-    std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, query_prefix, pooling = "last";
+    std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, ask_doc, query_prefix, pooling = "last";
     int dims = 0, batch = 32, ctx = 512, gpu_layers = 99, audit = 0;
     bool once = false, do_register = false;
 };
@@ -76,6 +76,7 @@ Options parse(int argc, char **argv) {
         else if (a == "--dsn") o.dsn = next();
         else if (a == "--ask") o.ask = next();
         else if (a == "--ask-file") o.ask_file = next();
+        else if (a == "--ask-doc") o.ask_doc = next();
         else if (a == "--query-prefix") o.query_prefix = next();
         else if (a == "--pooling") o.pooling = next();
         else if (a == "--dims") o.dims = std::stoi(next());
@@ -301,7 +302,68 @@ struct Reader {
         if (!h) return {};
         return {unit(heads->project(h, dims)), heads->familiarity(h)};
     }
+
+    // A document read in place ("late chunking"): every piece tokenized without special tokens and
+    // closed by the marker, all of them in ONE forward with consecutive positions, each read at its
+    // marker's last token -- so a piece's state has attended to the pieces before it. The trainer's
+    // Codec.document, token for token: pieces that do not fit are dropped from the end, and the
+    // caller sees how many survived. A one-piece document is exactly read_contract().
+    std::vector<Reading> read_document(const std::vector<std::string> &pieces) {
+        if (!heads || marker.empty()) die("--ask-doc needs a contract reader (--heads and its manifest)");
+        std::vector<llama_token> toks;
+        std::vector<int> at;
+        for (const auto &p : pieces) {
+            auto t = tokenize(p, false);
+            if (toks.size() + t.size() + marker.size() > (size_t)max_tokens) break;
+            toks.insert(toks.end(), t.begin(), t.end());
+            toks.insert(toks.end(), marker.begin(), marker.end());
+            at.push_back((int)toks.size() - 1);
+        }
+        if (at.empty()) return {};
+        llama_memory_clear(llama_get_memory(ctx), true);
+        int n = (int)toks.size();
+        llama_batch b = llama_batch_init(n, 0, 1);
+        size_t next_at = 0;
+        for (int i = 0; i < n; i++) {
+            b.token[i] = toks[i];
+            b.pos[i] = i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = next_at < at.size() && at[next_at] == i;
+            if (b.logits[i]) next_at++;
+        }
+        b.n_tokens = n;
+        int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        if (rc != 0) return {};
+        std::vector<Reading> out;
+        for (int i : at) {
+            const float *h = llama_get_embeddings_ith(ctx, i);
+            if (!h) return {};
+            out.push_back({unit(heads->project(h, dims)), heads->familiarity(h)});
+        }
+        return out;
+    }
 };
+
+// Standard base64 (no line breaks), for --ask-doc: pieces carry newlines and tabs of their own.
+std::string from_base64(const std::string &in) {
+    static const std::string abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, bits = -8;
+    for (char ch : in) {
+        if (ch == '=') break;
+        size_t p = abc.find(ch);
+        if (p == std::string::npos) continue;
+        val = (val << 6) + (int)p;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(char((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
 
 // The 64-bit code: the signs of the first 64 dimensions (the Matryoshka head).
 int64_t code64(const std::vector<float> &v) {
@@ -463,6 +525,38 @@ int main(int argc, char **argv) {
         Reading q = rd.read(o.query_prefix + o.ask, true);
         if (q.v.empty()) die("the question has no tokens");
         std::printf("%lld\t%s\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str(), code256(q.v).c_str());
+        return 0;
+    }
+    if (!o.ask_doc.empty()) {
+        // Documents read in place, for measuring (F3a): "D <id>" opens a document, each "P <base64>"
+        // line is one of its pieces, in order. Out: one line per piece that fit, with its document,
+        // its index, both codes, the int8 code and the familiarity. A question is a one-piece
+        // document whose text already carries the manifest's query instruction.
+        std::ifstream f(o.ask_doc);
+        if (!f) die("cannot read " + o.ask_doc);
+        std::string line, doc;
+        std::vector<std::string> pieces;
+        auto flush = [&]() {
+            if (doc.empty()) return;
+            auto rs = rd.read_document(pieces);
+            for (size_t i = 0; i < rs.size(); i++) {
+                const Reading &q = rs[i];
+                std::printf("%s\t%zu\t%lld\t%s\t%s\t%s\n", doc.c_str(), i, (long long)code64(q.v),
+                            code_literal(q.v).c_str(), code256(q.v).c_str(),
+                            q.familiarity ? std::to_string(*q.familiarity).c_str() : "");
+            }
+            std::fflush(stdout);
+            pieces.clear();
+        };
+        while (std::getline(f, line)) {
+            if (line.rfind("D ", 0) == 0) {
+                flush();
+                doc = line.substr(2);
+            } else if (line.rfind("P ", 0) == 0) {
+                pieces.push_back(from_base64(line.substr(2)));
+            }
+        }
+        flush();
         return 0;
     }
     if (!o.ask_file.empty()) {
