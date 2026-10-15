@@ -138,6 +138,47 @@ SELECT key, state FROM muninn.reading_states WHERE watch = 'notes' ORDER BY key;
 SELECT state, n, share FROM muninn.coverage('notes') WHERE n > 0;
 SELECT key, state FROM muninn.find('notes', 2, ARRAY[90,10,0,0]::smallint[]) ORDER BY key;
 DROP TABLE notes;
+
+-- ------------------------------------------------ the counts never lie (0.2.0)
+-- coverage() reads counts the triggers keep; coverage_check() recounts the tables from scratch.
+-- After every kind of change above -- readings, stale text, an orphan, a failure, a new reader --
+-- they agree.
+SELECT count(*) AS mismatches FROM muninn.coverage_check('docs');
+-- control: a count corrupted by hand is reported...
+UPDATE muninn.counts SET n = n + 1 WHERE watch = (SELECT id FROM muninn.watches WHERE name = 'docs') AND state = 'foreign';
+SELECT state, counted, recounted FROM muninn.coverage_check('docs');
+-- ...a recount repairs it...
+SELECT muninn._recount((SELECT id FROM muninn.watches WHERE name = 'docs'));
+SELECT count(*) AS mismatches FROM muninn.coverage_check('docs');
+-- ...and a count can never go below zero
+UPDATE muninn.counts SET n = -1 WHERE watch = (SELECT id FROM muninn.watches WHERE name = 'docs') AND state = 'orphan';
+
+-- ------------------------------------------------ the 256-bit sweep (0.2.0)
+-- Three rows of a 256-dimension reader. Row 'a' is the nearest by its 256-bit code but the farthest
+-- by its 64-bit code; with m = 1 only the candidate the sweep picks is reranked, so the answer says
+-- which code was swept.
+SELECT muninn.reader_register('r256', repeat('9', 64), 256) > 0 AS r256;
+CREATE TABLE wide (id text PRIMARY KEY, body text);
+INSERT INTO wide VALUES ('a', 'alpha'), ('b', 'beta'), ('c', 'gamma');
+SELECT muninn.watch('wide', 'wide'::regclass, 'id', 'r.body', 'r256') > 0 AS watch;
+SELECT count(muninn.record('wide', n.key, 'r256', n.text_hash,
+                           CASE n.key WHEN 'a' THEN -1 ELSE 0 END,          -- 64 bits: 'a' is far
+                           array_fill(CASE n.key WHEN 'a' THEN 100 WHEN 'b' THEN 50 ELSE -100 END::smallint, ARRAY[256]),
+                           NULL,
+                           CASE n.key WHEN 'a' THEN repeat('1', 256) WHEN 'b' THEN repeat('1', 128) || repeat('0', 128)
+                                      ELSE repeat('0', 256) END::bit(256)))  -- 256 bits: 'a' is near
+                           AS recorded
+  FROM muninn.next('wide') n;
+-- the question: all ones in 256 bits, all zeros in 64
+SELECT key, hamming FROM muninn.find('wide', 0, array_fill(100::smallint, ARRAY[256]), 1, false, 1,
+                                     repeat('1', 256)::bit(256));
+-- control: the same question without its 256-bit code sweeps the 64-bit one and gets another row
+SELECT key, hamming FROM muninn.find('wide', 0, array_fill(100::smallint, ARRAY[256]), 1, false, 1);
+-- a 256-bit code from a reader of fewer dimensions is refused
+SELECT muninn.record('docs', '2', 'r2', (SELECT text_hash FROM muninn.sources WHERE key = '2' AND watch = (SELECT id FROM muninn.watches WHERE name = 'docs')),
+                     2, ARRAY[0,100,0,0]::smallint[], NULL, repeat('1', 256)::bit(256));
+SELECT count(*) AS mismatches FROM muninn.coverage_check('wide');
+DROP TABLE wide;
 -- ------------------------------------------------ dropping the table drops its watch
 SELECT count(*) AS watches_before FROM muninn.watches;
 DROP TABLE docs;

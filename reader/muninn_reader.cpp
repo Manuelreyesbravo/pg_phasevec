@@ -312,6 +312,17 @@ int64_t code64(const std::vector<float> &v) {
     return s;
 }
 
+// The 256-bit code (0.2.0): the signs of the first 256 dimensions, as a bit(256) literal whose
+// leftmost bit is dimension 0. Taken from the float vector, like code64, never from the int8 code
+// (int8 rounds small values to 0 and would lose their sign). Empty when the vector is shorter.
+std::string code256(const std::vector<float> &v) {
+    if (v.size() < 256) return "";
+    std::string s(256, '0');
+    for (int i = 0; i < 256; i++)
+        if (v[i] > 0) s[i] = '1';
+    return s;
+}
+
 // The full code: int8 with one scale per reading (the cosine does not see the scale).
 std::string code_literal(const std::vector<float> &v) {
     float m = 0;
@@ -450,7 +461,7 @@ int main(int argc, char **argv) {
     if (!o.ask.empty()) {
         Reading q = rd.read(o.query_prefix + o.ask, true);
         if (q.v.empty()) die("the question has no tokens");
-        std::printf("%lld\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str());
+        std::printf("%lld\t%s\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str(), code256(q.v).c_str());
         return 0;
     }
     if (!o.ask_file.empty()) {
@@ -460,8 +471,9 @@ int main(int argc, char **argv) {
         std::string line;
         while (std::getline(f, line)) {
             Reading q = line.empty() ? Reading{} : rd.read(o.query_prefix + line, true);
-            if (q.v.empty()) std::printf("\t\n");
-            else std::printf("%lld\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str());
+            if (q.v.empty()) std::printf("\t\t\n");
+            else std::printf("%lld\t%s\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str(),
+                             code256(q.v).c_str());
         }
         return 0;
     }
@@ -487,9 +499,10 @@ int main(int argc, char **argv) {
                               {o.watch, key, o.reader, hash, body.empty() ? "empty text" : "the model produced no reading"});
                 if (!err) failed++;
             } else {
-                err = db.exec("SELECT muninn.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[], nullif($7, '')::real)",
+                err = db.exec("SELECT muninn.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[], "
+                              "nullif($7, '')::real, nullif($8, '')::bit(256))",
                               {o.watch, key, o.reader, hash, std::to_string(code64(rdg.v)), code_literal(rdg.v),
-                               familiarity_param(rdg)});
+                               familiarity_param(rdg), code256(rdg.v)});
                 if (!err) read_ok++;
             }
             if (err) {
