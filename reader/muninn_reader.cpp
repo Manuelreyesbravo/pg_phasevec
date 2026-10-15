@@ -24,6 +24,10 @@
 //   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
 //   muninn-reader ... --reader NAME --ask-file questions.txt   one question per line, one code per line
 //   muninn-reader --backend B --print-compute                  the compute signature this process detects
+//   muninn-reader --backend B ... --reader NAME --watch W --serve SOCKET
+//       the asker: a JSON line {"q": ..., "k": 10, "m": 200, "partial": false} in, a JSON line out with
+//       the hits of muninn.find (key, score, hamming, state, familiarity, read_at, truncated), the
+//       watch's coverage and the time to read the question and to find; or {"error": ...}
 //
 // --backend cpu|cuda is always given and pins what the reader computes on: cpu hides every GPU from
 // llama.cpp, cuda puts every layer on the GPU. There is no partial offload. The reader is sealed with
@@ -50,7 +54,13 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <chrono>
+#include <csignal>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -58,6 +68,7 @@ namespace {
 struct Options {
     std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, ask_doc, query_prefix, pooling = "last";
     std::string backend;   // cpu | cuda: pinned by the process, never inherited from the environment
+    std::string serve;     // a unix socket: answer questions on the watch, one JSON line each way
     int dims = 0, batch = 32, ctx = 512, threads = 4, audit = 0;
     bool once = false, do_register = false, print_compute = false;
 };
@@ -85,6 +96,7 @@ Options parse(int argc, char **argv) {
         else if (a == "--ask") o.ask = next();
         else if (a == "--ask-file") o.ask_file = next();
         else if (a == "--ask-doc") o.ask_doc = next();
+        else if (a == "--serve") o.serve = next();
         else if (a == "--query-prefix") o.query_prefix = next();
         else if (a == "--pooling") o.pooling = next();
         else if (a == "--dims") o.dims = std::stoi(next());
@@ -628,6 +640,107 @@ void wait_for_notify(Db &db, int seconds) {
     while (PGnotify *n = PQnotifies(db.c)) PQfreemem(n);
 }
 
+// ------------------------------------------------------------------ serving --
+
+// One JSON object per line, built by the database so nothing is escaped by hand here.
+std::string json_error(Db &db, const std::string &msg) {
+    PGresult *r = nullptr;
+    if (db.exec("SELECT jsonb_build_object('error', $1::text)::text", {msg}, &r)) return "{\"error\": \"internal\"}";
+    std::string out = PQgetvalue(r, 0, 0);
+    PQclear(r);
+    return out;
+}
+
+double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// One question: {"q": text, "k": 10, "m": 200, "partial": false}. The question is read by this
+// process, which proved its seal and compute, so it is comparable with the watch's readings; find
+// refuses below the watch's declared coverage unless partial is asked for, and that refusal comes
+// back as {"error": ...}: the caller fails cleanly instead of reading a half-read corpus as whole.
+std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line) {
+    PGresult *r = nullptr;
+    if (auto err = db.exec("SELECT j->>'q', coalesce((j->>'k')::int, 10), coalesce((j->>'m')::int, 200), "
+                           "coalesce((j->>'partial')::boolean, false) FROM (SELECT $1::jsonb AS j) x",
+                           {line}, &r))
+        return json_error(db, "a question is one JSON object per line: {\"q\": text, \"k\": 10, \"m\": 200, \"partial\": false}");
+    bool no_q = PQgetisnull(r, 0, 0);
+    std::string q = no_q ? "" : PQgetvalue(r, 0, 0), k = PQgetvalue(r, 0, 1), m = PQgetvalue(r, 0, 2);
+    std::string partial = PQgetvalue(r, 0, 3);
+    PQclear(r);
+    if (q.empty()) return json_error(db, "the question (q) is empty");
+
+    auto t0 = std::chrono::steady_clock::now();
+    Reading rq = rd.read(o.query_prefix + q, true);
+    double encode_ms = ms_since(t0);
+    if (rq.v.empty()) return json_error(db, "the question has no tokens");
+
+    auto t1 = std::chrono::steady_clock::now();
+    if (auto err = db.exec(
+            "SELECT jsonb_build_object('watch', $1::text, 'reader', $2::text, "
+            "  'hits', coalesce((SELECT jsonb_agg(jsonb_build_object('key', f.key, 'score', f.score, 'hamming', f.hamming, "
+            "      'state', f.state, 'familiarity', f.familiarity, 'read_at', f.read_at, 'truncated', f.truncated) "
+            "      ORDER BY f.score DESC, f.key) "
+            "    FROM muninn.find($1, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, nullif($8, '')::bit(256)) f), '[]'::jsonb), "
+            "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM muninn.coverage($1) c))::text",
+            {o.watch, o.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial, m, code256(rq.v)}, &r)) {
+        // The message and its hint, as the caller should read them; the PL/pgSQL context is ours.
+        std::string msg = *err;
+        if (msg.rfind("ERROR:  ", 0) == 0) msg.erase(0, 8);
+        if (size_t at = msg.find("\nCONTEXT:"); at != std::string::npos) msg.erase(at);
+        while (!msg.empty() && (msg.back() == '\n' || msg.back() == ' ')) msg.pop_back();
+        return json_error(db, msg);
+    }
+    double find_ms = ms_since(t1);
+    std::string body = PQgetvalue(r, 0, 0);
+    PQclear(r);
+    char head[96];
+    std::snprintf(head, sizeof head, "{\"encode_ms\": %.1f, \"find_ms\": %.1f, ", encode_ms, find_ms);
+    return head + body.substr(1);
+}
+
+// The asker: the weights stay loaded, questions arrive on a unix socket only its owner can open, and
+// are answered one at a time (one llama context). A connection may carry many questions.
+int serve(Db &db, const Options &o, Reader &rd) {
+    std::signal(SIGPIPE, SIG_IGN);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (o.serve.size() >= sizeof addr.sun_path) die("socket path too long: " + o.serve);
+    std::strncpy(addr.sun_path, o.serve.c_str(), sizeof addr.sun_path - 1);
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ls < 0) die("cannot create a socket");
+    unlink(o.serve.c_str());
+    mode_t old = umask(0177);
+    if (bind(ls, (sockaddr *)&addr, sizeof addr) < 0) die("cannot bind " + o.serve);
+    umask(old);
+    if (listen(ls, 16) < 0) die("cannot listen on " + o.serve);
+    std::fprintf(stderr, "muninn-reader: answering on %s for watch %s (reader %s)\n", o.serve.c_str(),
+                 o.watch.c_str(), o.reader.c_str());
+    for (;;) {
+        int c = accept(ls, nullptr, nullptr);
+        if (c < 0) continue;
+        std::string buf;
+        char chunk[4096];
+        for (;;) {
+            ssize_t n = recv(c, chunk, sizeof chunk, 0);
+            if (n <= 0) break;
+            buf.append(chunk, (size_t)n);
+            size_t nl;
+            while ((nl = buf.find('\n')) != std::string::npos) {
+                std::string line = buf.substr(0, nl);
+                buf.erase(0, nl + 1);
+                if (line.empty()) continue;
+                std::string out = answer(db, o, rd, line) + "\n";
+                if (send(c, out.data(), out.size(), 0) < 0) break;
+            }
+            if (buf.size() > (1 << 20)) break;   // a question is not a megabyte
+        }
+        close(c);
+        if (PQstatus(db.c) != CONNECTION_OK) die("lost the database connection");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -684,6 +797,10 @@ int main(int argc, char **argv) {
 
     check_seal(db, o, rd, have);
 
+    if (!o.serve.empty()) {
+        if (o.watch.empty()) die("--serve answers questions on a --watch");
+        return serve(db, o, rd);
+    }
     if (!o.ask.empty()) {
         Reading q = rd.read(o.query_prefix + o.ask, true);
         if (q.v.empty()) die("the question has no tokens");
