@@ -71,7 +71,7 @@ struct Options {
     std::string backend;   // cpu | cuda: pinned by the process, never inherited from the environment
     std::string serve;     // a unix socket: answer questions on the watch, one JSON line each way
     int dims = 0, batch = 32, ctx = 512, threads = 4, audit = 0;
-    bool once = false, do_register = false, print_compute = false;
+    bool once = false, do_register = false, print_compute = false, no_repack = false;
 };
 
 [[noreturn]] void die(const std::string &msg) {
@@ -106,6 +106,7 @@ Options parse(int argc, char **argv) {
         else if (a == "--backend") o.backend = next();
         else if (a == "--threads") o.threads = std::stoi(next());
         else if (a == "--print-compute") o.print_compute = true;
+        else if (a == "--no-repack") o.no_repack = true;
         else if (a == "--gpu-layers")
             die("--gpu-layers is gone: a partial offload has no reproducible compute; use --backend cpu|cuda");
         else if (a == "--once") o.once = true;
@@ -236,6 +237,9 @@ Compute detect_compute(const Options &o) {
         if (name == "CPU" || (o.backend == "cuda" && name == "CUDA"))
             c.system_info += (c.system_info.empty() ? "" : " | ") + backend_features(reg);
     }
+    // Not repacking the weights changes the bits (measured), so it is a different compute. The
+    // default (repacking) leaves the signature as it was, so readers sealed before keep matching.
+    if (o.no_repack) c.system_info += " | weights not repacked";
     auto libs = compute_libraries(o.backend);
     if (libs.empty()) die("cannot find the llama.cpp libraries this process loaded");
     c.libs = sha256_of_all(libs);
@@ -337,6 +341,12 @@ struct Reader {
     explicit Reader(const Options &o) {
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = o.backend == "cuda" ? 999 : 0;
+        // --no-repack: the weights are read from the GGUF's mmap instead of copied into anonymous
+        // memory in the layout of the CPU's faster kernels: page cache the kernel can hand to other
+        // processes (anonymous memory 1 GB instead of 4.9), 1.44 times slower. It CHANGES THE BITS
+        // (ygg mun_norepack_bits: 28 of 220 readings reproduced), so it is part of the compute
+        // signature (detect_compute) and a reader sealed with repacking refuses it.
+        mp.use_extra_bufts = !o.no_repack;
         model = llama_model_load_from_file(o.model.c_str(), mp);
         if (!model) die("cannot load " + o.model + (o.backend == "cuda" ? " entirely on the GPU" : ""));
         auto cp = llama_context_default_params();
