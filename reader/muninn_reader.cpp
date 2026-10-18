@@ -13,6 +13,9 @@
 //
 // Two ways to read:
 //   pooled    an off-the-shelf embedding model: llama.cpp pools the sequence (--pooling last|mean).
+//             The text is tokenized alone, cut to fit, and closed by the model's own special tokens
+//             (its BOS and EOS flags), so a long text keeps the token the model pools at. Pooling,
+//             context and query instruction are sealed at --register and taken from the seal after.
 //   contract  a reader trained for Muninn (--heads): the text is closed by the reader's marker, the
 //             state is taken at the marker's last token, and the reader's own heads turn it into the
 //             vector (projection, Matryoshka prefix) and into a familiarity score. Marker and query
@@ -23,11 +26,15 @@
 //   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --watch W [--once]
 //   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
 //   muninn-reader ... --reader NAME --ask-file questions.txt   one question per line, one code per line
+//   muninn-reader ... --reader NAME --embed-file texts.txt     "Q <base64>" (a question) or "D <base64>"
+//       (a document) per line; one line out each: kind, code64, int8 code, code256, tokens read, total
 //   muninn-reader --backend B --print-compute                  the compute signature this process detects
 //   muninn-reader --backend B ... --reader NAME --watch W --serve SOCKET
 //       the asker: a JSON line {"q": ..., "k": 10, "m": 200, "partial": false} in, a JSON line out with
 //       the hits of muninn.find (key, score, hamming, state, familiarity, read_at, truncated), the
-//       watch's coverage and the time to read the question and to find; or {"error": ...}
+//       watch's coverage and the time to read the question and to find; or {"error": ...}. With
+//       "hybrid": true (and "lm", default 200) it asks muninn.find_hybrid (pg_muninn 0.6.0), and each
+//       hit also carries its rank and score in the vector and the lexical arm.
 //
 // --backend cpu|cuda is always given and pins what the reader computes on: cpu hides every GPU from
 // llama.cpp, cuda puts every layer on the GPU. There is no partial offload. The reader is sealed with
@@ -67,7 +74,8 @@
 namespace {
 
 struct Options {
-    std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, ask_doc, query_prefix, pooling = "last";
+    std::string model, lora, heads, manifest, reader, watch, dsn, ask, ask_file, ask_doc, embed_file, query_prefix,
+        pooling = "last";
     std::string backend;   // cpu | cuda: pinned by the process, never inherited from the environment
     std::string serve;     // a unix socket: answer questions on the watch, one JSON line each way
     int dims = 0, batch = 32, ctx = 512, threads = 4, audit = 0;
@@ -97,6 +105,7 @@ Options parse(int argc, char **argv) {
         else if (a == "--ask") o.ask = next();
         else if (a == "--ask-file") o.ask_file = next();
         else if (a == "--ask-doc") o.ask_doc = next();
+        else if (a == "--embed-file") o.embed_file = next();
         else if (a == "--serve") o.serve = next();
         else if (a == "--query-prefix") o.query_prefix = next();
         else if (a == "--pooling") o.pooling = next();
@@ -124,6 +133,8 @@ Options parse(int argc, char **argv) {
     if (o.pooling != "last" && o.pooling != "mean") die("--pooling is last or mean");
     if (!o.heads.empty() && !o.query_prefix.empty())
         die("a contract reader takes its query instruction from its manifest, not from --query-prefix");
+    if (!o.query_prefix.empty() && !o.do_register)
+        die("a pooled reader's query instruction is sealed at --register and taken from the seal, not from --query-prefix");
     return o;
 }
 
@@ -424,18 +435,31 @@ struct Reader {
         return rc == 0;
     }
 
-    // A document piece, or a question when `query` is set.
+    // A document piece, or a question when `query` is set: the reader's sealed query instruction first.
     Reading read(const std::string &text, bool query = false) {
-        if (heads) return read_contract(query ? query_instruction + text : text);
-        auto toks = tokenize(text, true);
+        const std::string body = query ? query_instruction + text : text;
+        return heads ? read_contract(body) : read_pooled(body);
+    }
+
+    // An off-the-shelf model: the text tokenized alone (a special token written in a row is text, not
+    // control), cut to what fits, then closed by the model's own special tokens. Cutting after the
+    // specials were added (until 0.6.0) dropped the EOS of every long text, and a last-token reader
+    // then pooled at a word instead of at the token it was trained to read. Counts are of the text.
+    Reading read_pooled(const std::string &text) {
+        auto toks = tokenize(text, false);
         if (toks.empty()) return {};
-        // too long: keep the head, which is where a recipe puts what matters, and say so
+        const bool bos = llama_vocab_get_add_bos(vocab), eos = llama_vocab_get_add_eos(vocab);
         int total = (int)toks.size();
-        if (total > max_tokens) toks.resize(max_tokens);
+        size_t room = (size_t)max_tokens - (bos ? 1 : 0) - (eos ? 1 : 0);
+        // too long: keep the head, which is where a recipe puts what matters, and say so
+        if (toks.size() > room) toks.resize(room);
+        int kept = (int)toks.size();
+        if (bos) toks.insert(toks.begin(), llama_vocab_bos(vocab));
+        if (eos) toks.push_back(llama_vocab_eos(vocab));
         if (!decode(toks, true)) return {};
         const float *e = llama_get_embeddings_seq(ctx, 0);
         if (!e) return {};
-        return {unit(std::vector<float>(e, e + dims)), std::nullopt, (int)toks.size(), total};
+        return {unit(std::vector<float>(e, e + dims)), std::nullopt, kept, total};
     }
 
     // The contract: the piece tokenized without special tokens, closed by the marker, read at the
@@ -603,18 +627,28 @@ void check_compute(Db &db, const Options &o, const Compute &have) {
         " was sealed on " + backend + " (" + device + ") or with other kernels or libraries: refusing to read in its name");
 }
 
-// Proves the loaded weights are the registered ones and, for a contract reader, takes its marker and
-// query instruction from the sealed manifest.
+// How a pooled reader tokenizes, as its manifest says it (0.6.0). A pooled reader registered without it
+// was read by a process that dropped the closing token of every truncated text: its readings are of
+// another reading, so it is registered again, as another reader, never served under the old name.
+constexpr const char *kPooledTokens = "text alone, cut to fit, closed by the model's own special tokens";
+
+// Proves the loaded weights are the registered ones. A contract reader takes its marker and query
+// instruction from the sealed manifest; a pooled one, its query instruction, and it must be served
+// with the pooling and the context it was sealed with, which decide what it reads.
 void check_seal(Db &db, const Options &o, Reader &rd, const Seal &have) {
     PGresult *r = nullptr;
     if (auto err = db.exec("SELECT model_sha, coalesce(adapter_sha, ''), dims, coalesce(heads_sha, ''), "
-                           "coalesce(manifest->>'marker', ''), coalesce(manifest->>'query_instruction', '') "
+                           "coalesce(manifest->>'marker', ''), coalesce(manifest->>'query_instruction', ''), "
+                           "coalesce(manifest->>'pooling', ''), coalesce(manifest->>'ctx', ''), "
+                           "coalesce(manifest->>'query_prefix', ''), coalesce(manifest->>'tokens', '') "
                            "FROM muninn.reader_seal($1)", {o.reader}, &r))
         die("cannot read the seal of reader " + o.reader + ": " + *err);
     if (PQntuples(r) != 1) die("no reader named " + o.reader + " (register it with --register)");
     std::string m = PQgetvalue(r, 0, 0), a = PQgetvalue(r, 0, 1), h = PQgetvalue(r, 0, 3);
     int dims = std::atoi(PQgetvalue(r, 0, 2));
     std::string marker = PQgetvalue(r, 0, 4), instruction = PQgetvalue(r, 0, 5);
+    std::string pooling = PQgetvalue(r, 0, 6), ctx = PQgetvalue(r, 0, 7), prefix = PQgetvalue(r, 0, 8),
+                tokens = PQgetvalue(r, 0, 9);
     PQclear(r);
     if (m != have.model_sha || a != have.adapter_sha || h != have.heads_sha)
         die("the weights loaded are not the ones reader " + o.reader + " was registered with: refusing to read in its name");
@@ -622,7 +656,14 @@ void check_seal(Db &db, const Options &o, Reader &rd, const Seal &have) {
     if (rd.heads) {
         if (marker.empty()) die("reader " + o.reader + " has heads but its manifest names no marker");
         rd.set_contract(marker, instruction);
+        return;
     }
+    if (tokens != kPooledTokens)
+        die("reader " + o.reader + " was registered before pooled readers kept the closing token of a truncated "
+            "text (pg_muninn 0.6.0): register the model again under a new name, and reader_switch the watch to it");
+    if (pooling != o.pooling) die("reader " + o.reader + " was sealed with --pooling " + pooling + ", not " + o.pooling);
+    if (ctx != std::to_string(o.ctx)) die("reader " + o.reader + " was sealed with --ctx " + ctx + ", not " + std::to_string(o.ctx));
+    rd.query_instruction = prefix;
 }
 
 std::string read_file(const std::string &path) {
@@ -666,42 +707,61 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// One question: {"q": text, "k": 10, "m": 200, "partial": false, "codes": false}; with codes the
-// answer also carries the question's code64, int8 code and code256. The question is read by this
+// One question: {"q": text, "k": 10, "m": 200, "partial": false, "codes": false, "hybrid": false,
+// "lm": 200}; with codes the answer also carries the question's code64, int8 code and code256; with
+// hybrid it is asked of muninn.find_hybrid, with the question's text for the lexical arm. The question is read by this
 // process, which proved its seal and compute, so it is comparable with the watch's readings; find
 // refuses below the watch's declared coverage unless partial is asked for, and that refusal comes
 // back as {"error": ...}: the caller fails cleanly instead of reading a half-read corpus as whole.
 std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line) {
     PGresult *r = nullptr;
     if (auto err = db.exec("SELECT j->>'q', coalesce((j->>'k')::int, 10), coalesce((j->>'m')::int, 200), "
-                           "coalesce((j->>'partial')::boolean, false), coalesce((j->>'codes')::boolean, false) "
+                           "coalesce((j->>'partial')::boolean, false), coalesce((j->>'codes')::boolean, false), "
+                           "coalesce((j->>'hybrid')::boolean, false), coalesce((j->>'lm')::int, 200) "
                            "FROM (SELECT $1::jsonb AS j) x",
                            {line}, &r))
         return json_error(db, "a question is one JSON object per line: {\"q\": text, \"k\": 10, \"m\": 200, \"partial\": false}");
     bool no_q = PQgetisnull(r, 0, 0);
     std::string q = no_q ? "" : PQgetvalue(r, 0, 0), k = PQgetvalue(r, 0, 1), m = PQgetvalue(r, 0, 2);
-    std::string partial = PQgetvalue(r, 0, 3), codes = PQgetvalue(r, 0, 4);
+    std::string partial = PQgetvalue(r, 0, 3), codes = PQgetvalue(r, 0, 4), lm = PQgetvalue(r, 0, 6);
+    bool hybrid = std::string(PQgetvalue(r, 0, 5)) == "t";
     PQclear(r);
     if (q.empty()) return json_error(db, "the question (q) is empty");
 
     auto t0 = std::chrono::steady_clock::now();
-    Reading rq = rd.read(o.query_prefix + q, true);
+    Reading rq = rd.read(q, true);
     double encode_ms = ms_since(t0);
     if (rq.v.empty()) return json_error(db, "the question has no tokens");
 
+    // find(), or find_hybrid() with the question's text for the lexical arm ($10, $11); the hits of
+    // the hybrid also say what each arm made of them.
+    std::string source = hybrid
+        ? "muninn.find_hybrid($1, $10::text, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, "
+          "nullif($8, '')::bit(256), $11::int)"
+        : "muninn.find($1, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, nullif($8, '')::bit(256))";
+    std::string arms = hybrid
+        ? ", 'vector_score', f.vector_score, 'vector_rank', f.vector_rank, 'lexical_score', f.lexical_score, "
+          "'lexical_rank', f.lexical_rank"
+        : "";
+    std::vector<std::string> params = {o.watch, o.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial,
+                                       m, code256(rq.v), codes};
+    if (hybrid) {
+        params.push_back(q);
+        params.push_back(lm);
+    }
+    std::string sql =
+        "SELECT (jsonb_build_object('watch', $1::text, 'reader', $2::text, "
+        "  'hits', coalesce((SELECT jsonb_agg(jsonb_build_object('key', f.key, 'score', f.score, 'hamming', f.hamming, "
+        "      'state', f.state, 'familiarity', f.familiarity, 'read_at', f.read_at, 'truncated', f.truncated" + arms + ") "
+        "      ORDER BY f.score DESC, f.key) "
+        "    FROM " + source + " f), '[]'::jsonb), "
+        "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM muninn.coverage($1) c)) "
+        // the question's own codes, on request: to audit an answer or to run find by hand
+        "|| CASE WHEN $9::boolean THEN jsonb_build_object('code64', $3::bigint, 'code', to_jsonb($4::smallint[]), "
+        "     'code256', nullif($8, '')) ELSE '{}'::jsonb END)::text";
+
     auto t1 = std::chrono::steady_clock::now();
-    if (auto err = db.exec(
-            "SELECT (jsonb_build_object('watch', $1::text, 'reader', $2::text, "
-            "  'hits', coalesce((SELECT jsonb_agg(jsonb_build_object('key', f.key, 'score', f.score, 'hamming', f.hamming, "
-            "      'state', f.state, 'familiarity', f.familiarity, 'read_at', f.read_at, 'truncated', f.truncated) "
-            "      ORDER BY f.score DESC, f.key) "
-            "    FROM muninn.find($1, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, nullif($8, '')::bit(256)) f), '[]'::jsonb), "
-            "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM muninn.coverage($1) c)) "
-            // the question's own codes, on request: to audit an answer or to run find by hand
-            "|| CASE WHEN $9::boolean THEN jsonb_build_object('code64', $3::bigint, 'code', to_jsonb($4::smallint[]), "
-            "     'code256', nullif($8, '')) ELSE '{}'::jsonb END)::text",
-            {o.watch, o.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial, m, code256(rq.v), codes},
-            &r)) {
+    if (auto err = db.exec(sql.c_str(), params, &r)) {
         // The message and its hint, as the caller should read them; the PL/pgSQL context is ours.
         std::string msg = *err;
         if (msg.rfind("ERROR:  ", 0) == 0) msg.erase(0, 8);
@@ -785,6 +845,22 @@ struct Asker {
     }
 };
 
+// The weights of the lexical arm follow the rows when the queue empties (pg_muninn 0.6.0). A database
+// without lexical_maintain() (before 0.6.0) is said once, and the reader goes on reading.
+void maintain_lexicon(Db &db, const Options &o) {
+    static bool unavailable = false;
+    if (unavailable) return;
+    PGresult *r = nullptr;
+    if (auto err = db.exec("SELECT muninn.lexical_maintain($1)", {o.watch}, &r)) {
+        std::fprintf(stderr, "muninn-reader: the lexical weights of %s are not kept here: %s", o.watch.c_str(), err->c_str());
+        unavailable = true;
+        return;
+    }
+    if (std::string(PQgetvalue(r, 0, 0)) == "t")
+        std::fprintf(stderr, "muninn-reader: %s: lexical weights recounted\n", o.watch.c_str());
+    PQclear(r);
+}
+
 // The idle wait: until a NOTIFY says there is something to read, or 30 s pass, whichever first.
 // With an asker, questions are answered meanwhile. A NOTIFY can also arrive while a question's
 // query runs (libpq then queues it), so the queue is checked after each step too.
@@ -849,11 +925,11 @@ int main(int argc, char **argv) {
         }
         if (rd.heads) die("a reader with heads registers through its --manifest");
         std::vector<std::string> params = {o.reader, have.model_sha, std::to_string(rd.dims), have.adapter_sha,
-                                           o.pooling, std::to_string(o.ctx), o.query_prefix};
+                                           o.pooling, std::to_string(o.ctx), o.query_prefix, kPooledTokens};
         params.insert(params.end(), cv.begin(), cv.end());
         std::string sql = "SELECT muninn.reader_register($1, $2, $3::int, nullif($4, ''), "
-                          "jsonb_build_object('pooling', $5::text, 'ctx', $6::int, 'query_prefix', $7::text), " +
-                          compute_json(8) + ")";
+                          "jsonb_build_object('pooling', $5::text, 'ctx', $6::int, 'query_prefix', $7::text, "
+                          "'tokens', $8::text), " + compute_json(9) + ")";
         if (auto err = db.exec(sql.c_str(), params, &r)) die("cannot register: " + *err);
         std::printf("registered reader %s (model %s, %d dimensions; %s on %s)\n", o.reader.c_str(),
                     have.model_sha.substr(0, 12).c_str(), rd.dims, compute.backend.c_str(), compute.device.c_str());
@@ -864,10 +940,10 @@ int main(int argc, char **argv) {
     check_seal(db, o, rd, have);
 
     if (!o.serve.empty() && (o.watch.empty() || o.once || o.audit > 0 || !o.ask.empty() || !o.ask_file.empty() ||
-                             !o.ask_doc.empty()))
+                             !o.ask_doc.empty() || !o.embed_file.empty()))
         die("--serve answers questions while the process reads its --watch: not with --once, --audit or --ask*");
     if (!o.ask.empty()) {
-        Reading q = rd.read(o.query_prefix + o.ask, true);
+        Reading q = rd.read(o.ask, true);
         if (q.v.empty()) die("the question has no tokens");
         std::printf("%lld\t%s\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str(), code256(q.v).c_str());
         return 0;
@@ -904,13 +980,29 @@ int main(int argc, char **argv) {
         flush();
         return 0;
     }
+    if (!o.embed_file.empty()) {
+        // Questions and documents, each read as find and the watch would read it: for checking a reader
+        // against another implementation of the same model, and for measuring without a watch.
+        std::ifstream f(o.embed_file);
+        if (!f) die("cannot read " + o.embed_file);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.size() < 2 || (line[0] != 'Q' && line[0] != 'D') || line[1] != ' ') die("--embed-file lines are \"Q <base64>\" or \"D <base64>\"");
+            Reading q = rd.read(from_base64(line.substr(2)), line[0] == 'Q');
+            if (q.v.empty()) std::printf("%c\t\t\t\t\t\n", line[0]);
+            else std::printf("%c\t%lld\t%s\t%s\t%d\t%d\n", line[0], (long long)code64(q.v), code_literal(q.v).c_str(),
+                             code256(q.v).c_str(), q.tokens_read, q.tokens_total);
+            std::fflush(stdout);
+        }
+        return 0;
+    }
     if (!o.ask_file.empty()) {
         // The model loads once; each line is a question and gets its codes on the same line number.
         std::ifstream f(o.ask_file);
         if (!f) die("cannot read " + o.ask_file);
         std::string line;
         while (std::getline(f, line)) {
-            Reading q = line.empty() ? Reading{} : rd.read(o.query_prefix + line, true);
+            Reading q = line.empty() ? Reading{} : rd.read(line, true);
             if (q.v.empty()) std::printf("\t\t\n");
             else std::printf("%lld\t%s\t%s\n", (long long)code64(q.v), code_literal(q.v).c_str(),
                              code256(q.v).c_str());
@@ -990,6 +1082,7 @@ int main(int argc, char **argv) {
         if (rows == 0) {
             std::fprintf(stderr, "muninn-reader: %s: %ld read, %ld failed, %ld refused; queue empty\n",
                          o.watch.c_str(), read_ok, failed, refused);
+            maintain_lexicon(db, o);
             if (o.once) break;
             wait_for_work(db, o, rd, asker.get());
         }

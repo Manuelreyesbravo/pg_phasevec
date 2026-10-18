@@ -1,0 +1,44 @@
+-- 0.6.0: how a reader reads is part of what it is.
+\set VERBOSITY terse
+CREATE EXTENSION pg_muninn;
+-- a pooled reader as muninn-reader --register writes it
+SELECT muninn.reader_register('q@cpu', repeat('b', 64), 1024, NULL,
+    '{"pooling": "last", "ctx": 1024, "query_prefix": "Instruct: find\nQuery: ", "tokens": "t"}',
+    jsonb_build_object('backend', 'cpu', 'device', 'd', 'libs', repeat('c', 64))) > 0 AS registered;
+ registered 
+------------
+ t
+(1 row)
+
+-- the same model asking questions another way is another reader
+SELECT muninn.reader_register('q-plain@cpu', repeat('b', 64), 1024, NULL,
+    '{"pooling": "last", "ctx": 1024, "query_prefix": "", "tokens": "t"}',
+    jsonb_build_object('backend', 'cpu', 'device', 'd', 'libs', repeat('c', 64))) > 0 AS another_reader;
+ another_reader 
+----------------
+ t
+(1 row)
+
+-- and cut at another context, another again
+SELECT muninn.reader_register('q-512@cpu', repeat('b', 64), 1024, NULL,
+    '{"pooling": "last", "ctx": 512, "query_prefix": "", "tokens": "t"}',
+    jsonb_build_object('backend', 'cpu', 'device', 'd', 'libs', repeat('c', 64))) > 0 AS another_again;
+ another_again 
+---------------
+ t
+(1 row)
+
+-- but the same reading under another name is refused
+SELECT muninn.reader_register('q-renamed@cpu', repeat('b', 64), 1024, NULL,
+    '{"pooling": "last", "ctx": 1024, "query_prefix": "", "tokens": "t", "note": "a label is not a reader"}',
+    jsonb_build_object('backend', 'cpu', 'device', 'd', 'libs', repeat('c', 64)));
+ERROR:  duplicate key value violates unique constraint "readers_seal_key"
+SELECT name, reads FROM muninn.readers ORDER BY id;
+    name     |                                           reads                                            
+-------------+--------------------------------------------------------------------------------------------
+ q@cpu       | {"ctx": 1024, "tokens": "t", "pooling": "last", "query_prefix": "Instruct: find\nQuery: "}
+ q-plain@cpu | {"ctx": 1024, "tokens": "t", "pooling": "last", "query_prefix": ""}
+ q-512@cpu   | {"ctx": 512, "tokens": "t", "pooling": "last", "query_prefix": ""}
+(3 rows)
+
+DROP EXTENSION pg_muninn;

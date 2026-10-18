@@ -173,7 +173,7 @@ SELECT key, state, failed FROM muninn.reading_states WHERE key = '2';
 (1 row)
 
 -- ------------------------------------------------ the trigger's writers cannot be called directly
-SELECT muninn._note((SELECT id FROM muninn.watches WHERE name = 'docs'), '1', '\x00');
+SELECT muninn._note((SELECT id FROM muninn.watches WHERE name = 'docs'), '1', '\x00', 'forged');
 ERROR:  muninn: _note() is called by a watch trigger, not directly
 SELECT muninn._forget((SELECT id FROM muninn.watches WHERE name = 'docs'), '1');
 ERROR:  muninn: _forget() is called by a watch trigger, not directly

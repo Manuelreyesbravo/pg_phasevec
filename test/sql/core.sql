@@ -75,7 +75,7 @@ SELECT muninn.record_failure('docs', '2', 'r1', (SELECT text_hash FROM muninn.so
 SELECT key, state, failed FROM muninn.reading_states WHERE key = '2';
 
 -- ------------------------------------------------ the trigger's writers cannot be called directly
-SELECT muninn._note((SELECT id FROM muninn.watches WHERE name = 'docs'), '1', '\x00');
+SELECT muninn._note((SELECT id FROM muninn.watches WHERE name = 'docs'), '1', '\x00', 'forged');
 SELECT muninn._forget((SELECT id FROM muninn.watches WHERE name = 'docs'), '1');
 
 -- ------------------------------------------------ a new reader makes every old reading foreign

@@ -1,0 +1,208 @@
+-- 0.6.0: a watch read by its words too, in the same transaction as its text; find_hybrid() asks both.
+\set VERBOSITY terse
+CREATE EXTENSION pg_muninn VERSION '0.5.0';
+SELECT muninn.reader_register('t1', repeat('a', 64), 4) > 0 AS t1;
+ t1 
+----
+ t
+(1 row)
+
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs VALUES
+    (1, 'nbtree treats heap TID as a tiebreaker column'),
+    (2, 'fix memory alignment in pg_mcv_list serialization'),
+    (3, 'the planner chooses a merge append plan'),
+    (4, 'vacuum cost delay is fractional since twelve'),
+    (5, 'nbtree deduplication of posting lists');
+-- forty rows of common words, so that the rare ones are rare
+INSERT INTO docs SELECT g, 'common filler words in row ' || g FROM generate_series(10, 49) g;
+SELECT muninn.watch('docs', 'docs'::regclass, 'id', 'r.body', 't1') > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+ALTER EXTENSION pg_muninn UPDATE TO '0.6.0';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_muninn';
+ extversion 
+------------
+ 0.6.0
+(1 row)
+
+-- every row read; the vector of row k points at k, so the vector arm alone prefers 49, 48, ...
+SELECT count(muninn.record('docs', n.key, 't1', n.text_hash, n.key::bigint,
+                           ARRAY[n.key::int, 1, 0, 0]::smallint[], NULL, NULL, 5, 5))
+  FROM muninn.next('docs', 100) n;
+ count 
+-------
+    45
+(1 row)
+
+-- not read lexically: find_hybrid refuses, it does not answer with the vector alone
+SELECT * FROM muninn.find_hybrid('docs', 'heap tiebreaker', 1, ARRAY[100, 1, 0, 0]::smallint[]);
+ERROR:  muninn: watch docs is not read lexically
+SELECT muninn.lexical_maintain('docs') AS maintained;
+ maintained 
+------------
+ f
+(1 row)
+
+SELECT muninn.lexical('docs', 'english') AS read_lexically;
+ read_lexically 
+----------------
+             45
+(1 row)
+
+SELECT n, round(avg_n::numeric, 2) AS avg_n FROM muninn.lexdocs;
+ n  | avg_n 
+----+-------
+ 45 |  5.07
+(1 row)
+
+SELECT lexeme, ndoc FROM muninn.lexstats WHERE lexeme IN ('nbtree', 'mcv', 'tiebreak', 'common') ORDER BY 1;
+  lexeme  | ndoc 
+----------+------
+ common   |   40
+ mcv      |    1
+ nbtree   |    2
+ tiebreak |    1
+(4 rows)
+
+SELECT count(*) AS without_lexemes FROM muninn.sources WHERE lexemes IS NULL;
+ without_lexemes 
+-----------------
+               0
+(1 row)
+
+-- the question's vector points at row 49 (m covers every row, so the vector arm is exact): the vector
+-- arm alone ranks 49, 48, 47; the rare words bring row 1 into the top, and each hit says which arm
+-- brought it, and where
+SELECT key, round(score::numeric, 5) AS score, vector_rank, lexical_rank, state
+  FROM muninn.find_hybrid('docs', 'what made heap TID a tiebreaker in nbtree?', 49, ARRAY[100, 1, 0, 0]::smallint[], 4, false, 100, NULL, 4);
+ key |  score  | vector_rank | lexical_rank | state 
+-----+---------+-------------+--------------+-------
+ 5   | 0.02603 |          41 |            2 | fresh
+ 1   | 0.02592 |          45 |            1 | fresh
+ 49  | 0.01639 |           1 |              | fresh
+ 48  | 0.01613 |           2 |              | fresh
+(4 rows)
+
+-- a question made only of common words has no lexical arm: the vector ranking alone
+SELECT key, vector_rank, lexical_rank
+  FROM muninn.find_hybrid('docs', 'common filler words', 49, ARRAY[100, 1, 0, 0]::smallint[], 3, false, 100, NULL, 3);
+ key | vector_rank | lexical_rank 
+-----+-------------+--------------
+ 49  |           1 |             
+ 48  |           2 |             
+ 47  |           3 |             
+(3 rows)
+
+-- the text changes: in the same transaction its lexical reading is the new one, and its vector
+-- reading is stale, so neither arm serves the row
+BEGIN;
+UPDATE docs SET body = 'nbtree heap tiebreaker rewritten' WHERE id = 5;
+SELECT lexemes @@ muninn._term('rewritten') AS new_words_now FROM muninn.sources WHERE key = '5';
+ new_words_now 
+---------------
+ t
+(1 row)
+
+SELECT key, lexical_rank FROM muninn.find_hybrid('docs', 'heap tiebreaker nbtree rewritten', 49, ARRAY[100, 1, 0, 0]::smallint[], 5, true, 100, NULL, 5)
+ WHERE key IN ('1', '5') ORDER BY key;
+ key | lexical_rank 
+-----+--------------
+ 1   |            1
+(1 row)
+
+COMMIT;
+-- the weights follow when the reader's queue empties
+SELECT muninn.lexical_maintain('docs') AS maintained;
+ maintained 
+------------
+ t
+(1 row)
+
+SELECT muninn.lexical_maintain('docs') AS maintained_again;
+ maintained_again 
+------------------
+ f
+(1 row)
+
+SELECT ndoc FROM muninn.lexstats WHERE lexeme = 'rewritten';
+ ndoc 
+------
+    1
+(1 row)
+
+-- a row without its lexical reading: refused unless partial
+UPDATE muninn.sources SET lexemes = NULL, lexeme_n = NULL WHERE key = '3';
+SELECT count(*) FROM muninn.find_hybrid('docs', 'merge append', 1, ARRAY[1, 1, 0, 0]::smallint[]);
+ERROR:  muninn: watch docs has rows not read lexically
+SELECT count(*) > 0 AS partial_answers FROM muninn.find_hybrid('docs', 'merge append', 1, ARRAY[1, 1, 0, 0]::smallint[], 10, true);
+ partial_answers 
+-----------------
+ t
+(1 row)
+
+SELECT muninn.lexical('docs', 'english') AS read_again;
+ read_again 
+------------
+         45
+(1 row)
+
+SELECT key, lexical_rank FROM muninn.find_hybrid('docs', 'merge append planner', 49, ARRAY[100, 1, 0, 0]::smallint[], 3, false, 100, NULL, 3)
+ WHERE lexical_rank IS NOT NULL;
+ key | lexical_rank 
+-----+--------------
+ 3   |            1
+(1 row)
+
+-- a text far longer than a tsvector holds is still written; its lexical reading is of its head
+INSERT INTO docs VALUES (60, 'needle ' || repeat('hay ', 200000) || 'tailword');
+SELECT lexemes @@ muninn._term('needl') AS head_read, lexemes @@ muninn._term('tailword') AS tail_read
+  FROM muninn.sources WHERE key = '60';
+ head_read | tail_read 
+-----------+-----------
+ t         | f
+(1 row)
+
+-- lexemes with quotes and backslashes are terms, not syntax
+SELECT muninn._term($$o'k\x$$) AS term;
+   term    
+-----------
+ 'o''k\\x'
+(1 row)
+
+SELECT to_tsvector('simple', $$o'k\x$$) @@ muninn._term('o') AS quoted;
+ quoted 
+--------
+ t
+(1 row)
+
+-- only a trigger notes a row
+SELECT muninn._note(1, '1', '\x00'::bytea, 'forged');
+ERROR:  muninn: _note() is called by a watch trigger, not directly
+-- the counts still agree with a recount
+SELECT count(*) AS mismatches FROM muninn.coverage_check('docs');
+ mismatches 
+------------
+          0
+(1 row)
+
+-- reading lexically can stop
+SELECT muninn.lexical('docs', NULL) AS stopped;
+ stopped 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS with_lexemes FROM muninn.sources WHERE lexemes IS NOT NULL;
+ with_lexemes 
+--------------
+            0
+(1 row)
+
+SELECT * FROM muninn.find_hybrid('docs', 'nbtree', 1, ARRAY[1, 1, 0, 0]::smallint[]);
+ERROR:  muninn: watch docs is not read lexically
+DROP TABLE docs;
+DROP EXTENSION pg_muninn;
