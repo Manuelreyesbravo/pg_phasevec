@@ -283,8 +283,10 @@ BEGIN
     IF p_q IS NULL OR cardinality(p_q) <> dims THEN
         RAISE EXCEPTION 'muninn: the question must be read by the watch''s reader (% dimensions)', dims;
     END IF;
-    IF p_k NOT BETWEEN 1 AND 1000 OR p_m NOT BETWEEN p_k AND 100000 OR p_lm NOT BETWEEN p_k AND 100000 THEN
-        RAISE EXCEPTION 'muninn: k must be in 1..1000, and m and lm in k..100000';
+    -- k may exceed either arm: asking for k = m + lm returns every candidate of both, with its ranks
+    -- (the union a reranker reads).
+    IF p_k NOT BETWEEN 1 AND 1000 OR p_m NOT BETWEEN 1 AND 100000 OR p_lm NOT BETWEEN 1 AND 100000 THEN
+        RAISE EXCEPTION 'muninn: k must be in 1..1000, and m and lm in 1..100000';
     END IF;
     IF w.lexical IS NULL THEN
         RAISE EXCEPTION 'muninn: watch % is not read lexically', p_watch

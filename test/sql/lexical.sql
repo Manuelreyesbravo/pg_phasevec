@@ -35,6 +35,10 @@ SELECT count(*) AS without_lexemes FROM muninn.sources WHERE lexemes IS NULL;
 -- brought it, and where
 SELECT key, round(score::numeric, 5) AS score, vector_rank, lexical_rank, state
   FROM muninn.find_hybrid('docs', 'what made heap TID a tiebreaker in nbtree?', 49, ARRAY[100, 1, 0, 0]::smallint[], 4, false, 100, NULL, 4);
+-- k = m + lm: every candidate of both arms, each with its ranks (vector top 3 and lexical top 2 here)
+SELECT key, vector_rank, lexical_rank
+  FROM muninn.find_hybrid('docs', 'what made heap TID a tiebreaker in nbtree?', 49, ARRAY[100, 1, 0, 0]::smallint[], 5, false, 3, NULL, 2)
+ ORDER BY vector_rank NULLS LAST, lexical_rank;
 -- a question made only of common words has no lexical arm: the vector ranking alone
 SELECT key, vector_rank, lexical_rank
   FROM muninn.find_hybrid('docs', 'common filler words', 49, ARRAY[100, 1, 0, 0]::smallint[], 3, false, 100, NULL, 3);
