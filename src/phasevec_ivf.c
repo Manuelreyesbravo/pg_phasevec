@@ -37,6 +37,8 @@
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
 #include "utils/varlena.h"
+#include "utils/lsyscache.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
 #include "utils/varbit.h"
 
@@ -113,6 +115,7 @@ normalize(float *v, int dims)
 /* ------------------------------------------------------------------------------------ build -- */
 
 static bool have_added(void);
+static bool have_gen(void);
 
 PG_FUNCTION_INFO_V1(phasevec_ivf_build);
 Datum
@@ -500,7 +503,7 @@ typedef struct BIndex
 {
 	MemoryContext cx;
 	int32		watch;
-	TransactionId xmin;
+	uint64		ver;			/* the copy's version: phasevec.ivf_cents.gen (0.10.0) or its xmin */
 	int			k, dims, n;
 	float	   *cents;			/* k x dims */
 	int		   *lstart;			/* k + 1: where each list starts among the entries */
@@ -515,7 +518,21 @@ typedef struct BIndex
 	int			slot;
 } BIndex;
 
-static BIndex g_ix = {NULL, 0, InvalidTransactionId, 0, 0, 0};
+static BIndex g_ix = {NULL, 0, 0, 0, 0, 0};
+
+/*
+ * phasevec.ivf_cents.gen exists from 0.10.0 on. Asked of the syscache on every call, never remembered:
+ * a backend that lives through ALTER EXTENSION ... UPDATE switches with it.
+ */
+#define GEN_BIT (UINT64CONST(1) << 63)	/* a generation, never equal to an xmin */
+static bool
+have_gen(void)
+{
+	Oid			ns = get_namespace_oid("phasevec", true);
+	Oid			rel = OidIsValid(ns) ? get_relname_relid("ivf_cents", ns) : InvalidOid;
+
+	return OidIsValid(rel) && get_attnum(rel, "gen") != InvalidAttrNumber;
+}
 
 /* phasevec.ivf_added exists from 0.10.0 on: an older SQL with this library has no chunks. */
 static bool
@@ -526,12 +543,13 @@ have_added(void)
 }
 
 static void
-load_index(int32 watch, TransactionId xmin, int k, int dims, int n, bytea *cb)
+load_index(int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 {
 	Oid			at[1] = {INT4OID};
 	Datum		av[1] = {Int32GetDatum(watch)};
 	MemoryContext old;
 	BIndex		ix = {0};
+	MemoryContext volatile loading;
 	uint8	   *have;
 	int64		ne = 0, kcap = 1 << 20, klen = 0;
 	int		   *lsize, *bsize, *fill;
@@ -544,9 +562,12 @@ load_index(int32 watch, TransactionId xmin, int k, int dims, int n, bytea *cb)
 		MemoryContextDelete(g_ix.cx);
 	g_ix.cx = NULL;
 	ix.cx = AllocSetContextCreate(TopMemoryContext, "phasevec ivf index", ALLOCSET_DEFAULT_SIZES);
+	loading = ix.cx;
+	PG_TRY();
+	{
 	old = MemoryContextSwitchTo(ix.cx);
 	ix.watch = watch;
-	ix.xmin = xmin;
+	ix.ver = ver;
 	ix.k = k;
 	ix.dims = dims;
 	ix.n = n;
@@ -627,6 +648,10 @@ load_index(int32 watch, TransactionId xmin, int k, int dims, int n, bytea *cb)
 		td = SPI_tuptable->tupdesc;
 		sz = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
 		ssz = DatumGetInt32(SPI_getbinval(tup, td, 8, &isnull));
+		if (VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull))) != sizeof(int32) * (size_t) sz ||
+			VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 7, &isnull))) != (size_t) sz * dims ||
+			VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 9, &isnull))) != sizeof(int32) * (size_t) ssz)
+			elog(ERROR, "phasevec ivf: list %d of watch %d has blobs of the wrong size", j, watch);
 		if (sz + ssz != bsize[j])
 			elog(ERROR, "phasevec ivf: list %d changed while loading", j);
 		docs = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull)));
@@ -704,6 +729,14 @@ load_index(int32 watch, TransactionId xmin, int k, int dims, int n, bytea *cb)
 				const int32 *sdocs = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 10, &isnull)));
 				const uint8 *sc256 = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 11, &isnull)));
 
+				if (VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 3, &isnull))) != sizeof(int32) * (size_t) sz ||
+					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 5, &isnull))) != sizeof(int32) * (size_t) (sz + 1) ||
+					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 6, &isnull))) != (size_t) sz * HB ||
+					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 7, &isnull))) != (size_t) sz * CB ||
+					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 8, &isnull))) != (size_t) sz * dims ||
+					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 10, &isnull))) != sizeof(int32) * (size_t) ssz ||
+					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 11, &isnull))) != (size_t) ssz * CB)
+					elog(ERROR, "phasevec ivf: a chunk of list %d of watch %d has blobs of the wrong size", l, watch);
 				if (l < 0 || l >= k || fill[l] + sz + ssz > ix.lstart[l + 1])
 					elog(ERROR, "phasevec ivf: a chunk of list %d changed while loading", l);
 				for (int t = 0; t < sz; t++)
@@ -744,6 +777,10 @@ load_index(int32 watch, TransactionId xmin, int k, int dims, int n, bytea *cb)
 		}
 		SPI_cursor_close(pc);
 	}
+	for (int j = 0; j < k; j++)
+		if (fill[j] != ix.lstart[j + 1])
+			elog(ERROR, "phasevec ivf: list %d of watch %d holds %d entries, %d counted", j, watch,
+				 fill[j] - ix.lstart[j], ix.lstart[j + 1] - ix.lstart[j]);
 	/* keys by ordinal, so a reading's key is keys[koff[d] .. koff[d + 1]) */
 	ix.keys = MemoryContextAllocHuge(ix.cx, klen ? klen : 1);
 	ix.koff = MemoryContextAllocHuge(ix.cx, sizeof(int64) * (n + 1));
@@ -761,6 +798,15 @@ load_index(int32 watch, TransactionId xmin, int k, int dims, int n, bytea *cb)
 	pfree(kpos);
 	pfree(klen_of);
 	pfree(have);
+	}
+	PG_CATCH();
+	{
+		/* a cancel, a timeout or a check below: the half-built index goes with it */
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(loading);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	g_ix = ix;
 }
 
@@ -781,13 +827,16 @@ extern bool phasevec_shared_ivf_cache;
 bool		phasevec_shared_ivf_cache = true;
 
 #define SLOTS 32
+#define PER_WATCH 2				/* versions of one watch kept at once: old and new snapshots both served */
+extern int	phasevec_shared_ivf_cache_mb;
+int			phasevec_shared_ivf_cache_mb = 1024;
 
 typedef struct Slot
 {
 	bool		used, dead;
 	Oid			db;
 	int32		watch;
-	TransactionId xmin;
+	uint64		ver;			/* the copy's version: phasevec.ivf_cents.gen (0.10.0) or its xmin */
 	dsa_pointer blob;
 	Size		size;
 	int			refs;
@@ -798,6 +847,7 @@ typedef struct Ctl
 {
 	LWLock		lock;
 	uint64		tick;
+	Size		bytes;			/* held by every used slot */
 	Slot		slot[SLOTS];
 } Ctl;
 
@@ -833,11 +883,17 @@ attach_shared(void)
 {
 	bool		found;
 
-	if (g_ctl)
+	Ctl		   *ctl;
+	dsa_area   *area;
+
+	if (g_ctl && g_area)
 		return true;
-	g_ctl = GetNamedDSMSegment("phasevec_ivf_cache", sizeof(Ctl), ctl_init, &found, NULL);
-	g_area = GetNamedDSA("phasevec_ivf_cache_dsa", &found);
+	/* both or neither: an error between them must not leave a control block without its area */
+	ctl = GetNamedDSMSegment("phasevec_ivf_cache", sizeof(Ctl), ctl_init, &found, NULL);
+	area = GetNamedDSA("phasevec_ivf_cache_dsa", &found);
 	before_shmem_exit(release_at_exit, (Datum) 0);
+	g_area = area;
+	g_ctl = ctl;
 	return true;
 }
 
@@ -846,6 +902,8 @@ free_slot(Slot *sl)
 {
 	if (sl->blob != InvalidDsaPointer)
 		dsa_free(g_area, sl->blob);
+	if (sl->used && g_ctl->bytes >= sl->size)
+		g_ctl->bytes -= sl->size;
 	memset(sl, 0, sizeof(Slot));
 	sl->blob = InvalidDsaPointer;
 }
@@ -867,12 +925,12 @@ release_index(void)
 	LWLockRelease(&g_ctl->lock);
 	g_ix.shared = false;
 	g_ix.watch = 0;
-	g_ix.xmin = InvalidTransactionId;
+	g_ix.ver = 0;
 }
 
-/* The shared copy of (this database, watch, xmin), if there is one: g_ix points into it, held. */
+/* The shared copy of (this database, watch, version), if there is one: g_ix points into it, held. */
 static bool
-use_shared(int32 watch, TransactionId xmin)
+use_shared(int32 watch, uint64 ver)
 {
 	int			found = -1;
 	char	   *b;
@@ -883,7 +941,7 @@ use_shared(int32 watch, TransactionId xmin)
 	{
 		Slot	   *sl = &g_ctl->slot[i];
 
-		if (sl->used && !sl->dead && sl->db == MyDatabaseId && sl->watch == watch && sl->xmin == xmin)
+		if (sl->used && !sl->dead && sl->db == MyDatabaseId && sl->watch == watch && sl->ver == ver)
 		{
 			sl->refs++;
 			sl->tick = ++g_ctl->tick;
@@ -900,7 +958,7 @@ use_shared(int32 watch, TransactionId xmin)
 	h = (Blob *) b;
 	g_ix.cx = NULL;
 	g_ix.watch = watch;
-	g_ix.xmin = xmin;
+	g_ix.ver = ver;
 	g_ix.k = h->k;
 	g_ix.dims = h->dims;
 	g_ix.n = h->n;
@@ -944,6 +1002,8 @@ publish_index(void)
 	SECTION(hash, (Size) g_ix.n * HB);
 	SECTION(keys, h.klen ? h.klen : 1);
 #undef SECTION
+	if (at > (Size) phasevec_shared_ivf_cache_mb * 1024 * 1024)
+		return false;			/* larger than the whole cache: kept private */
 	dp = dsa_allocate_extended(g_area, at, DSA_ALLOC_HUGE | DSA_ALLOC_NO_OOM);
 	if (dp == InvalidDsaPointer)
 		return false;
@@ -960,23 +1020,56 @@ publish_index(void)
 	memcpy(b + h.keys, g_ix.keys, h.klen);
 
 	LWLockAcquire(&g_ctl->lock, LW_EXCLUSIVE);
-	for (int i = 0; i < SLOTS; i++)
 	{
-		Slot	   *sl = &g_ctl->slot[i];
+		int			mine = 0, oldest = -1;
 
-		if (!sl->used || sl->dead || sl->db != MyDatabaseId || sl->watch != g_ix.watch)
-			continue;
-		if (sl->xmin == g_ix.xmin)
+		for (int i = 0; i < SLOTS; i++)
 		{
-			/* another backend published the same copy meanwhile: keep theirs */
-			LWLockRelease(&g_ctl->lock);
-			dsa_free(g_area, dp);
-			return true;
+			Slot	   *sl = &g_ctl->slot[i];
+
+			if (!sl->used || sl->dead || sl->db != MyDatabaseId || sl->watch != g_ix.watch)
+				continue;
+			if (sl->ver == g_ix.ver)
+			{
+				/* another backend published the same version meanwhile: keep theirs */
+				LWLockRelease(&g_ctl->lock);
+				dsa_free(g_area, dp);
+				return true;
+			}
+			/*
+			 * Other versions of the watch stay: a reader with an older snapshot still asks for the
+			 * old one, and killing it made readers of the two snapshots reload by turns (audit 22-10).
+			 * At most PER_WATCH of them: the least recently used goes.
+			 */
+			mine++;
+			if (oldest < 0 || sl->tick < g_ctl->slot[oldest].tick)
+				oldest = i;
 		}
-		/* an older copy of this watch: no new reader takes it; freed when its last one lets go */
-		sl->dead = true;
-		if (sl->refs == 0)
-			free_slot(sl);
+		if (mine >= PER_WATCH && oldest >= 0)
+		{
+			g_ctl->slot[oldest].dead = true;
+			if (g_ctl->slot[oldest].refs == 0)
+				free_slot(&g_ctl->slot[oldest]);
+		}
+	}
+	/* the memory cap: unreferenced copies go, least recently used first, until this one fits */
+	while (g_ctl->bytes + at > (Size) phasevec_shared_ivf_cache_mb * 1024 * 1024)
+	{
+		int			victim = -1;
+
+		for (int i = 0; i < SLOTS; i++)
+			if (g_ctl->slot[i].used && g_ctl->slot[i].refs == 0 &&
+				(victim < 0 || g_ctl->slot[i].tick < g_ctl->slot[victim].tick))
+				victim = i;
+		if (victim < 0)
+			break;
+		free_slot(&g_ctl->slot[victim]);
+	}
+	if (g_ctl->bytes + at > (Size) phasevec_shared_ivf_cache_mb * 1024 * 1024)
+	{
+		LWLockRelease(&g_ctl->lock);
+		dsa_free(g_area, dp);
+		return false;
 	}
 	for (int i = 0; i < SLOTS && slot < 0; i++)
 		if (!g_ctl->slot[i].used)
@@ -1000,9 +1093,10 @@ publish_index(void)
 	g_ctl->slot[slot].dead = false;
 	g_ctl->slot[slot].db = MyDatabaseId;
 	g_ctl->slot[slot].watch = g_ix.watch;
-	g_ctl->slot[slot].xmin = g_ix.xmin;
+	g_ctl->slot[slot].ver = g_ix.ver;
 	g_ctl->slot[slot].blob = dp;
 	g_ctl->slot[slot].size = at;
+	g_ctl->bytes += at;
 	g_ctl->slot[slot].refs = 0;
 	g_ctl->slot[slot].tick = ++g_ctl->tick;
 	LWLockRelease(&g_ctl->lock);
@@ -1010,20 +1104,20 @@ publish_index(void)
 }
 
 /*
- * The index of (watch, xmin) for this query: the shared copy, or the private one. True if g_ix
+ * The index of (watch, version) for this query: the shared copy, or the private one. True if g_ix
  * already holds it; false if the caller must load it (load_index) and then call it again.
  */
 static bool
-acquire_index(int32 watch, TransactionId xmin, bool just_loaded)
+acquire_index(int32 watch, uint64 ver, bool just_loaded)
 {
 	if (phasevec_shared_ivf_cache && attach_shared())
 	{
 		if (just_loaded)
 			publish_index();
-		if (use_shared(watch, xmin))
+		if (use_shared(watch, ver))
 			return true;
 	}
-	return g_ix.cx != NULL && g_ix.watch == watch && g_ix.xmin == xmin;
+	return g_ix.cx != NULL && g_ix.watch == watch && g_ix.ver == ver;
 }
 
 typedef struct Cand
@@ -1184,18 +1278,26 @@ hold_index(int32 watch)
 	TupleDesc	td;
 	bool		isnull;
 	int			ck, cdims, cn;
-	TransactionId xmin;
-
-	static SPIPlanPtr plan = NULL;
+	uint64		ver;
+	static SPIPlanPtr plans[2] = {NULL, NULL};
+	bool		gen = have_gen();
+	SPIPlanPtr	plan = plans[gen];
 
 	if (plan == NULL)
 	{
-		SPIPlanPtr	p = SPI_prepare("SELECT k, dims, n, c, xmin::text::bigint FROM phasevec.ivf_cents WHERE watch = $1", 1, at);
+		/*
+		 * The version a copy is keyed by: ivf_cents.gen, drawn from a sequence by every build and absorb
+		 * (0.10.0). The xmin was not enough: two changes in one transaction share it (audit of 22-10).
+		 * With the SQL of 0.8.0/0.9.0 (no gen column) the xmin is used, as then.
+		 */
+		SPIPlanPtr	p = SPI_prepare(gen
+									? "SELECT k, dims, n, c, gen FROM phasevec.ivf_cents WHERE watch = $1"
+									: "SELECT k, dims, n, c, xmin::text::bigint FROM phasevec.ivf_cents WHERE watch = $1", 1, at);
 
 		if (p == NULL)
 			elog(ERROR, "phasevec ivf: cannot prepare the centroids' query");
 		SPI_keepplan(p);
-		plan = p;
+		plans[gen] = plan = p;
 	}
 	SPI_execute_plan(plan, av, NULL, true, 1);
 	if (SPI_processed != 1)
@@ -1205,15 +1307,15 @@ hold_index(int32 watch)
 	ck = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
 	cdims = DatumGetInt32(SPI_getbinval(tup, td, 2, &isnull));
 	cn = DatumGetInt32(SPI_getbinval(tup, td, 3, &isnull));
-	xmin = (TransactionId) DatumGetInt64(SPI_getbinval(tup, td, 5, &isnull));
-	if (!acquire_index(watch, xmin, false))
+	ver = (uint64) DatumGetInt64(SPI_getbinval(tup, td, 5, &isnull)) | (gen ? GEN_BIT : 0);
+	if (!acquire_index(watch, ver, false))
 	{
 		bytea	   *cb = DatumGetByteaPP(SPI_getbinval(tup, td, 4, &isnull));
 
 		if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * ck * cdims)
 			elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, ck, cdims);
-		load_index(watch, xmin, ck, cdims, cn, cb);
-		if (!acquire_index(watch, xmin, true))
+		load_index(watch, ver, ck, cdims, cn, cb);
+		if (!acquire_index(watch, ver, true))
 			elog(ERROR, "phasevec ivf: the index of watch %d was loaded and is not there", watch);
 	}
 }
@@ -1232,6 +1334,9 @@ sweep_top(const Question *Q, int nprobe, int m, int *ncp)
 
 	if (Q->nq != dims)
 		elog(ERROR, "phasevec ivf: the question has %d dimensions, the index %d", Q->nq, dims);
+	if (m < 1 || nprobe < 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("phasevec ivf: m and nprobe must be at least 1 (got %d and %d)", m, nprobe)));
 	if (nprobe > k)
 		nprobe = k;
 	pr = palloc(sizeof(Probe) * k);
@@ -1450,6 +1555,8 @@ phasevec_ivf_delta(PG_FUNCTION_ARGS)
 	DeltaHit   *hits;
 	size_t		nh;
 
+	if (kk < 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("phasevec ivf: kk must be at least 1")));
 	InitMaterializedSRF(fcinfo, 0);
 	SPI_connect();
 	hits = delta_top(watch, reader, Q, &nh);
@@ -1537,7 +1644,9 @@ grow_index(const Absorbed *ab, size_t na, int n0, BIndex *nx)
 	for (int j = 0; j < k; j++)
 		nx->lstart[j + 1] = nx->lstart[j] + (g_ix.lstart[j + 1] - g_ix.lstart[j]) + add[j];
 	ne = nx->lstart[k];
-	nx->cents = g_ix.cents;		/* the centroids do not move: publish copies them */
+	/* copied: the shared copy they come from is released before the grown one is published (audit 22-10) */
+	nx->cents = palloc(sizeof(float) * k * dims);
+	memcpy(nx->cents, g_ix.cents, sizeof(float) * k * dims);
 	nx->edoc = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(int32) * (ne ? ne : 1));
 	nx->ec256 = MemoryContextAllocHuge(CurrentMemoryContext, (size_t) (ne ? ne : 1) * CB);
 	for (int j = 0; j < k; j++)
@@ -1837,7 +1946,9 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 			Oid			ct[3] = {INT4OID, INT4OID, INT4OID};
 			Datum		cv[3] = {Int32GetDatum(watch), Int32GetDatum((int32) (n0 + na)), Int32GetDatum((int32) na)};
 
-			SPI_execute_with_args("UPDATE phasevec.ivf_cents SET n = $2, absorbed = absorbed + $3 WHERE watch = $1",
+			SPI_execute_with_args(have_gen()
+								  ? "UPDATE phasevec.ivf_cents SET n = $2, absorbed = absorbed + $3, gen = nextval('phasevec.ivf_gen') WHERE watch = $1"
+								  : "UPDATE phasevec.ivf_cents SET n = $2, absorbed = absorbed + $3 WHERE watch = $1",
 								  3, ct, cv, NULL, false, 0);
 		}
 		/*
@@ -1852,11 +1963,14 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 			bool		isnull;
 			BIndex		saved = g_ix;
 
-			SPI_execute_with_args("SELECT xmin::text::bigint FROM phasevec.ivf_cents WHERE watch = $1", 1, xt, xv, NULL, false, 1);
+			bool		gen = have_gen();
+
+			SPI_execute_with_args(gen ? "SELECT gen FROM phasevec.ivf_cents WHERE watch = $1"
+								  : "SELECT xmin::text::bigint FROM phasevec.ivf_cents WHERE watch = $1", 1, xt, xv, NULL, false, 1);
 			if (SPI_processed == 1)
 			{
 				nx.watch = watch;
-				nx.xmin = (TransactionId) DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+				nx.ver = (uint64) DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)) | (gen ? GEN_BIT : 0);
 				nx.cx = NULL;
 				nx.shared = false;
 				g_ix = nx;
@@ -2070,6 +2184,8 @@ phasevec_ivf_find(PG_FUNCTION_ARGS)
 		if (PG_ARGISNULL(a))
 			elog(ERROR, "phasevec ivf: _ivf_find takes no NULL but its doubt threshold");
 	Q = question_of(PG_GETARG_VARBIT_P(2), PG_GETARG_ARRAYTYPE_P(3));
+	if (PG_GETARG_INT32(6) < 1 || PG_GETARG_INT32(7) < 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("phasevec ivf: kk and k must be at least 1")));
 	InitMaterializedSRF(fcinfo, 0);
 	SPI_connect();
 	n = find_valid(PG_GETARG_INT32(0), PG_GETARG_INT32(1), Q, PG_GETARG_INT32(4), PG_GETARG_INT32(5),
@@ -2080,9 +2196,11 @@ phasevec_ivf_find(PG_FUNCTION_ARGS)
 }
 
 /*
- * phasevec.find_ivf itself (0.10.0): find_v2's contract of 0.8.0 unchanged -- the same checks, the
- * same messages, the same coverage refusal (computed by the same SQL, so its rounding is the same),
- * the same columns and scores -- in one C call with prepared plans. The PL/pgSQL version cost a
+ * phasevec.find_ivf itself (0.10.0): find_v2's contract of 0.8.0 -- the same checks, the same
+ * messages, the same coverage refusal (computed by the same SQL, so its rounding is the same), the
+ * same columns and scores -- in one C call with prepared plans. One deliberate difference: an
+ * explicit NULL k, m or code is an error now (0.8.0 let some through by accident: a NULL p_partial
+ * skipped the coverage refusal), and a NULL nprobe means the default, 16. The PL/pgSQL version cost a
  * quarter of the throughput with 16 clients (the probe of 22-10).
  */
 PG_FUNCTION_INFO_V1(phasevec_find_ivf);

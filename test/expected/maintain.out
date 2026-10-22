@@ -272,3 +272,7 @@ SELECT watch, action, delta, indexed FROM phasevec.ivf_maintain_all();
  docs  | none   |     0 |    2000
 (1 row)
 
+DROP TABLE docs;
+DROP FUNCTION code_of(int), signs_of(smallint[]), change_as(int, int, int);
+DROP FUNCTION read_as(text, int, int, int);
+DROP EXTENSION pg_phasevec;

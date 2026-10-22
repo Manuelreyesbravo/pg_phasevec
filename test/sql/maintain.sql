@@ -92,3 +92,8 @@ SELECT read_as('r256b', 1001, 2000, 0) AS rest;
 SELECT phasevec.ivf_maintain('docs') AS covered;
 SELECT rd.name AS index_reader FROM phasevec.ivf_cents c JOIN phasevec.readers rd ON rd.id = c.reader;
 SELECT watch, action, delta, indexed FROM phasevec.ivf_maintain_all();
+
+DROP TABLE docs;
+DROP FUNCTION code_of(int), signs_of(smallint[]), change_as(int, int, int);
+DROP FUNCTION read_as(text, int, int, int);
+DROP EXTENSION pg_phasevec;

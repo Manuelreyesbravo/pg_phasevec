@@ -26,6 +26,7 @@
 
 void		_PG_init(void);
 extern bool phasevec_shared_ivf_cache;	/* phasevec_ivf.c */
+extern int	phasevec_shared_ivf_cache_mb;	/* phasevec_ivf.c */
 
 static char *socket_dir = NULL;
 static int	ask_timeout_ms = 10000;
@@ -33,6 +34,10 @@ static int	ask_timeout_ms = 10000;
 void
 _PG_init(void)
 {
+	DefineCustomIntVariable("phasevec.shared_ivf_cache_mb",
+							"Memory the shared copies of the coarse indexes may hold, in MB (0.10.0)",
+							"Past it, unreferenced copies go least recently used first; an index larger than it stays private to each backend.",
+							&phasevec_shared_ivf_cache_mb, 1024, 16, 1024 * 1024, PGC_SUSET, GUC_UNIT_MB, NULL, NULL, NULL);
 	DefineCustomBoolVariable("phasevec.shared_ivf_cache",
 							 "Sweep the coarse index from the copy shared by every backend (0.10.0)",
 							 "Off: each connection loads and keeps its own copy, as before 0.10.0.",

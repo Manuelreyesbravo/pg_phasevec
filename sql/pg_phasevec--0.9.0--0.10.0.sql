@@ -235,3 +235,39 @@ RETURNS TABLE (key text, score double precision, hamming int, state text, famili
                truncated boolean)
     AS 'MODULE_PATHNAME', 'phasevec_find_ivf' LANGUAGE C STABLE SECURITY DEFINER ROWS 10
     SET search_path = pg_catalog, pg_temp;
+
+-- The audit of 22-10 (an independent review and an ASan stress test).
+-- (1) A shared copy of an index is keyed by a GENERATION drawn by every build and absorb: the xmin of
+--     ivf_cents, used until now, is the same for two changes in one transaction, and the second one's
+--     copy was taken for the first's (its readings, already out of the delta, were never found).
+CREATE SEQUENCE phasevec.ivf_gen;
+ALTER TABLE phasevec.ivf_cents ADD COLUMN gen bigint NOT NULL DEFAULT nextval('phasevec.ivf_gen');
+COMMENT ON COLUMN phasevec.ivf_cents.gen IS
+    'The version of the index: drawn by every build and absorb, keys its shared copy in memory.';
+-- (2) Two compactions at once folded the same deltas into a negative count (reproduced: 7 and 8 of
+--     ~700-1400 changes failed with a_count_is_never_negative when counts_compact or ivf_build ran
+--     beside a writer that compacts). Compactions take turns, and each one reads after the previous
+--     one committed: the lock comes first, the DELETE (a new statement, a new snapshot) after.
+CREATE OR REPLACE FUNCTION phasevec.counts_compact(p_watch text DEFAULT NULL)
+RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    folded bigint;
+BEGIN
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('phasevec.counts_compact'));
+    WITH moved AS (
+        DELETE FROM phasevec.count_deltas d
+         WHERE p_watch IS NULL OR d.watch = (SELECT id FROM phasevec._watch(p_watch))
+     RETURNING d.watch, d.state, d.d),
+    s AS (SELECT watch, state, sum(d)::bigint AS d, count(*) AS rows FROM moved GROUP BY watch, state),
+    u AS (UPDATE phasevec.counts c SET n = c.n + s.d FROM s
+           WHERE c.watch = s.watch AND c.state = s.state AND s.d <> 0 RETURNING 1)
+    SELECT coalesce(sum(rows), 0) INTO folded FROM s;
+    RETURN folded;
+END;
+$$;
+-- (3) The internal functions added in 0.10.0 are not for PUBLIC (the 7-argument _ivf_build was not either).
+REVOKE ALL ON FUNCTION phasevec._ivf_build(int, int, int, int, int, int, boolean, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION phasevec._ivf_absorb(int, int, text) FROM PUBLIC;
