@@ -1,10 +1,10 @@
 // Copyright 2026 Manuel Reyes Bravo
 // SPDX-License-Identifier: Apache-2.0
 //
-// muninn-reader: the process that reads for a watch.
+// phasevec-reader: the process that reads for a watch.
 //
 // It loads a sealed model with llama.cpp, proves to the database that the weights it loaded are the
-// ones the reader was registered with (sha256), and then reads what muninn.next() hands out: every
+// ones the reader was registered with (sha256), and then reads what phasevec.next() hands out: every
 // row never read, read from older text, or read by another reader. Each reading is recorded with the
 // hash of the exact text it read, so the database can refuse it if the row changed meanwhile.
 //
@@ -16,29 +16,34 @@
 //             The text is tokenized alone, cut to fit, and closed by the model's own special tokens
 //             (its BOS and EOS flags), so a long text keeps the token the model pools at. Pooling,
 //             context and query instruction are sealed at --register and taken from the seal after.
-//   contract  a reader trained for Muninn (--heads): the text is closed by the reader's marker, the
+//   contract  a reader trained for Phasevec (--heads): the text is closed by the reader's marker, the
 //             state is taken at the marker's last token, and the reader's own heads turn it into the
 //             vector (projection, Matryoshka prefix) and into a familiarity score. Marker and query
 //             instruction come from the manifest sealed in the database, never from the command line.
 //
-//   muninn-reader --backend B --model M.gguf [--lora A.gguf] --reader NAME --register [--dims D]
-//   muninn-reader --backend B --model M.gguf --lora A.gguf --heads H.gguf --register --manifest manifest.json
-//   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --watch W [--once]
-//   muninn-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
-//   muninn-reader ... --reader NAME --ask-file questions.txt   one question per line, one code per line
-//   muninn-reader ... --reader NAME --embed-file texts.txt     "Q <base64>" (a question) or "D <base64>"
+//   phasevec-reader --backend B --model M.gguf [--lora A.gguf] --reader NAME --register [--dims D]
+//   phasevec-reader --backend B --model M.gguf --lora A.gguf --heads H.gguf --register --manifest manifest.json
+//   phasevec-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --watch W [--once]
+//   phasevec-reader --backend B --model M.gguf [--lora A.gguf] [--heads H.gguf] --reader NAME --ask "question"
+//   phasevec-reader ... --reader NAME --ask-file questions.txt   one question per line, one code per line
+//   phasevec-reader ... --reader NAME --embed-file texts.txt     "Q <base64>" (a question) or "D <base64>"
 //       (a document) per line; one line out each: kind, code64, int8 code, code256, tokens read, total
-//   muninn-reader --backend B --print-compute                  the compute signature this process detects
-//   muninn-reader --backend B ... --reader NAME --watch W --serve SOCKET
+//   phasevec-reader --backend B --print-compute                  the compute signature this process detects
+//   phasevec-reader --backend B ... --reader NAME --watch W --serve SOCKET
 //       the asker: a JSON line {"q": ..., "k": 10, "m": 200, "partial": false} in, a JSON line out with
-//       the hits of muninn.find (key, score, hamming, state, familiarity, read_at, truncated), the
+//       the hits of phasevec.find (key, score, hamming, state, familiarity, read_at, truncated), the
 //       watch's coverage and the time to read the question and to find; or {"error": ...}. With
-//       "hybrid": true (and "lm", default 200) it asks muninn.find_hybrid (pg_muninn 0.6.0), and each
+//       "hybrid": true (and "lm", default 200) it asks phasevec.find_hybrid (pg_phasevec 0.6.0), and each
 //       hit also carries its rank and score in the vector and the lexical arm.
+//   phasevec-reader --backend B ... --watch W1 --watch W2 ... [--serve-dir DIR]
+//       one process, one model in memory, for every watch read by the same weights, compute, pooling
+//       and context: each watch is read in the name of ITS reader (phasevec.watches, or --reader for
+//       all), whose seal is proved against what was loaded, and keeps its own query instruction. With
+//       --serve-dir each watch answers on DIR/<watch>.sock, the path phasevec._ask() connects to.
 //
 // --backend cpu|cuda is always given and pins what the reader computes on: cpu hides every GPU from
 // llama.cpp, cuda puts every layer on the GPU. There is no partial offload. The reader is sealed with
-// that compute (pg_muninn 0.4.0) and refuses to read in a reader's name on any other.
+// that compute (pg_phasevec 0.4.0) and refuses to read in a reader's name on any other.
 //
 // The database connection comes from the usual PG* environment variables (or --dsn).
 
@@ -50,6 +55,7 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -78,12 +84,14 @@ struct Options {
         pooling = "last";
     std::string backend;   // cpu | cuda: pinned by the process, never inherited from the environment
     std::string serve;     // a unix socket: answer questions on the watch, one JSON line each way
+    std::string serve_dir; // a directory: answer each watch's questions on <dir>/<watch>.sock
+    std::vector<std::string> watches;   // every --watch, in order; `watch` is the first
     int dims = 0, batch = 32, ctx = 512, threads = 4, audit = 0;
     bool once = false, do_register = false, print_compute = false, no_repack = false;
 };
 
 [[noreturn]] void die(const std::string &msg) {
-    std::fprintf(stderr, "muninn-reader: %s\n", msg.c_str());
+    std::fprintf(stderr, "phasevec-reader: %s\n", msg.c_str());
     std::exit(1);
 }
 
@@ -100,13 +108,14 @@ Options parse(int argc, char **argv) {
         else if (a == "--heads") o.heads = next();
         else if (a == "--manifest") o.manifest = next();
         else if (a == "--reader") o.reader = next();
-        else if (a == "--watch") o.watch = next();
+        else if (a == "--watch") o.watches.push_back(next());
         else if (a == "--dsn") o.dsn = next();
         else if (a == "--ask") o.ask = next();
         else if (a == "--ask-file") o.ask_file = next();
         else if (a == "--ask-doc") o.ask_doc = next();
         else if (a == "--embed-file") o.embed_file = next();
         else if (a == "--serve") o.serve = next();
+        else if (a == "--serve-dir") o.serve_dir = next();
         else if (a == "--query-prefix") o.query_prefix = next();
         else if (a == "--pooling") o.pooling = next();
         else if (a == "--dims") o.dims = std::stoi(next());
@@ -124,12 +133,22 @@ Options parse(int argc, char **argv) {
         else die("unknown option " + a);
     }
     if (o.backend != "cpu" && o.backend != "cuda") die("--backend cpu|cuda is required: the reader pins what it computes on");
+    if (!o.watches.empty()) o.watch = o.watches.front();
+    for (size_t i = 0; i < o.watches.size(); i++)
+        for (size_t j = 0; j < i; j++)
+            if (o.watches[i] == o.watches[j]) die("watch " + o.watches[i] + " is given twice");
     if (o.threads < 1) die("--threads must be at least 1");
     if (o.print_compute) return o;
     if (o.model.empty()) die("--model is required");
     if (!o.manifest.empty() && (!o.do_register || o.heads.empty() || o.lora.empty()))
         die("--manifest is for --register, with the --lora and --heads it names");
-    if (o.reader.empty() && o.manifest.empty()) die("--reader is required");
+    // Reading watches, each watch's reader can come from the database; everything else names it.
+    const bool asking = !o.ask.empty() || !o.ask_file.empty() || !o.ask_doc.empty() || !o.embed_file.empty();
+    if (o.reader.empty() && o.manifest.empty() && (o.watches.empty() || o.do_register || asking))
+        die("--reader is required");
+    if (o.watches.size() > 1 && (o.audit > 0 || !o.serve.empty()))
+        die("with several watches: --audit takes one watch, and they are served with --serve-dir");
+    if (!o.serve.empty() && !o.serve_dir.empty()) die("--serve or --serve-dir, not both");
     if (o.pooling != "last" && o.pooling != "mean") die("--pooling is last or mean");
     if (!o.heads.empty() && !o.query_prefix.empty())
         die("a contract reader takes its query instruction from its manifest, not from --query-prefix");
@@ -302,7 +321,10 @@ struct Heads {
         std::vector<float> fb = floats(tensor("fam.bias"));
         if ((int)bias.size() != out || (int)fam.size() != in || fb.size() != 1) die("heads have inconsistent shapes");
         fam_bias = fb[0];
-        int64_t key = gguf_find_key(g, "muninn.layer");
+        // heads written before the rename (vec-0.1.0, sealed by sha256: they cannot be rewritten) carry
+        // the key under its old name; without this fallback the check below would be skipped silently
+        int64_t key = gguf_find_key(g, "phasevec.layer");
+        if (key < 0) key = gguf_find_key(g, "muninn.layer");
         if (key >= 0 && gguf_get_val_i32(g, key) != -1)
             die("these heads read an intermediate layer; this reader serves layer -1 only");
         gguf_free(g);
@@ -437,7 +459,11 @@ struct Reader {
 
     // A document piece, or a question when `query` is set: the reader's sealed query instruction first.
     Reading read(const std::string &text, bool query = false) {
-        const std::string body = query ? query_instruction + text : text;
+        return read_body(query ? query_instruction + text : text);
+    }
+
+    // The text exactly as it is to be read: a question carries its watch's instruction already.
+    Reading read_body(const std::string &body) {
         return heads ? read_contract(body) : read_pooled(body);
     }
 
@@ -608,22 +634,22 @@ struct Seal {
 
 // Proves this process computes on what the reader was sealed with. Runs before the model is loaded,
 // so a process on the wrong backend is turned away without touching the weights or the GPU.
-void check_compute(Db &db, const Options &o, const Compute &have) {
+void check_compute(Db &db, const std::string &reader, const Compute &have) {
     PGresult *r = nullptr;
-    std::string sql = "SELECT muninn.reader_compute_matches($1, " + compute_json(2) + "), "
-                      "coalesce(muninn.reader_compute($1)->>'backend', ''), coalesce(muninn.reader_compute($1)->>'device', ''), "
-                      "EXISTS (SELECT 1 FROM muninn.reader_seal($1))";
-    if (auto err = db.exec(sql.c_str(), {o.reader, have.backend, have.device, have.system_info, have.libs}, &r))
-        die("cannot read the compute seal of reader " + o.reader + ": " + *err);
+    std::string sql = "SELECT phasevec.reader_compute_matches($1, " + compute_json(2) + "), "
+                      "coalesce(phasevec.reader_compute($1)->>'backend', ''), coalesce(phasevec.reader_compute($1)->>'device', ''), "
+                      "EXISTS (SELECT 1 FROM phasevec.reader_seal($1))";
+    if (auto err = db.exec(sql.c_str(), {reader, have.backend, have.device, have.system_info, have.libs}, &r))
+        die("cannot read the compute seal of reader " + reader + ": " + *err);
     bool matches = std::string(PQgetvalue(r, 0, 0)) == "t", exists = std::string(PQgetvalue(r, 0, 3)) == "t";
     std::string backend = PQgetvalue(r, 0, 1), device = PQgetvalue(r, 0, 2);
     PQclear(r);
     if (matches) return;
-    if (!exists) die("no reader named " + o.reader + " (register it with --register)");
+    if (!exists) die("no reader named " + reader + " (register it with --register)");
     if (backend.empty())
-        die("reader " + o.reader + " was registered without its compute (before pg_muninn 0.4.0): register it again "
-            "with --register --backend, and switch the watch to it with muninn.reader_switch()");
-    die("this process computes on " + have.backend + " (" + have.device + "), but reader " + o.reader +
+        die("reader " + reader + " was registered without its compute (before pg_phasevec 0.4.0): register it again "
+            "with --register --backend, and switch the watch to it with phasevec.reader_switch()");
+    die("this process computes on " + have.backend + " (" + have.device + "), but reader " + reader +
         " was sealed on " + backend + " (" + device + ") or with other kernels or libraries: refusing to read in its name");
 }
 
@@ -635,15 +661,18 @@ constexpr const char *kPooledTokens = "text alone, cut to fit, closed by the mod
 // Proves the loaded weights are the registered ones. A contract reader takes its marker and query
 // instruction from the sealed manifest; a pooled one, its query instruction, and it must be served
 // with the pooling and the context it was sealed with, which decide what it reads.
-void check_seal(Db &db, const Options &o, Reader &rd, const Seal &have) {
+// Returns the reader's query instruction. Several readers may share the process only if they read
+// documents the same way: same weights, dimensions, pooling and context, and for contract readers the
+// same marker; they may differ in the instruction a question is read with.
+std::string check_seal(Db &db, const Options &o, Reader &rd, const Seal &have, const std::string &reader) {
     PGresult *r = nullptr;
     if (auto err = db.exec("SELECT model_sha, coalesce(adapter_sha, ''), dims, coalesce(heads_sha, ''), "
                            "coalesce(manifest->>'marker', ''), coalesce(manifest->>'query_instruction', ''), "
                            "coalesce(manifest->>'pooling', ''), coalesce(manifest->>'ctx', ''), "
                            "coalesce(manifest->>'query_prefix', ''), coalesce(manifest->>'tokens', '') "
-                           "FROM muninn.reader_seal($1)", {o.reader}, &r))
-        die("cannot read the seal of reader " + o.reader + ": " + *err);
-    if (PQntuples(r) != 1) die("no reader named " + o.reader + " (register it with --register)");
+                           "FROM phasevec.reader_seal($1)", {reader}, &r))
+        die("cannot read the seal of reader " + reader + ": " + *err);
+    if (PQntuples(r) != 1) die("no reader named " + reader + " (register it with --register)");
     std::string m = PQgetvalue(r, 0, 0), a = PQgetvalue(r, 0, 1), h = PQgetvalue(r, 0, 3);
     int dims = std::atoi(PQgetvalue(r, 0, 2));
     std::string marker = PQgetvalue(r, 0, 4), instruction = PQgetvalue(r, 0, 5);
@@ -651,19 +680,21 @@ void check_seal(Db &db, const Options &o, Reader &rd, const Seal &have) {
                 tokens = PQgetvalue(r, 0, 9);
     PQclear(r);
     if (m != have.model_sha || a != have.adapter_sha || h != have.heads_sha)
-        die("the weights loaded are not the ones reader " + o.reader + " was registered with: refusing to read in its name");
-    if (dims != rd.dims) die("reader " + o.reader + " was registered with " + std::to_string(dims) + " dimensions");
+        die("the weights loaded are not the ones reader " + reader + " was registered with: refusing to read in its name");
+    if (dims != rd.dims) die("reader " + reader + " was registered with " + std::to_string(dims) + " dimensions");
     if (rd.heads) {
-        if (marker.empty()) die("reader " + o.reader + " has heads but its manifest names no marker");
-        rd.set_contract(marker, instruction);
-        return;
+        if (marker.empty()) die("reader " + reader + " has heads but its manifest names no marker");
+        if (rd.marker.empty()) rd.set_contract(marker, instruction);
+        else if (rd.tokenize(marker, false) != rd.marker)
+            die("reader " + reader + " closes documents with another marker than the watches already served here");
+        return instruction;
     }
     if (tokens != kPooledTokens)
-        die("reader " + o.reader + " was registered before pooled readers kept the closing token of a truncated "
-            "text (pg_muninn 0.6.0): register the model again under a new name, and reader_switch the watch to it");
-    if (pooling != o.pooling) die("reader " + o.reader + " was sealed with --pooling " + pooling + ", not " + o.pooling);
-    if (ctx != std::to_string(o.ctx)) die("reader " + o.reader + " was sealed with --ctx " + ctx + ", not " + std::to_string(o.ctx));
-    rd.query_instruction = prefix;
+        die("reader " + reader + " was registered before pooled readers kept the closing token of a truncated "
+            "text (pg_phasevec 0.6.0): register the model again under a new name, and reader_switch the watch to it");
+    if (pooling != o.pooling) die("reader " + reader + " was sealed with --pooling " + pooling + ", not " + o.pooling);
+    if (ctx != std::to_string(o.ctx)) die("reader " + reader + " was sealed with --ctx " + ctx + ", not " + std::to_string(o.ctx));
+    return prefix;
 }
 
 std::string read_file(const std::string &path) {
@@ -694,6 +725,21 @@ void wait_for_notify(Db &db, int seconds) {
 
 // ------------------------------------------------------------------ serving --
 
+// A watch this process reads, in the name of its reader, with that reader's query instruction.
+struct Watch {
+    std::string name, reader, instruction;
+    long read_ok = 0, refused = 0, failed = 0;
+    bool drained = false;   // its queue emptied and was maintained since the last wait
+};
+
+// A watch's name becomes a file name (its socket), so only names phasevec._ask() would accept.
+bool safe_watch_name(const std::string &w) {
+    if (w.empty() || w.size() > 63 || w[0] == '.') return false;
+    for (unsigned char c : w)
+        if (!std::isalnum(c) && c != '_' && c != '-' && c != '.') return false;
+    return true;
+}
+
 // One JSON object per line, built by the database so nothing is escaped by hand here.
 std::string json_error(Db &db, const std::string &msg) {
     PGresult *r = nullptr;
@@ -703,21 +749,33 @@ std::string json_error(Db &db, const std::string &msg) {
     return out;
 }
 
+// A JSON string literal (quotes, backslashes and control characters escaped).
+std::string json_string(const std::string &v) {
+    std::string out = "\"";
+    for (unsigned char ch : v) {
+        if (ch == '"' || ch == '\\') { out += '\\'; out += (char)ch; }
+        else if (ch < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", ch); out += b; }
+        else out += (char)ch;
+    }
+    return out + "\"";
+}
+
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 // One question: {"q": text, "k": 10, "m": 200, "partial": false, "codes": false, "hybrid": false,
-// "lm": 200}; with codes the answer also carries the question's code64, int8 code and code256; with
-// hybrid it is asked of muninn.find_hybrid, with the question's text for the lexical arm. The question is read by this
+// "lm": 200, "encode": false}; with encode only the question's codes come back (nothing is searched); with codes the answer also carries the question's code64, int8 code and code256; with
+// hybrid it is asked of phasevec.find_hybrid, with the question's text for the lexical arm. The question is read by this
 // process, which proved its seal and compute, so it is comparable with the watch's readings; find
 // refuses below the watch's declared coverage unless partial is asked for, and that refusal comes
 // back as {"error": ...}: the caller fails cleanly instead of reading a half-read corpus as whole.
-std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line) {
+std::string answer(Db &db, const Watch &w, Reader &rd, const std::string &line) {
     PGresult *r = nullptr;
     if (auto err = db.exec("SELECT j->>'q', coalesce((j->>'k')::int, 10), coalesce((j->>'m')::int, 200), "
                            "coalesce((j->>'partial')::boolean, false), coalesce((j->>'codes')::boolean, false), "
-                           "coalesce((j->>'hybrid')::boolean, false), coalesce((j->>'lm')::int, 200) "
+                           "coalesce((j->>'hybrid')::boolean, false), coalesce((j->>'lm')::int, 200), "
+                           "coalesce((j->>'encode')::boolean, false) "
                            "FROM (SELECT $1::jsonb AS j) x",
                            {line}, &r))
         return json_error(db, "a question is one JSON object per line: {\"q\": text, \"k\": 10, \"m\": 200, \"partial\": false}");
@@ -725,25 +783,37 @@ std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line
     std::string q = no_q ? "" : PQgetvalue(r, 0, 0), k = PQgetvalue(r, 0, 1), m = PQgetvalue(r, 0, 2);
     std::string partial = PQgetvalue(r, 0, 3), codes = PQgetvalue(r, 0, 4), lm = PQgetvalue(r, 0, 6);
     bool hybrid = std::string(PQgetvalue(r, 0, 5)) == "t";
+    bool encode = std::string(PQgetvalue(r, 0, 7)) == "t";
     PQclear(r);
     if (q.empty()) return json_error(db, "the question (q) is empty");
 
     auto t0 = std::chrono::steady_clock::now();
-    Reading rq = rd.read(q, true);
+    Reading rq = rd.read_body(w.instruction + q);
     double encode_ms = ms_since(t0);
     if (rq.v.empty()) return json_error(db, "the question has no tokens");
+
+    // Only the codes (pg_phasevec 0.9.0): phasevec.search() asks this from inside the database and
+    // runs find_ivf/find itself, in the caller's snapshot, after checking that the reader that read
+    // the question is the watch's. Nothing is searched here.
+    if (encode) {
+        char head[64];
+        std::snprintf(head, sizeof head, "{\"encode_ms\": %.1f, ", encode_ms);
+        return std::string(head) + "\"watch\": " + json_string(w.name) + ", \"reader\": " + json_string(w.reader) +
+               ", \"code64\": " + std::to_string(code64(rq.v)) + ", \"code\": " + json_string(code_literal(rq.v)) +
+               ", \"code256\": " + json_string(code256(rq.v)) + "}";
+    }
 
     // find(), or find_hybrid() with the question's text for the lexical arm ($10, $11); the hits of
     // the hybrid also say what each arm made of them.
     std::string source = hybrid
-        ? "muninn.find_hybrid($1, $10::text, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, "
+        ? "phasevec.find_hybrid($1, $10::text, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, "
           "nullif($8, '')::bit(256), $11::int)"
-        : "muninn.find($1, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, nullif($8, '')::bit(256))";
+        : "phasevec.find($1, $3::bigint, $4::smallint[], $5::int, $6::boolean, $7::int, nullif($8, '')::bit(256))";
     std::string arms = hybrid
         ? ", 'vector_score', f.vector_score, 'vector_rank', f.vector_rank, 'lexical_score', f.lexical_score, "
           "'lexical_rank', f.lexical_rank"
         : "";
-    std::vector<std::string> params = {o.watch, o.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial,
+    std::vector<std::string> params = {w.name, w.reader, std::to_string(code64(rq.v)), code_literal(rq.v), k, partial,
                                        m, code256(rq.v), codes};
     if (hybrid) {
         params.push_back(q);
@@ -755,7 +825,7 @@ std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line
         "      'state', f.state, 'familiarity', f.familiarity, 'read_at', f.read_at, 'truncated', f.truncated" + arms + ") "
         "      ORDER BY f.score DESC, f.key) "
         "    FROM " + source + " f), '[]'::jsonb), "
-        "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM muninn.coverage($1) c)) "
+        "  'coverage', (SELECT jsonb_object_agg(c.state, c.n) FROM phasevec.coverage($1) c)) "
         // the question's own codes, on request: to audit an answer or to run find by hand
         "|| CASE WHEN $9::boolean THEN jsonb_build_object('code64', $3::bigint, 'code', to_jsonb($4::smallint[]), "
         "     'code256', nullif($8, '')) ELSE '{}'::jsonb END)::text";
@@ -783,39 +853,46 @@ std::string answer(Db &db, const Options &o, Reader &rd, const std::string &line
 // queue is empty the process waits on the database's NOTIFY and on the questions at once. A
 // connection may carry many questions.
 struct Asker {
+    struct Listener {
+        int fd;
+        size_t watch;
+    };
     struct Client {
         int fd;
+        size_t watch;
         std::string buf;
     };
-    int ls = -1;
+    std::vector<Listener> listeners;
     std::vector<Client> clients;
 
-    void open(const std::string &path) {
+    void open(const std::string &path, size_t watch) {
         std::signal(SIGPIPE, SIG_IGN);
         sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
         if (path.size() >= sizeof addr.sun_path) die("socket path too long: " + path);
         std::strncpy(addr.sun_path, path.c_str(), sizeof addr.sun_path - 1);
-        ls = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (ls < 0) die("cannot create a socket");
         unlink(path.c_str());
         mode_t old = umask(0177);
         if (bind(ls, (sockaddr *)&addr, sizeof addr) < 0) die("cannot bind " + path);
         umask(old);
         if (listen(ls, 16) < 0) die("cannot listen on " + path);
+        listeners.push_back({ls, watch});
     }
 
     // Waits up to timeout_ms for questions (and for the database socket when watch_db), answering
-    // every complete line that arrived. True when the database socket became readable.
-    bool step(Db &db, const Options &o, Reader &rd, int timeout_ms, bool watch_db) {
+    // every complete line that arrived, each on its watch. True when the database socket became readable.
+    bool step(Db &db, const std::vector<Watch> &watches, Reader &rd, int timeout_ms, bool watch_db) {
         std::vector<pollfd> fds;
-        fds.push_back({ls, POLLIN, 0});
+        for (auto &l : listeners) fds.push_back({l.fd, POLLIN, 0});
+        const size_t first_client = fds.size();
         for (auto &c : clients) fds.push_back({c.fd, POLLIN, 0});
         if (watch_db) fds.push_back({PQsocket(db.c), POLLIN, 0});
         if (poll(fds.data(), fds.size(), timeout_ms) <= 0) return false;
         bool db_ready = watch_db && (fds.back().revents & POLLIN);
         for (size_t i = 0; i < clients.size(); i++) {
-            if (!(fds[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (!(fds[first_client + i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             Client &c = clients[i];
             char chunk[4096];
             ssize_t n = recv(c.fd, chunk, sizeof chunk, 0);
@@ -827,7 +904,7 @@ struct Asker {
                     std::string line = c.buf.substr(0, nl);
                     c.buf.erase(0, nl + 1);
                     if (line.empty()) continue;
-                    std::string out = answer(db, o, rd, line) + "\n";
+                    std::string out = answer(db, watches[c.watch], rd, line) + "\n";
                     keep = send(c.fd, out.data(), out.size(), 0) >= 0;
                 }
                 keep = keep && c.buf.size() <= (1 << 20);   // a question is not a megabyte
@@ -839,32 +916,48 @@ struct Asker {
         }
         clients.erase(std::remove_if(clients.begin(), clients.end(), [](const Client &c) { return c.fd < 0; }),
                       clients.end());
-        if (fds[0].revents & POLLIN)
-            for (int fd; (fd = accept(ls, nullptr, nullptr)) >= 0;) clients.push_back({fd, {}});
+        for (size_t i = 0; i < listeners.size(); i++)
+            if (fds[i].revents & POLLIN)
+                for (int fd; (fd = accept(listeners[i].fd, nullptr, nullptr)) >= 0;)
+                    clients.push_back({fd, listeners[i].watch, {}});
         return db_ready;
     }
 };
 
-// The weights of the lexical arm follow the rows when the queue empties (pg_muninn 0.6.0). A database
+// The weights of the lexical arm follow the rows when the queue empties (pg_phasevec 0.6.0). A database
 // without lexical_maintain() (before 0.6.0) is said once, and the reader goes on reading.
-void maintain_lexicon(Db &db, const Options &o) {
+void maintain_lexicon(Db &db, const std::string &watch) {
     static bool unavailable = false;
     if (unavailable) return;
     PGresult *r = nullptr;
-    if (auto err = db.exec("SELECT muninn.lexical_maintain($1)", {o.watch}, &r)) {
-        std::fprintf(stderr, "muninn-reader: the lexical weights of %s are not kept here: %s", o.watch.c_str(), err->c_str());
+    if (auto err = db.exec("SELECT phasevec.lexical_maintain($1)", {watch}, &r)) {
+        std::fprintf(stderr, "phasevec-reader: the lexical weights of %s are not kept here: %s", watch.c_str(), err->c_str());
         unavailable = true;
         return;
     }
     if (std::string(PQgetvalue(r, 0, 0)) == "t")
-        std::fprintf(stderr, "muninn-reader: %s: lexical weights recounted\n", o.watch.c_str());
+        std::fprintf(stderr, "phasevec-reader: %s: lexical weights recounted\n", watch.c_str());
+    PQclear(r);
+}
+
+// The count deltas fold into the base counts when the queue empties too (pg_phasevec 0.7.0): until
+// then coverage() sums them, right but slower. A database without counts_compact() is said once.
+void maintain_counts(Db &db, const std::string &watch) {
+    static bool unavailable = false;
+    if (unavailable) return;
+    PGresult *r = nullptr;
+    if (auto err = db.exec("SELECT phasevec.counts_compact($1)", {watch}, &r)) {
+        std::fprintf(stderr, "phasevec-reader: the counts of %s are not folded here: %s", watch.c_str(), err->c_str());
+        unavailable = true;
+        return;
+    }
     PQclear(r);
 }
 
 // The idle wait: until a NOTIFY says there is something to read, or 30 s pass, whichever first.
 // With an asker, questions are answered meanwhile. A NOTIFY can also arrive while a question's
 // query runs (libpq then queues it), so the queue is checked after each step too.
-void wait_for_work(Db &db, const Options &o, Reader &rd, Asker *asker) {
+void wait_for_work(Db &db, const std::vector<Watch> &watches, Reader &rd, Asker *asker) {
     if (!asker) {
         wait_for_notify(db, 30);
         return;
@@ -873,7 +966,7 @@ void wait_for_work(Db &db, const Options &o, Reader &rd, Asker *asker) {
     for (;;) {
         int left = 30000 - (int)ms_since(t0);
         if (left <= 0) return;
-        bool db_ready = asker->step(db, o, rd, left, true);
+        bool db_ready = asker->step(db, watches, rd, left, true);
         if (db_ready) PQconsumeInput(db.c);
         bool notified = false;
         while (PGnotify *n = PQnotifies(db.c)) {
@@ -896,7 +989,28 @@ int main(int argc, char **argv) {
         return 0;
     }
     Db db(o.dsn);
-    if (!o.do_register) check_compute(db, o, compute);
+    // The watches and the reader each is read in the name of: --reader for all, or the watch's own.
+    std::vector<Watch> watches;
+    for (auto &name : o.watches) {
+        Watch w;
+        w.name = name;
+        w.reader = o.reader;
+        if (w.reader.empty()) {
+            PGresult *r = nullptr;
+            if (auto err = db.exec("SELECT rd.name FROM phasevec.watches w JOIN phasevec.readers rd ON rd.id = w.reader "
+                                   "WHERE w.name = $1", {name}, &r))
+                die("cannot find the reader of watch " + name + ": " + *err);
+            if (PQntuples(r) != 1) die("no watch named " + name);
+            w.reader = PQgetvalue(r, 0, 0);
+            PQclear(r);
+        }
+        watches.push_back(w);
+    }
+    if (!o.do_register) {
+        if (!o.reader.empty() || watches.empty()) check_compute(db, o.reader, compute);
+        for (auto &w : watches)
+            if (w.reader != o.reader) check_compute(db, w.reader, compute);
+    }
     Seal have{sha256_of(o.model), o.lora.empty() ? "" : sha256_of(o.lora),
               o.heads.empty() ? "" : sha256_of(o.heads)};
     Reader rd(o);
@@ -914,7 +1028,7 @@ int main(int argc, char **argv) {
             if (!match) die("the --lora/--heads loaded are not the ones the manifest names: refusing to register");
             std::vector<std::string> params = {read_file(o.manifest), have.model_sha};
             params.insert(params.end(), cv.begin(), cv.end());
-            std::string sql = "SELECT muninn.reader_register(jsonb_set($1::jsonb, '{base_sha256}', to_jsonb($2::text)), " +
+            std::string sql = "SELECT phasevec.reader_register(jsonb_set($1::jsonb, '{base_sha256}', to_jsonb($2::text)), " +
                               compute_json(3) + "), ($1::jsonb->>'reader') || '-' || ($1::jsonb->>'version') || '@' || $3";
             if (auto err = db.exec(sql.c_str(), params, &r)) die("cannot register: " + *err);
             std::printf("registered reader %s (base %s, adapter %s, heads %s; %s on %s)\n", PQgetvalue(r, 0, 1),
@@ -927,7 +1041,7 @@ int main(int argc, char **argv) {
         std::vector<std::string> params = {o.reader, have.model_sha, std::to_string(rd.dims), have.adapter_sha,
                                            o.pooling, std::to_string(o.ctx), o.query_prefix, kPooledTokens};
         params.insert(params.end(), cv.begin(), cv.end());
-        std::string sql = "SELECT muninn.reader_register($1, $2, $3::int, nullif($4, ''), "
+        std::string sql = "SELECT phasevec.reader_register($1, $2, $3::int, nullif($4, ''), "
                           "jsonb_build_object('pooling', $5::text, 'ctx', $6::int, 'query_prefix', $7::text, "
                           "'tokens', $8::text), " + compute_json(9) + ")";
         if (auto err = db.exec(sql.c_str(), params, &r)) die("cannot register: " + *err);
@@ -937,11 +1051,16 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    check_seal(db, o, rd, have);
+    if (!o.reader.empty()) rd.query_instruction = check_seal(db, o, rd, have, o.reader);
+    for (auto &w : watches)
+        w.instruction = w.reader == o.reader ? rd.query_instruction : check_seal(db, o, rd, have, w.reader);
 
-    if (!o.serve.empty() && (o.watch.empty() || o.once || o.audit > 0 || !o.ask.empty() || !o.ask_file.empty() ||
+    if ((!o.serve.empty() || !o.serve_dir.empty()) && (o.watch.empty() || o.once || o.audit > 0 || !o.ask.empty() || !o.ask_file.empty() ||
                              !o.ask_doc.empty() || !o.embed_file.empty()))
         die("--serve answers questions while the process reads its --watch: not with --once, --audit or --ask*");
+    if (!o.serve_dir.empty())
+        for (auto &w : watches)
+            if (!safe_watch_name(w.name)) die("watch " + w.name + " cannot name a socket (letters, digits, _ - .)");
     if (!o.ask.empty()) {
         Reading q = rd.read(o.ask, true);
         if (q.v.empty()) die("the question has no tokens");
@@ -1015,9 +1134,9 @@ int main(int argc, char **argv) {
     if (o.audit > 0) {
         // The self-audit (0.3.0): re-read a sample of this reader's own fresh readings, as they are
         // now, and let the database say whether each one reproduces. Nothing is recorded as a
-        // reading; a reading that does not reproduce stays in muninn.audits as a broken assertion.
+        // reading; a reading that does not reproduce stays in phasevec.audits as a broken assertion.
         PGresult *r = nullptr;
-        if (auto err = db.exec("SELECT key, body, text_hash::text FROM muninn.audit_sample($1, $2::int)",
+        if (auto err = db.exec("SELECT key, body, text_hash::text FROM phasevec.audit_sample($1, $2::int)",
                                {o.watch, std::to_string(o.audit)}, &r))
             die("cannot ask for an audit sample: " + *err);
         long holds = 0, broken = 0, skipped = 0;
@@ -1025,8 +1144,8 @@ int main(int argc, char **argv) {
             std::string key = PQgetvalue(r, i, 0), body = PQgetvalue(r, i, 1), hash = PQgetvalue(r, i, 2);
             Reading again = rd.read(body);
             PGresult *a = nullptr;
-            if (auto err = db.exec("SELECT muninn.record_audit($1, $2, $3, $4::bytea, $5::smallint[], nullif($6, '')::bit(256))",
-                                   {o.watch, key, o.reader, hash, code_literal(again.v), code256(again.v)}, &a))
+            if (auto err = db.exec("SELECT phasevec.record_audit($1, $2, $3, $4::bytea, $5::smallint[], nullif($6, '')::bit(256))",
+                                   {o.watch, key, watches.front().reader, hash, code_literal(again.v), code256(again.v)}, &a))
                 die("cannot record an audit: " + *err);
             if (PQgetisnull(a, 0, 0)) skipped++;
             else if (std::string(PQgetvalue(a, 0, 0)) == "t") holds++;
@@ -1038,54 +1157,69 @@ int main(int argc, char **argv) {
                     o.watch.c_str(), holds, broken, skipped);
         return broken ? 2 : 0;
     }
-    if (auto err = db.exec("LISTEN muninn", {})) die("cannot listen: " + *err);
+    if (auto err = db.exec("LISTEN phasevec", {})) die("cannot listen: " + *err);
     std::unique_ptr<Asker> asker;
-    if (!o.serve.empty()) {
+    if (!o.serve.empty() || !o.serve_dir.empty()) {
         asker = std::make_unique<Asker>();
-        asker->open(o.serve);
-        std::fprintf(stderr, "muninn-reader: answering on %s for watch %s (reader %s) between rows\n",
-                     o.serve.c_str(), o.watch.c_str(), o.reader.c_str());
+        for (size_t i = 0; i < watches.size(); i++) {
+            std::string path = !o.serve.empty() ? o.serve : o.serve_dir + "/" + watches[i].name + ".sock";
+            asker->open(path, i);
+            std::fprintf(stderr, "phasevec-reader: answering on %s for watch %s (reader %s) between rows\n",
+                         path.c_str(), watches[i].name.c_str(), watches[i].reader.c_str());
+        }
     }
 
-    long read_ok = 0, refused = 0, failed = 0;
+    // The watches take turns, a batch each; a waiting question goes before the next row of any of
+    // them. A watch whose queue empties is maintained then (lexicon, counts), as with one watch.
     for (;;) {
-        PGresult *r = nullptr;
-        if (auto err = db.exec("SELECT key, body, text_hash::text FROM muninn.next($1, $2::int)",
-                               {o.watch, std::to_string(o.batch)}, &r))
-            die("cannot ask what to read: " + *err);
-        int rows = PQntuples(r);
-        for (int i = 0; i < rows; i++) {
-            if (asker) asker->step(db, o, rd, 0, false);   // a waiting question goes before the next row
-            std::string key = PQgetvalue(r, i, 0);
-            std::string body = PQgetisnull(r, i, 1) ? "" : PQgetvalue(r, i, 1);
-            std::string hash = PQgetvalue(r, i, 2);
-            Reading rdg = body.empty() ? Reading{} : rd.read(body);
-            std::optional<std::string> err;
-            if (rdg.v.empty()) {
-                err = db.exec("SELECT muninn.record_failure($1, $2, $3, $4::bytea, $5)",
-                              {o.watch, key, o.reader, hash, body.empty() ? "empty text" : "the model produced no reading"});
-                if (!err) failed++;
-            } else {
-                err = db.exec("SELECT muninn.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[], "
-                              "nullif($7, '')::real, nullif($8, '')::bit(256), $9::int, $10::int)",
-                              {o.watch, key, o.reader, hash, std::to_string(code64(rdg.v)), code_literal(rdg.v),
-                               familiarity_param(rdg), code256(rdg.v), std::to_string(rdg.tokens_read),
-                               std::to_string(rdg.tokens_total)});
-                if (!err) read_ok++;
+        bool any = false;
+        for (auto &w : watches) {
+            PGresult *r = nullptr;
+            if (auto err = db.exec("SELECT key, body, text_hash::text FROM phasevec.next($1, $2::int)",
+                                   {w.name, std::to_string(o.batch)}, &r))
+                die("cannot ask what to read of " + w.name + ": " + *err);
+            int rows = PQntuples(r);
+            for (int i = 0; i < rows; i++) {
+                if (asker) asker->step(db, watches, rd, 0, false);   // a waiting question goes before the next row
+                std::string key = PQgetvalue(r, i, 0);
+                std::string body = PQgetisnull(r, i, 1) ? "" : PQgetvalue(r, i, 1);
+                std::string hash = PQgetvalue(r, i, 2);
+                Reading rdg = body.empty() ? Reading{} : rd.read(body);
+                std::optional<std::string> err;
+                if (rdg.v.empty()) {
+                    err = db.exec("SELECT phasevec.record_failure($1, $2, $3, $4::bytea, $5)",
+                                  {w.name, key, w.reader, hash, body.empty() ? "empty text" : "the model produced no reading"});
+                    if (!err) w.failed++;
+                } else {
+                    err = db.exec("SELECT phasevec.record($1, $2, $3, $4::bytea, $5::bigint, $6::smallint[], "
+                                  "nullif($7, '')::real, nullif($8, '')::bit(256), $9::int, $10::int)",
+                                  {w.name, key, w.reader, hash, std::to_string(code64(rdg.v)), code_literal(rdg.v),
+                                   familiarity_param(rdg), code256(rdg.v), std::to_string(rdg.tokens_read),
+                                   std::to_string(rdg.tokens_total)});
+                    if (!err) w.read_ok++;
+                }
+                if (err) {
+                    w.refused++;
+                    std::fprintf(stderr, "phasevec-reader: %s: row %s not recorded: %s", w.name.c_str(), key.c_str(),
+                                 err->c_str());
+                }
             }
-            if (err) {
-                refused++;
-                std::fprintf(stderr, "muninn-reader: row %s not recorded: %s", key.c_str(), err->c_str());
+            PQclear(r);
+            if (rows > 0) {
+                any = true;
+                w.drained = false;
+            } else if (!w.drained) {
+                std::fprintf(stderr, "phasevec-reader: %s: %ld read, %ld failed, %ld refused; queue empty\n",
+                             w.name.c_str(), w.read_ok, w.failed, w.refused);
+                maintain_lexicon(db, w.name);
+                maintain_counts(db, w.name);
+                w.drained = true;
             }
         }
-        PQclear(r);
-        if (rows == 0) {
-            std::fprintf(stderr, "muninn-reader: %s: %ld read, %ld failed, %ld refused; queue empty\n",
-                         o.watch.c_str(), read_ok, failed, refused);
-            maintain_lexicon(db, o);
-            if (o.once) break;
-            wait_for_work(db, o, rd, asker.get());
-        }
+        if (any) continue;
+        if (o.once) break;
+        wait_for_work(db, watches, rd, asker.get());
+        for (auto &w : watches) w.drained = false;   // maintained again after each wait, as before
     }
     return 0;
 }

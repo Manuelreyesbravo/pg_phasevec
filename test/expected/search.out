@@ -1,0 +1,35 @@
+-- 0.9.0: phasevec.search() asks the watch's reader through the database. Without a reader it fails with
+-- its cause (never an empty answer); a name that could escape the socket directory is refused.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
+ extversion 
+------------
+ 0.10.0
+(1 row)
+
+SELECT phasevec.reader_register('r256', repeat('a', 64), 256) > 0 AS r256;
+ r256 
+------
+ t
+(1 row)
+
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs VALUES (1, 'uno');
+SELECT phasevec.watch('docs', 'docs'::regclass, 'id', 'r.body', 'r256') > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+SET phasevec.socket_dir = '/nonexistent/phasevec';
+SELECT * FROM phasevec.search('docs', 'una pregunta');
+ERROR:  phasevec: the reader of watch "docs" is not reachable at /nonexistent/phasevec/docs.sock: No such file or directory
+SELECT * FROM phasevec.search('docs', '   ');
+ERROR:  phasevec: the question is empty
+SELECT phasevec._ask('../etc', '{}');
+ERROR:  phasevec: "../etc" is not a watch name a socket can carry
+SELECT phasevec._ask('docs', E'{}\n{}');
+ERROR:  phasevec: a request is one JSON line
+DROP TABLE docs;
+DROP EXTENSION pg_phasevec;

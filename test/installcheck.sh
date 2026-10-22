@@ -6,7 +6,10 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
 mkdir -p .testcluster/ext/extension
-for f in pg_muninn.control sql/*.sql; do ln -sfn "$PWD/$f" ".testcluster/ext/extension/$(basename "$f")"; done
+for f in pg_phasevec.control sql/*.sql; do ln -sfn "$PWD/$f" ".testcluster/ext/extension/$(basename "$f")"; done
+make -s PG_CONFIG="$PG/pg_config" >/dev/null
+mkdir -p .testcluster/ext/lib && ln -sfn "$PWD/pg_phasevec.so" .testcluster/ext/lib/pg_phasevec.so
+grep -q "^dynamic_library_path" .testcluster/postgresql.conf || echo "dynamic_library_path = '$PWD/.testcluster/ext/lib:\$libdir'" >> .testcluster/postgresql.conf
 "$PG/pg_ctl" -D .testcluster -o "-p 5491 -k /tmp" -l .testcluster/server.log -w start >/dev/null
 PGHOST=/tmp PGPORT=5491 make installcheck PG_CONFIG="$PG/pg_config" 2>&1 | grep -E '^(ok|not ok|#)'
 rc=${PIPESTATUS[0]}

@@ -1,0 +1,123 @@
+-- 0.7.0: the counts are kept as deltas. A bulk load in ONE transaction is linear, and the counts
+-- still never lie: coverage() equals a full recount before and after folding the deltas in.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec VERSION '0.6.0';
+SELECT phasevec.reader_register('t1', repeat('a', 64), 4) > 0 AS t1;
+ t1 
+----
+ t
+(1 row)
+
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs SELECT g, 'row ' || g FROM generate_series(1, 10) g;
+SELECT phasevec.watch('docs', 'docs'::regclass, 'id', 'r.body', 't1') > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+-- from 0.6.0 with live counts: nothing to fold yet, and the counts agree with a recount
+ALTER EXTENSION pg_phasevec UPDATE TO '0.7.0';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
+ extversion 
+------------
+ 0.7.0
+(1 row)
+
+SELECT count(*) AS deltas FROM phasevec.count_deltas;
+ deltas 
+--------
+      0
+(1 row)
+
+SELECT count(*) AS mismatches FROM phasevec.coverage_check('docs');
+ mismatches 
+------------
+          0
+(1 row)
+
+-- a bulk load in one transaction: 20,000 rows noted, then 10,000 of them read
+BEGIN;
+INSERT INTO docs SELECT g, 'row ' || g FROM generate_series(11, 20010) g;
+SELECT count(phasevec.record('docs', n.key, 't1', n.text_hash, 1::bigint,
+                             ARRAY[1, 1, 0, 0]::smallint[], NULL, NULL, 5, 5))
+  FROM phasevec.next('docs', 10000) n;
+ count 
+-------
+ 10000
+(1 row)
+
+COMMIT;
+SELECT state, n FROM phasevec.coverage('docs') WHERE n > 0;
+  state  |   n   
+---------+-------
+ fresh   | 10000
+ pending | 10010
+(2 rows)
+
+SELECT count(*) AS mismatches FROM phasevec.coverage_check('docs');
+ mismatches 
+------------
+          0
+(1 row)
+
+SELECT count(*) > 1000 AS deltas_pending FROM phasevec.count_deltas;
+ deltas_pending 
+----------------
+ t
+(1 row)
+
+-- folded in: no delta left, the same coverage, still equal to a recount
+SELECT phasevec.counts_compact('docs') > 1000 AS folded;
+ folded 
+--------
+ t
+(1 row)
+
+SELECT count(*) AS deltas FROM phasevec.count_deltas;
+ deltas 
+--------
+      0
+(1 row)
+
+SELECT state, n FROM phasevec.coverage('docs') WHERE n > 0;
+  state  |   n   
+---------+-------
+ fresh   | 10000
+ pending | 10010
+(2 rows)
+
+SELECT count(*) AS mismatches FROM phasevec.coverage_check('docs');
+ mismatches 
+------------
+          0
+(1 row)
+
+-- after folding, a change is still stale in its own transaction (through a new delta)
+UPDATE docs SET body = 'changed' WHERE id = (SELECT key::int FROM phasevec.readings ORDER BY key LIMIT 1);
+SELECT state, n FROM phasevec.coverage('docs') WHERE state IN ('fresh', 'stale');
+ state |  n   
+-------+------
+ fresh | 9999
+ stale |    1
+(2 rows)
+
+SELECT count(*) AS mismatches FROM phasevec.coverage_check('docs');
+ mismatches 
+------------
+          0
+(1 row)
+
+-- a delta that would drive a count below zero is caught when it is folded, not silently kept
+INSERT INTO phasevec.count_deltas SELECT id, 'orphan', -5 FROM phasevec.watches WHERE name = 'docs';
+SELECT phasevec.counts_compact('docs');
+ERROR:  new row for relation "counts" violates check constraint "a_count_is_never_negative"
+DELETE FROM phasevec.count_deltas WHERE d = -5;
+SELECT count(*) AS mismatches FROM phasevec.coverage_check('docs');
+ mismatches 
+------------
+          0
+(1 row)
+
+DROP TABLE docs;
+DROP EXTENSION pg_phasevec;

@@ -2,7 +2,11 @@ results/
 regression.*
 .testcluster/
 dist/
-reader/muninn-reader
+reader/phasevec-reader
 .modelos/
 reader/probe-caps
 reader/probe-parity
+*.o
+*.so
+*.bc
+reader/phasevec-reader.*

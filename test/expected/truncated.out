@@ -1,7 +1,7 @@
 -- 0.5.0: a reading says whether the reader saw the whole text.
 \set VERBOSITY terse
-CREATE EXTENSION pg_muninn VERSION '0.4.0';
-SELECT muninn.reader_register('t1', repeat('a', 64), 4) > 0 AS t1;
+CREATE EXTENSION pg_phasevec VERSION '0.4.0';
+SELECT phasevec.reader_register('t1', repeat('a', 64), 4) > 0 AS t1;
  t1 
 ----
  t
@@ -9,55 +9,55 @@ SELECT muninn.reader_register('t1', repeat('a', 64), 4) > 0 AS t1;
 
 CREATE TABLE docs (id int PRIMARY KEY, body text);
 INSERT INTO docs SELECT g, 'doc ' || g FROM generate_series(1, 4) g;
-SELECT muninn.watch('docs', 'docs'::regclass, 'id', 'r.body', 't1') > 0 AS watch;
+SELECT phasevec.watch('docs', 'docs'::regclass, 'id', 'r.body', 't1') > 0 AS watch;
  watch 
 -------
  t
 (1 row)
 
 -- read under 0.4.0: no counts
-SELECT count(muninn.record('docs', n.key, 't1', n.text_hash, n.key::bigint, ARRAY[1,2,3,4]::smallint[]))
-  FROM muninn.next('docs', 1) n;
+SELECT count(phasevec.record('docs', n.key, 't1', n.text_hash, n.key::bigint, ARRAY[1,2,3,4]::smallint[]))
+  FROM phasevec.next('docs', 1) n;
  count 
 -------
      1
 (1 row)
 
-ALTER EXTENSION pg_muninn UPDATE TO '0.5.0';
-SELECT extversion FROM pg_extension WHERE extname = 'pg_muninn';
+ALTER EXTENSION pg_phasevec UPDATE TO '0.5.0';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
  extversion 
 ------------
  0.5.0
 (1 row)
 
 -- a reading from before 0.5.0 is unknown, not complete
-SELECT key, tokens_read, tokens_total, truncated FROM muninn.readings ORDER BY key;
+SELECT key, tokens_read, tokens_total, truncated FROM phasevec.readings ORDER BY key;
  key | tokens_read | tokens_total | truncated 
 -----+-------------+--------------+-----------
  1   |             |              | 
 (1 row)
 
 -- counts must come together and make sense
-SELECT muninn.record('docs', '2', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 10, NULL);
-ERROR:  muninn: a reading counts the tokens it read and the tokens its text has, both or neither (read 10, total <NULL>)
-SELECT muninn.record('docs', '2', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 11, 10);
-ERROR:  muninn: a reading counts the tokens it read and the tokens its text has, both or neither (read 11, total 10)
-SELECT muninn.record('docs', '2', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 0, 10);
-ERROR:  muninn: a reading counts the tokens it read and the tokens its text has, both or neither (read 0, total 10)
+SELECT phasevec.record('docs', '2', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 10, NULL);
+ERROR:  phasevec: a reading counts the tokens it read and the tokens its text has, both or neither (read 10, total <NULL>)
+SELECT phasevec.record('docs', '2', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 11, 10);
+ERROR:  phasevec: a reading counts the tokens it read and the tokens its text has, both or neither (read 11, total 10)
+SELECT phasevec.record('docs', '2', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 0, 10);
+ERROR:  phasevec: a reading counts the tokens it read and the tokens its text has, both or neither (read 0, total 10)
 -- a reading that saw everything, one that saw a prefix
-SELECT muninn.record('docs', '2', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 10, 10);
+SELECT phasevec.record('docs', '2', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '2'), 2, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 10, 10);
  record 
 --------
  
 (1 row)
 
-SELECT muninn.record('docs', '3', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '3'), 3, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 1021, 2380);
+SELECT phasevec.record('docs', '3', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '3'), 3, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 1021, 2380);
  record 
 --------
  
 (1 row)
 
-SELECT key, tokens_read, tokens_total, truncated FROM muninn.readings ORDER BY key;
+SELECT key, tokens_read, tokens_total, truncated FROM phasevec.readings ORDER BY key;
  key | tokens_read | tokens_total | truncated 
 -----+-------------+--------------+-----------
  1   |             |              | 
@@ -66,7 +66,7 @@ SELECT key, tokens_read, tokens_total, truncated FROM muninn.readings ORDER BY k
 (3 rows)
 
 -- find and alike say it; truncations() lists only the current truncated readings
-SELECT key, truncated FROM muninn.find('docs', 3, ARRAY[1,2,3,4]::smallint[], 10, true) ORDER BY key;
+SELECT key, truncated FROM phasevec.find('docs', 3, ARRAY[1,2,3,4]::smallint[], 10, true) ORDER BY key;
  key | truncated 
 -----+-----------
  1   | 
@@ -74,55 +74,55 @@ SELECT key, truncated FROM muninn.find('docs', 3, ARRAY[1,2,3,4]::smallint[], 10
  3   | t
 (3 rows)
 
-SELECT key, truncated FROM muninn.alike('docs', '2', 10, true) ORDER BY key;
+SELECT key, truncated FROM phasevec.alike('docs', '2', 10, true) ORDER BY key;
  key | truncated 
 -----+-----------
  1   | 
  3   | t
 (2 rows)
 
-SELECT * FROM muninn.truncations('docs');
+SELECT * FROM phasevec.truncations('docs');
  key | tokens_read | tokens_total 
 -----+-------------+--------------
  3   |        1021 |         2380
 (1 row)
 
 -- a failed reading carries no counts
-SELECT muninn.record_failure('docs', '3', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '3'), 'no tokens');
+SELECT phasevec.record_failure('docs', '3', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '3'), 'no tokens');
  record_failure 
 ----------------
  
 (1 row)
 
-SELECT key, tokens_read, tokens_total, truncated FROM muninn.readings WHERE key = '3';
+SELECT key, tokens_read, tokens_total, truncated FROM phasevec.readings WHERE key = '3';
  key | tokens_read | tokens_total | truncated 
 -----+-------------+--------------+-----------
  3   |             |              | 
 (1 row)
 
-SELECT * FROM muninn.truncations('docs');
+SELECT * FROM phasevec.truncations('docs');
  key | tokens_read | tokens_total 
 -----+-------------+--------------
 (0 rows)
 
 -- once the row changes, the old truncated reading is not listed: it is no longer of this text
-SELECT muninn.record('docs', '4', 't1', (SELECT text_hash FROM muninn.sources WHERE key = '4'), 4, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 5, 9);
+SELECT phasevec.record('docs', '4', 't1', (SELECT text_hash FROM phasevec.sources WHERE key = '4'), 4, ARRAY[1,2,3,4]::smallint[], NULL, NULL, 5, 9);
  record 
 --------
  
 (1 row)
 
 UPDATE docs SET body = 'changed' WHERE id = 4;
-SELECT * FROM muninn.truncations('docs');
+SELECT * FROM phasevec.truncations('docs');
  key | tokens_read | tokens_total 
 -----+-------------+--------------
 (0 rows)
 
-SELECT count(*) AS mismatches FROM muninn.coverage_check('docs');
+SELECT count(*) AS mismatches FROM phasevec.coverage_check('docs');
  mismatches 
 ------------
           0
 (1 row)
 
 DROP TABLE docs;
-DROP EXTENSION pg_muninn;
+DROP EXTENSION pg_phasevec;
