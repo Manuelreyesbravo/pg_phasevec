@@ -41,6 +41,13 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
 #include "utils/varbit.h"
+#include "access/table.h"
+#include "access/xact.h"
+#include "catalog/pg_trigger.h"
+#include "commands/trigger.h"
+#include "port/atomics.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 PG_MODULE_MAGIC;
 
@@ -1471,15 +1478,180 @@ by_delta_score(const void *x, const void *y)
 	return memcmp(a->key, b->key, a->klen);
 }
 
-/* Every reading of the delta, scored as phasevec.find scores, best first. Inside SPI. */
-static DeltaHit *
-delta_top(int32 watch, int32 reader, const Question *Q, size_t *nhp)
+/*
+ * 0.11.0: the delta's rows kept between questions. Measured (sql/182, b_100k): with the 50 rows a burst of
+ * writes leaves in the delta, asking for them again on every question (cursor, join ivf_dirty -> readings,
+ * one tuple each) put 0.108 ms on a 0.62 ms question, while the delta changes a few dozen times a second
+ * and is asked for thousands of times. Each backend keeps the rows it read; scoring is unchanged.
+ *
+ * When a kept copy may be used: every statement that writes phasevec.readings or phasevec.ivf_dirty marks
+ * its transaction (statement trigger delta_touch, ENABLE ALWAYS). Such a transaction counts itself in
+ * flight at pre-commit and, once its commit is visible to new snapshots, bumps a counter shared by the
+ * cluster and leaves the flight (abort too). A copy is built only with nothing in flight, under a snapshot
+ * taken AFTER reading the counter; a question uses it only if, read again, nothing is in flight, the
+ * counter has not moved, and the question's snapshot is not older than the copy's (completed-transaction
+ * count). Any transaction the question's snapshot sees was by then either in flight or counted, so a
+ * copy that misses its rows is never used. Otherwise the delta is read as before 0.11.0.
+ * Never kept: with phasevec.delta_cache off, without both delta_touch triggers armed (a 0.11.0 library
+ * over 0.10.0 SQL), under REPEATABLE READ or SERIALIZABLE, in recovery or parallel mode, in a transaction
+ * that wrote those tables itself, and after a two-phase PREPARE that wrote them (off until restart: the
+ * COMMIT PREPARED runs elsewhere and bumps nothing).
+ */
+typedef struct DGen
+{
+	pg_atomic_uint64 gen;
+	pg_atomic_uint32 inflight;
+	pg_atomic_uint32 off;
+} DGen;
+
+typedef struct DRow
+{
+	char	   *key;
+	int			klen;
+	uint8		hash[HB];
+	uint8		c256[CB];
+	double		norm;			/* sqrt of the code's sum of squares, as the scoring divides by */
+	int16	   *code;
+} DRow;
+
+extern bool phasevec_delta_cache;
+bool		phasevec_delta_cache = true;	/* GUC phasevec.delta_cache */
+
+#define DC_MAX_ROWS 20000		/* a delta larger than this is not kept (~0.6 KB a row) */
+
+static DGen *g_dgen = NULL;
+static bool g_touched = false;	/* this transaction wrote readings or ivf_dirty */
+static bool g_inflight = false; /* ... and counted itself in g_dgen->inflight */
+static bool g_xact_cb = false;
+
+static struct
+{
+	bool		valid;
+	int32		watch;
+	int32		reader;
+	int			nq;
+	uint64		gen;
+	uint64		completed;		/* snapXactCompletionCount of the snapshot the copy was read under */
+	size_t		n;
+	DRow	   *rows;
+	MemoryContext cxt;
+}			g_dc;
+
+static void
+dgen_init(void *ptr, void *arg)
+{
+	DGen	   *g = ptr;
+
+	pg_atomic_init_u64(&g->gen, 0);
+	pg_atomic_init_u32(&g->inflight, 0);
+	pg_atomic_init_u32(&g->off, 0);
+}
+
+static void
+dc_xact(XactEvent event, void *arg)
+{
+	if (!g_touched)
+		return;
+	if (event == XACT_EVENT_PRE_PREPARE || event == XACT_EVENT_PREPARE)
+		pg_atomic_write_u32(&g_dgen->off, 1);
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			if (!g_inflight)
+			{
+				pg_atomic_fetch_add_u32(&g_dgen->inflight, 1);
+				g_inflight = true;
+			}
+			break;
+		case XACT_EVENT_PRE_PREPARE:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			/* the bump before leaving the flight: a reader that sees nothing in flight sees the bump */
+			pg_atomic_fetch_add_u64(&g_dgen->gen, 1);
+			if (g_inflight)
+				pg_atomic_fetch_sub_u32(&g_dgen->inflight, 1);
+			g_inflight = false;
+			g_touched = false;
+			g_dc.valid = false;
+			break;
+	}
+}
+
+static DGen *
+dgen(void)
+{
+	if (g_dgen == NULL)
+	{
+		bool		found;
+
+		g_dgen = GetNamedDSMSegment("phasevec_delta_gen", sizeof(DGen), dgen_init, &found, NULL);
+	}
+	if (!g_xact_cb)
+	{
+		RegisterXactCallback(dc_xact, NULL);
+		g_xact_cb = true;
+	}
+	return g_dgen;
+}
+
+PG_FUNCTION_INFO_V1(phasevec_delta_touch);
+Datum
+phasevec_delta_touch(PG_FUNCTION_ARGS)
+{
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "phasevec: _delta_touch() is a trigger");
+	dgen();
+	g_touched = true;
+	g_dc.valid = false;
+	return PointerGetDatum(NULL);
+}
+
+/* Is phasevec.<rel>'s delta_touch an AFTER statement trigger on every write, enabled ALWAYS? */
+static bool
+touch_armed_on(Oid nsp, const char *rel)
+{
+	Oid			relid = get_relname_relid(rel, nsp);
+	Relation	r;
+	bool		ok = false;
+
+	if (!OidIsValid(relid))
+		return false;
+	r = table_open(relid, AccessShareLock);
+	if (r->trigdesc)
+		for (int i = 0; i < r->trigdesc->numtriggers && !ok; i++)
+		{
+			Trigger    *t = &r->trigdesc->triggers[i];
+			int16		ty = t->tgtype;
+
+			ok = strcmp(t->tgname, "delta_touch") == 0 && t->tgenabled == TRIGGER_FIRES_ALWAYS &&
+				!TRIGGER_FOR_ROW(ty) && TRIGGER_FOR_AFTER(ty) && TRIGGER_FOR_INSERT(ty) &&
+				TRIGGER_FOR_UPDATE(ty) && TRIGGER_FOR_DELETE(ty) && TRIGGER_FOR_TRUNCATE(ty);
+		}
+	table_close(r, AccessShareLock);
+	return ok;
+}
+
+static bool
+touch_armed(void)
+{
+	Oid			nsp = get_namespace_oid("phasevec", true);
+
+	return OidIsValid(nsp) && touch_armed_on(nsp, "readings") && touch_armed_on(nsp, "ivf_dirty");
+}
+
+/* The delta's readings, copied into cxt, under the active snapshot. Inside SPI. */
+static DRow *
+delta_read(int32 watch, int32 reader, int nq, size_t *np, MemoryContext cxt)
 {
 	Oid			at[2] = {INT4OID, INT4OID};
 	Datum		av[2] = {Int32GetDatum(watch), Int32GetDatum(reader)};
 	Portal		portal;
-	DeltaHit   *hits;
-	size_t		nh = 0, cap = 64;
+	DRow	   *rows;
+	size_t		n = 0, cap = 64;
 
 	static SPIPlanPtr plan = NULL;
 
@@ -1494,7 +1666,7 @@ delta_top(int32 watch, int32 reader, const Question *Q, size_t *nhp)
 		SPI_keepplan(p);
 		plan = p;
 	}
-	hits = palloc(sizeof(DeltaHit) * cap);
+	rows = MemoryContextAlloc(cxt, sizeof(DRow) * cap);
 	portal = SPI_cursor_open(NULL, plan, av, NULL, true);
 	for (;;)
 	{
@@ -1511,35 +1683,126 @@ delta_top(int32 watch, int32 reader, const Question *Q, size_t *nhp)
 			const uint8 *c256 = code256_bytes(SPI_getbinval(tup, td, 3, &isnull));
 			ArrayType  *ca = DatumGetArrayTypeP(SPI_getbinval(tup, td, 4, &isnull));
 			const int16 *c;
-			int64		dt = 0, nn = 0;
-			DeltaHit   *x;
+			int64		nn = 0;
+			DRow	   *x;
 
-			if (ARR_NDIM(ca) != 1 || ARR_HASNULL(ca) || ARR_DIMS(ca)[0] != Q->nq || VARSIZE_ANY_EXHDR(h) != HB)
-				elog(ERROR, "phasevec ivf: a reading of the delta is not a %d-dimension code with its hash", Q->nq);
+			if (ARR_NDIM(ca) != 1 || ARR_HASNULL(ca) || ARR_DIMS(ca)[0] != nq || VARSIZE_ANY_EXHDR(h) != HB)
+				elog(ERROR, "phasevec ivf: a reading of the delta is not a %d-dimension code with its hash", nq);
 			c = (const int16 *) ARR_DATA_PTR(ca);
-			for (int d = 0; d < Q->nq; d++)
-			{
-				dt += (int64) c[d] * Q->q[d];
+			for (int d = 0; d < nq; d++)
 				nn += (int64) c[d] * c[d];
-			}
-			if (nh == cap)
+			if (n == cap)
 			{
 				cap *= 2;
-				hits = repalloc_huge(hits, sizeof(DeltaHit) * cap);
+				rows = repalloc_huge(rows, sizeof(DRow) * cap);
 			}
-			x = &hits[nh++];
+			x = &rows[n++];
 			x->klen = VARSIZE_ANY_EXHDR(key);
-			x->key = palloc(x->klen);
+			x->key = MemoryContextAlloc(cxt, x->klen);
 			memcpy(x->key, VARDATA_ANY(key), x->klen);
 			memcpy(x->hash, VARDATA_ANY(h), HB);
-			x->score = (nn == 0 || Q->qnorm == 0) ? -INFINITY : (double) dt / (sqrt((double) nn) * Q->qnorm);
-			x->ham = ham256(Q->qb, c256);
+			memcpy(x->c256, c256, CB);
+			x->norm = sqrt((double) nn);
+			x->code = MemoryContextAlloc(cxt, sizeof(int16) * nq);
+			memcpy(x->code, c, sizeof(int16) * nq);
 		}
 		SPI_freetuptable(SPI_tuptable);
 	}
 	SPI_cursor_close(portal);
-	qsort(hits, nh, sizeof(DeltaHit), by_delta_score);
-	*nhp = nh;
+	*np = n;
+	return rows;
+}
+
+/* The delta's rows for this question: the kept copy when it may be used (see above), else read now. */
+static DRow *
+delta_rows(int32 watch, int32 reader, int nq, size_t *np)
+{
+	DGen	   *g;
+	Snapshot	cur, s;
+	uint64		gen;
+	DRow	   *rows;
+	size_t		n;
+
+	if (!phasevec_delta_cache || g_touched || RecoveryInProgress() || IsInParallelMode() ||
+		IsolationUsesXactSnapshot() || !ActiveSnapshotSet() || !touch_armed())
+		return delta_read(watch, reader, nq, np, CurrentMemoryContext);
+	g = dgen();
+	if (pg_atomic_read_u32(&g->off) != 0 || pg_atomic_read_u32(&g->inflight) != 0)
+		return delta_read(watch, reader, nq, np, CurrentMemoryContext);
+	pg_read_barrier();
+	gen = pg_atomic_read_u64(&g->gen);
+	cur = GetActiveSnapshot();
+	if (g_dc.valid && g_dc.watch == watch && g_dc.reader == reader && g_dc.nq == nq && g_dc.gen == gen)
+	{
+		if (cur->snapXactCompletionCount < g_dc.completed)
+			return delta_read(watch, reader, nq, np, CurrentMemoryContext);
+		*np = g_dc.n;
+		return g_dc.rows;
+	}
+	/* read it again under a snapshot taken after the counter, and keep it */
+	g_dc.valid = false;
+	if (g_dc.cxt == NULL)
+		g_dc.cxt = AllocSetContextCreate(TopMemoryContext, "phasevec delta", ALLOCSET_DEFAULT_SIZES);
+	else
+		MemoryContextReset(g_dc.cxt);
+	s = RegisterSnapshot(GetLatestSnapshot());
+	PushActiveSnapshot(s);
+	PG_TRY();
+	{
+		rows = delta_read(watch, reader, nq, &n, g_dc.cxt);
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	g_dc.completed = s->snapXactCompletionCount;
+	UnregisterSnapshot(s);
+	if (n <= DC_MAX_ROWS)
+	{
+		g_dc.watch = watch;
+		g_dc.reader = reader;
+		g_dc.nq = nq;
+		g_dc.gen = gen;
+		g_dc.n = n;
+		g_dc.rows = rows;
+		g_dc.valid = true;
+		if (cur->snapXactCompletionCount >= g_dc.completed)
+		{
+			*np = n;
+			return rows;
+		}
+	}
+	/* the question's snapshot is older than the copy's, or the copy is too large: this question reads its own */
+	return delta_read(watch, reader, nq, np, CurrentMemoryContext);
+}
+
+/* Every reading of the delta, scored as phasevec.find scores, best first. Inside SPI. */
+static DeltaHit *
+delta_top(int32 watch, int32 reader, const Question *Q, size_t *nhp)
+{
+	size_t		n;
+	DRow	   *rows = delta_rows(watch, reader, Q->nq, &n);
+	DeltaHit   *hits = palloc(sizeof(DeltaHit) * Max(n, 1));
+
+	for (size_t i = 0; i < n; i++)
+	{
+		const DRow *r = &rows[i];
+		DeltaHit   *x = &hits[i];
+		int64		dt = 0;
+
+		for (int d = 0; d < Q->nq; d++)
+			dt += (int64) r->code[d] * Q->q[d];
+		/* the key is copied: a kept copy may be reset by the next question before these are emitted */
+		x->klen = r->klen;
+		x->key = palloc(r->klen);
+		memcpy(x->key, r->key, r->klen);
+		memcpy(x->hash, r->hash, HB);
+		x->score = (r->norm == 0 || Q->qnorm == 0) ? -INFINITY : (double) dt / (r->norm * Q->qnorm);
+		x->ham = ham256(Q->qb, r->c256);
+	}
+	qsort(hits, n, sizeof(DeltaHit), by_delta_score);
+	*nhp = n;
 	return hits;
 }
 

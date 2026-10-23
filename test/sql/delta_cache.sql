@@ -1,0 +1,72 @@
+-- 0.11.0: the coarse index's delta kept between questions. Kept or read again, the answer is the same; a
+-- committed write is seen by the very next question; a transaction sees its own writes and, rolled back,
+-- they are gone; REPEATABLE READ reads it every time. Both triggers are there and fire ALWAYS.
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_phasevec;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
+SELECT tgrelid::regclass AS rel, tgenabled FROM pg_trigger WHERE tgname = 'delta_touch' ORDER BY 1::text;
+SELECT phasevec.reader_register('r256', repeat('a', 64), 256) > 0 AS r256;
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs SELECT g, 'doc ' || g FROM generate_series(1, 2000) g;
+SELECT phasevec.watch('docs', 'docs'::regclass, 'id', 'r.body', 'r256') > 0 AS watch;
+CREATE FUNCTION code_of(g int) RETURNS smallint[] LANGUAGE sql IMMUTABLE AS $$
+    SELECT array(SELECT (((g * 31 + j * 17 * (g % 7 + 1) + (g / 13) * j) % 255) - 127)::smallint
+                   FROM generate_series(1, 256) j) $$;
+CREATE FUNCTION signs_of(c smallint[]) RETURNS bit(256) LANGUAGE sql IMMUTABLE AS $$
+    SELECT string_agg(CASE WHEN x > 0 THEN '1' ELSE '0' END, '' ORDER BY o)::bit(256)
+      FROM unnest(c) WITH ORDINALITY u(x, o) $$;
+CREATE FUNCTION read_as(p_from int, p_to int, p_shift int) RETURNS bigint LANGUAGE sql AS $$
+    SELECT count(phasevec.record('docs', s.key, 'r256', s.text_hash, 0::bigint, code_of(s.key::int + p_shift), NULL,
+                                 signs_of(code_of(s.key::int + p_shift))))
+      FROM phasevec.sources s WHERE s.key::int BETWEEN p_from AND p_to $$;
+CREATE FUNCTION change_as(p_from int, p_to int, p_shift int) RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE docs SET body = 'doc ' || id || ' v' || p_shift WHERE id BETWEEN p_from AND p_to;
+    RETURN read_as(p_from, p_to, p_shift);
+END $$;
+CREATE FUNCTION top(q int, k int DEFAULT 10) RETURNS text LANGUAGE sql AS $$
+    SELECT string_agg(key || ':' || round(score::numeric, 4), ',' ORDER BY score DESC, key)
+      FROM phasevec.find_ivf('docs', 0, code_of(q), k, false, 200, signs_of(code_of(q)), 1000) $$;
+SELECT read_as(1, 2000, 0) AS read;
+SELECT phasevec.ivf_build('docs') > 0 AS built;
+
+-- 30 rows read again with other codes: a delta of 30
+SELECT read_as(1, 30, 5) AS reread;
+SELECT count(*) AS delta FROM phasevec.ivf_dirty;
+
+-- the same answers kept or read again (the second pass is served from the kept copy)
+SET phasevec.delta_cache = off;
+CREATE TEMP TABLE ref AS SELECT q, top(q) AS t FROM generate_series(1, 60, 3) q;
+SET phasevec.delta_cache = on;
+SELECT count(*) FILTER (WHERE top(q) = t) AS same_first, count(*) AS of FROM ref;
+SELECT count(*) FILTER (WHERE top(q) = t) AS same_kept, count(*) AS of FROM ref;
+SELECT count(*) FILTER (WHERE t LIKE '%1:%' OR t LIKE '%30:%') > 0 AS delta_rows_in_answers FROM ref;
+
+-- a committed write is seen by the next question: key 5 now reads as 1000 does (and no other key does)
+SELECT top(1000, 2) AS before_commit;
+SELECT change_as(5, 5, 995) AS changed;
+SELECT top(1000, 2) AS after_commit;
+
+-- a transaction sees its own write; rolled back, it is gone
+SELECT top(1500, 2) AS before_own_write;
+BEGIN;
+SELECT change_as(6, 6, 1494) AS changed;
+SELECT top(1500, 2) AS own_write;
+ROLLBACK;
+SELECT top(1500, 2) AS after_rollback;
+
+-- REPEATABLE READ reads the delta every time, and sees what its snapshot sees
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT top(1000, 2) AS repeatable_read;
+COMMIT;
+
+-- off and on agree after all of it
+SET phasevec.delta_cache = off;
+CREATE TEMP TABLE ref2 AS SELECT q, top(q) AS t FROM generate_series(2, 60, 5) q;
+SET phasevec.delta_cache = on;
+SELECT count(*) FILTER (WHERE top(q) = t) AS same_after, count(*) AS of FROM ref2;
+
+DROP TABLE docs;
+DROP FUNCTION code_of(int), signs_of(smallint[]), read_as(int, int, int), change_as(int, int, int), top(int, int);
+DROP EXTENSION pg_phasevec;

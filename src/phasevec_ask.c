@@ -27,6 +27,7 @@
 void		_PG_init(void);
 extern bool phasevec_shared_ivf_cache;	/* phasevec_ivf.c */
 extern int	phasevec_shared_ivf_cache_mb;	/* phasevec_ivf.c */
+extern bool phasevec_delta_cache;	/* phasevec_ivf.c */
 
 static char *socket_dir = NULL;
 static int	ask_timeout_ms = 10000;
@@ -42,6 +43,10 @@ _PG_init(void)
 							 "Sweep the coarse index from the copy shared by every backend (0.10.0)",
 							 "Off: each connection loads and keeps its own copy, as before 0.10.0.",
 							 &phasevec_shared_ivf_cache, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("phasevec.delta_cache",
+							 "Keep the coarse index's delta between questions (0.11.0)",
+							 "Off: every question reads the delta again, as before 0.11.0. The kept copy is used only while no write to readings or ivf_dirty has committed since it was read.",
+							 &phasevec_delta_cache, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("phasevec.socket_dir",
 							   "Directory of the readers' sockets (<watch>.sock); empty: /run/user/<uid>/phasevec.",
 							   NULL, &socket_dir, "", PGC_SUSET, 0, NULL, NULL, NULL);
