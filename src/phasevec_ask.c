@@ -84,12 +84,14 @@ wait_for(int fd, short ev, TimestampTz deadline, const char *path)
 	}
 }
 
-PG_FUNCTION_INFO_V1(phasevec_ask);
-Datum
-phasevec_ask(PG_FUNCTION_ARGS)
+/*
+ * One line to <phasevec.socket_dir>/<watch><suffix> and its answer: up to the first newline (the reader,
+ * phasevec._ask) or up to a blank line (phasevec-npu, phasevec._npu_ask: one line per result). The watch
+ * name is the file name, checked against [A-Za-z0-9_.-]; a server that is down, slow or gone is an ERROR.
+ */
+static text *
+hablar(const char *watch, const char *req, const char *suffix, bool hasta_vacia, const char *quien, const char *pista)
 {
-	char	   *watch = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *req = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char		path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
 	struct sockaddr_un addr;
 	StringInfoData out;
@@ -103,11 +105,11 @@ phasevec_ask(PG_FUNCTION_ARGS)
 	if (*watch == '\0' || *watch == '.')
 		ereport(ERROR, (errmsg("phasevec: \"%s\" is not a watch name a socket can carry", watch)));
 	if (strchr(req, '\n'))
-		ereport(ERROR, (errmsg("phasevec: a request is one JSON line")));
+		ereport(ERROR, (errmsg(hasta_vacia ? "phasevec: a request is one line" : "phasevec: a request is one JSON line")));
 	if (socket_dir && *socket_dir)
-		snprintf(path, sizeof path, "%s/%s.sock", socket_dir, watch);
+		snprintf(path, sizeof path, "%s/%s%s", socket_dir, watch, suffix);
 	else
-		snprintf(path, sizeof path, "/run/user/%d/phasevec/%s.sock", (int) geteuid(), watch);
+		snprintf(path, sizeof path, "/run/user/%d/phasevec/%s%s", (int) geteuid(), watch, suffix);
 
 	memset(&addr, 0, sizeof addr);
 	addr.sun_family = AF_UNIX;
@@ -125,8 +127,8 @@ phasevec_ask(PG_FUNCTION_ARGS)
 		else
 		{
 			close(fd);
-			ereport(ERROR, (errmsg("phasevec: the reader of watch \"%s\" is not reachable at %s: %s", watch, path, strerror(e)),
-							errhint("Start it: systemctl --user start phasevec-lector-...@%s", watch)));
+			ereport(ERROR, (errmsg("phasevec: the %s of watch \"%s\" is not reachable at %s: %s", quien, watch, path, strerror(e)),
+							errhint("%s", pista)));
 		}
 	}
 	while (sent <= len)
@@ -142,7 +144,7 @@ phasevec_ask(PG_FUNCTION_ARGS)
 			if (errno == EINTR || errno == EAGAIN)
 				continue;
 			close(fd);
-			ereport(ERROR, (errmsg("phasevec: sending to the reader at %s: %m", path)));
+			ereport(ERROR, (errmsg("phasevec: sending to the %s at %s: %m", quien, path)));
 		}
 		sent += (size_t) w;
 	}
@@ -159,22 +161,50 @@ phasevec_ask(PG_FUNCTION_ARGS)
 			if (errno == EINTR || errno == EAGAIN)
 				continue;
 			close(fd);
-			ereport(ERROR, (errmsg("phasevec: reading from the reader at %s: %m", path)));
+			ereport(ERROR, (errmsg("phasevec: reading from the %s at %s: %m", quien, path)));
 		}
 		if (r == 0)
 			break;
 		appendBinaryStringInfo(&out, buf, (int) r);
-		if (out.len > 0 && out.data[out.len - 1] == '\n')
+		if (!hasta_vacia && out.len > 0 && out.data[out.len - 1] == '\n')
+			break;
+		if (hasta_vacia && ((out.len == 1 && out.data[0] == '\n') ||
+							(out.len >= 2 && out.data[out.len - 1] == '\n' && out.data[out.len - 2] == '\n')))
 			break;
 		if (out.len > 64 * 1024 * 1024)
 		{
 			close(fd);
-			ereport(ERROR, (errmsg("phasevec: the reader at %s answered more than 64 MB", path)));
+			ereport(ERROR, (errmsg("phasevec: the %s at %s answered more than 64 MB", quien, path)));
 		}
 	}
 	close(fd);
 	if (out.len == 0 || out.data[out.len - 1] != '\n')
-		ereport(ERROR, (errmsg("phasevec: the reader at %s closed without a whole answer", path)));
+		ereport(ERROR, (errmsg("phasevec: the %s at %s closed without a whole answer", quien, path)));
 	out.data[--out.len] = '\0';
-	PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
+	if (hasta_vacia && out.len > 0 && out.data[out.len - 1] == '\n')
+		out.data[--out.len] = '\0';
+	return cstring_to_text_with_len(out.data, out.len);
+}
+
+PG_FUNCTION_INFO_V1(phasevec_ask);
+Datum
+phasevec_ask(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(hablar(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
+							".sock", false, "reader",
+							psprintf("Start it: systemctl --user start phasevec-lector-...@%s", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
+}
+
+/*
+ * 0.12.0: phasevec._npu_ask(watch, "k v0,...,v255") asks phasevec-npu, the server that keeps the watch's
+ * copy on the NPU, at <phasevec.socket_dir>/<watch>.npu.sock. One line per result, "key<TAB>score<TAB>hash",
+ * up to a blank line. phasevec.find_npu() validates and completes what it says; nothing else calls this.
+ */
+PG_FUNCTION_INFO_V1(phasevec_npu_ask);
+Datum
+phasevec_npu_ask(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(hablar(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
+							".npu.sock", true, "NPU server",
+							psprintf("Start it: phasevec-npu --vigia %s ...", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
 }
