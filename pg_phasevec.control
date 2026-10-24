@@ -1,5 +1,5 @@
 comment = 'Readings with provenance: what a sealed reader understood of each row, and whether it still holds'
-default_version = '0.12.0'
+default_version = '0.13.0'
 relocatable = false
 schema = phasevec
 module_pathname = 'pg_phasevec'
