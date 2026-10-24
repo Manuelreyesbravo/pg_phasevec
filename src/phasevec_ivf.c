@@ -2291,6 +2291,22 @@ found_cmp(const void *x, const void *y)
 static SPIPlanPtr g_validate = NULL;
 
 /*
+ * 0.14.0: a replaced, expired or refuted key is never served. The same library serves databases still on 0.12 or
+ * 0.13 (no phasevec.truth): the truth filter goes in only where the table exists, and the plan is prepared again
+ * when that changes (an ALTER EXTENSION ... UPDATE seen by a live backend).
+ */
+static bool g_validate_truth = false;
+#define VALIDATE_SQL \
+	"SELECT c.i::int, r.familiarity, r.read_at, r.truncated " \
+	"FROM unnest($2::text[], $3::bytea[]) WITH ORDINALITY c(key, h, i) " \
+	"JOIN phasevec.readings r ON r.watch = $1 AND r.key = c.key AND r.reader = $4 " \
+	"  AND r.failed IS NULL AND r.text_hash = c.h " \
+	"JOIN phasevec.sources s ON s.watch = $1 AND s.key = c.key AND s.text_hash = c.h"
+#define VALIDATE_TRUTH \
+	" WHERE NOT EXISTS (SELECT 1 FROM phasevec.truth tr WHERE tr.watch = $1 AND tr.key = c.key " \
+	"  AND (tr.verdict IN ($q$replaced$q$, $q$refuted$q$) OR tr.expires_at <= now()))"
+
+/*
  * The k best valid answers among the sweep's kk best and the delta's kk best, as find_ivf returns them.
  * Inside SPI; the Found array and what it points to live in the SPI context.
  */
@@ -2357,15 +2373,20 @@ find_valid(int32 watch, int32 reader, const Question *Q, int nprobe, int m, int 
 			kd[i] = PointerGetDatum(cstring_to_text_with_len(f[i].key, f[i].klen));
 			hd[i] = PointerGetDatum(h);
 		}
+		{
+			Oid			ns = get_namespace_oid("phasevec", true);
+			bool		truth = OidIsValid(ns) && OidIsValid(get_relname_relid("truth", ns));
+
+			if (g_validate != NULL && g_validate_truth != truth)
+			{
+				SPI_freeplan(g_validate);
+				g_validate = NULL;
+			}
+			g_validate_truth = truth;
+		}
 		if (g_validate == NULL)
 		{
-			SPIPlanPtr	p = SPI_prepare(
-				"SELECT c.i::int, r.familiarity, r.read_at, r.truncated "
-				"FROM unnest($2::text[], $3::bytea[]) WITH ORDINALITY c(key, h, i) "
-				"JOIN phasevec.readings r ON r.watch = $1 AND r.key = c.key AND r.reader = $4 "
-				"  AND r.failed IS NULL AND r.text_hash = c.h "
-				"JOIN phasevec.sources s ON s.watch = $1 AND s.key = c.key AND s.text_hash = c.h",
-				4, vt);
+			SPIPlanPtr	p = SPI_prepare(g_validate_truth ? VALIDATE_SQL VALIDATE_TRUTH : VALIDATE_SQL, 4, vt);
 
 			if (p == NULL)
 				elog(ERROR, "phasevec ivf: cannot prepare the validation: %s", SPI_result_code_string(SPI_result));
