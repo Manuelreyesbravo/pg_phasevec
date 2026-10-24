@@ -6,7 +6,7 @@ CREATE EXTENSION pg_phasevec;
 SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
  extversion 
 ------------
- 0.14.0
+ 0.14.1
 (1 row)
 
 SELECT phasevec.reader_register('r256', repeat('a', 64), 256) > 0 AS r256;
