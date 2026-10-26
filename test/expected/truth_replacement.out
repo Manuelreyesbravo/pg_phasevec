@@ -1,0 +1,144 @@
+-- 0.15.0: a replaced note hands its place to its replacement. The correction (2) is worded so differently that
+-- the question never reaches it on its own (cosine 0): before 0.15.0 hiding the old note (1) left the question
+-- without the truth. Each case with its control.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec VERSION $v$0.13.0$v$;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes VALUES (1, $t$the deployed version is 0.12.0$t$), (2, $t$what runs today is the 0.13 line$t$),
+                         (3, $t$cherry tart$t$), (4, $t$date palm$t$), (5, $t$deploy checklist$t$);
+SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+CREATE FUNCTION pg_temp.code(k text) RETURNS smallint[] LANGUAGE sql AS $f$
+    SELECT CASE k WHEN $k$1$k$ THEN ARRAY[100,0,0,0] WHEN $k$2$k$ THEN ARRAY[0,100,0,0]
+                  WHEN $k$3$k$ THEN ARRAY[0,0,100,0] WHEN $k$4$k$ THEN ARRAY[0,0,0,100]
+                  ELSE ARRAY[60,0,80,0] END::smallint[] $f$;
+SELECT count(phasevec.record($w$notes$w$, n.key, $n$r1$n$, n.text_hash, 1, pg_temp.code(n.key))) AS recorded
+  FROM phasevec.next($w$notes$w$) n;
+ recorded 
+----------
+        5
+(1 row)
+
+ALTER EXTENSION pg_phasevec UPDATE TO $v$0.15.0$v$;
+SELECT extversion FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
+ extversion 
+------------
+ 0.15.0
+(1 row)
+
+-- control: nothing said about truth, find = the 0.14 search
+SELECT key, round(score::numeric, 3) AS score, state FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 2);
+ key | score | state 
+-----+-------+-------
+ 1   | 1.000 | fresh
+ 5   | 0.600 | fresh
+(2 rows)
+
+SELECT (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 5))
+     = (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec._find_hide($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 5))
+       AS same_as_hide_without_truth;
+ same_as_hide_without_truth 
+----------------------------
+ t
+(1 row)
+
+-- replaced: the old note is not served, its replacement takes its place (it would not be reached on its own)
+SELECT phasevec.supersede($w$notes$w$, $k$1$k$, $k$2$k$, $m$the 0.13 line is deployed$m$);
+ supersede 
+-----------
+ 
+(1 row)
+
+SELECT key, round(score::numeric, 3) AS score FROM phasevec._find_hide($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 1);
+ key | score 
+-----+-------
+ 5   | 0.600
+(1 row)
+
+SELECT key, round(score::numeric, 3) AS score, state FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 2);
+ key | score |    state    
+-----+-------+-------------
+ 2   | 1.000 | replacement
+ 5   | 0.600 | fresh
+(2 rows)
+
+-- the replacement shows its own reading, not the old one
+SELECT f.read_at = r.read_at AS own_reading
+  FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 1) f
+  JOIN phasevec.readings r ON r.key = f.key AND r.watch = (SELECT id FROM phasevec.watches WHERE name = $w$notes$w$);
+ own_reading 
+-------------
+ t
+(1 row)
+
+-- a replacement already served on its own merit is not duplicated: it keeps its best score
+SELECT key, round(score::numeric, 3) AS score, state FROM phasevec.find($w$notes$w$, 1, ARRAY[0,100,0,0]::smallint[], 3);
+ key | score | state 
+-----+-------+-------
+ 2   | 1.000 | fresh
+ 3   | 0.000 | fresh
+ 4   | 0.000 | fresh
+(3 rows)
+
+-- a replacement that is no longer valid takes nobody's place (one hop)
+SELECT phasevec.assert($w$notes$w$, $k$2$k$, p_expires_at => now() - interval $i$1 minute$i$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT key, state FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 1);
+ key | state 
+-----+-------
+ 5   | fresh
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$2$k$, p_expires_at => now() + interval $i$1 hour$i$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT key, state FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 1);
+ key |    state    
+-----+-------------
+ 2   | replacement
+(1 row)
+
+-- k is still k
+SELECT count(*) AS k3 FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 3);
+ k3 
+----
+  3
+(1 row)
+
+-- unsuperseding restores the old note and the replacement leaves its place
+SELECT phasevec.unsupersede($w$notes$w$, $k$1$k$);
+ unsupersede 
+-------------
+ 
+(1 row)
+
+SELECT key, round(score::numeric, 3) AS score, state FROM phasevec.find($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 2);
+ key | score | state 
+-----+-------+-------
+ 1   | 1.000 | fresh
+ 5   | 0.600 | fresh
+(2 rows)
+
+-- find_ivf is the same wrapper over the 0.14 coarse search: its checks pass through unchanged
+SELECT * FROM phasevec.find_ivf($w$notes$w$, 1, ARRAY[100,0,0,0]::smallint[], 2);
+ERROR:  phasevec: find_v2 sweeps the 256-bit codes: pass the question's code256
+DROP EXTENSION pg_phasevec CASCADE;
+NOTICE:  drop cascades to trigger phasevec_watch_1 on table notes
+DROP TABLE notes;
