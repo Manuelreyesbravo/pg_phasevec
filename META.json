@@ -1,7 +1,7 @@
 {
    "name": "pg_phasevec",
    "abstract": "Readings with provenance: what a sealed reader understood of each row, and whether it still holds",
-   "description": "pg_phasevec records, for each row, what a sealed in-process reader understood of it -- an embedding tagged with the reader and model that produced it -- and lets you ask later whether that reading still holds against the row as it is now. It builds an IVF index over the readings for approximate-nearest-neighbour search, dates and proves each answer against its own clock, and when one note supersedes another the replacement takes the old one's place. No external service and no network call: the reader is sealed and runs inside the backend.",
+   "description": "pg_phasevec records, for each row, what a sealed reader understood of it -- an embedding tagged with the reader and model that produced it -- and lets you ask later whether that reading still holds against the row as it is now. It builds an IVF index over the readings for approximate-nearest-neighbour search, dates and proves each answer against its own clock, and when one note supersedes another the replacement takes the old one's place. No external service and no network call: the reader is yours and local, and readings from different readers are never compared.",
    "version": "0.16.0",
    "maintainer": [
       "Manuel Reyes <manuelreyesbravo@gmail.com>"
@@ -10,6 +10,7 @@
    "provides": {
       "pg_phasevec": {
          "abstract": "Readings with provenance, verifiable against the row as it is now, with IVF search over them",
+         "docfile": "README.md",
          "file": "src/phasevec_ivf.c",
          "version": "0.16.0"
       }
