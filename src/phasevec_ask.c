@@ -98,6 +98,8 @@ hablar(const char *watch, const char *req, const char *suffix, bool hasta_vacia,
 	TimestampTz deadline;
 	size_t		len = strlen(req), sent = 0;
 	int			fd;
+	int			plen;
+	size_t		slen;
 
 	for (const char *c = watch; *c; c++)
 		if (!(isalnum((unsigned char) *c) || *c == '_' || *c == '.' || *c == '-'))
@@ -107,13 +109,17 @@ hablar(const char *watch, const char *req, const char *suffix, bool hasta_vacia,
 	if (strchr(req, '\n'))
 		ereport(ERROR, (errmsg(hasta_vacia ? "phasevec: a request is one line" : "phasevec: a request is one JSON line")));
 	if (socket_dir && *socket_dir)
-		snprintf(path, sizeof path, "%s/%s%s", socket_dir, watch, suffix);
+		plen = snprintf(path, sizeof path, "%s/%s%s", socket_dir, watch, suffix);
 	else
-		snprintf(path, sizeof path, "/run/user/%d/phasevec/%s%s", (int) geteuid(), watch, suffix);
+		plen = snprintf(path, sizeof path, "/run/user/%d/phasevec/%s%s", (int) geteuid(), watch, suffix);
+	if (plen >= (int) sizeof path)
+		ereport(ERROR, (errmsg("phasevec: the socket path for watch \"%s\" is too long", watch)));
 
 	memset(&addr, 0, sizeof addr);
 	addr.sun_family = AF_UNIX;
-	strlcpy(addr.sun_path, path, sizeof addr.sun_path);
+	slen = strlcpy(addr.sun_path, path, sizeof addr.sun_path);
+	if (slen >= sizeof addr.sun_path)
+		ereport(ERROR, (errmsg("phasevec: the socket path for watch \"%s\" is too long", watch)));
 	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0)
 		ereport(ERROR, (errmsg("phasevec: socket(): %m")));

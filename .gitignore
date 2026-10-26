@@ -10,3 +10,4 @@ reader/probe-parity
 *.so
 *.bc
 reader/phasevec-reader.*
+*.zip

@@ -30,6 +30,7 @@ PG_FUNCTION_INFO_V1(phasevec_prove);
 
 static TimeoutId prove_timeout = MAX_TIMEOUTS;
 static volatile sig_atomic_t prove_fired = false;
+static bool prove_in_progress = false;
 
 static void
 prove_timeout_handler(void)
@@ -73,6 +74,8 @@ phasevec_prove(PG_FUNCTION_ARGS)
 	StringInfoData sql;
 	MemoryContext oldcontext = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
+	bool		nested = prove_in_progress;
+	int			my_timeout = nested ? 0 : timeout_ms;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "phasevec_prove: the result must be a row type");
@@ -84,6 +87,7 @@ phasevec_prove(PG_FUNCTION_ARGS)
 	appendStringInfo(&sql, "SELECT (%s)::boolean", proof);
 
 	prove_fired = false;
+	prove_in_progress = true;
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcontext);
 	PG_TRY();
@@ -109,11 +113,11 @@ phasevec_prove(PG_FUNCTION_ARGS)
 			bool		isnull;
 			Datum		d;
 
-			if (timeout_ms > 0)
-				enable_timeout_after(prove_timeout, timeout_ms);
+			if (my_timeout > 0)
+				enable_timeout_after(prove_timeout, my_timeout);
 			if (SPI_execute(sql.data, false, 1) != SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "the proof must return one row");
-			if (timeout_ms > 0)
+			if (my_timeout > 0)
 				disable_timeout(prove_timeout, false);
 			d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
 			ok = !isnull && DatumGetBool(d);
@@ -130,13 +134,14 @@ phasevec_prove(PG_FUNCTION_ARGS)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
 		CurrentResourceOwner = oldowner;
+		prove_in_progress = nested;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata;
 		bool		ours = prove_fired;
 
-		if (timeout_ms > 0)
+		if (my_timeout > 0)
 			disable_timeout(prove_timeout, false);
 		prove_fired = false;
 		MemoryContextSwitchTo(oldcontext);
@@ -158,6 +163,7 @@ phasevec_prove(PG_FUNCTION_ARGS)
 		else
 			err = pstrdup(edata->message);
 		FreeErrorData(edata);
+		prove_in_progress = nested;
 	}
 	PG_END_TRY();
 

@@ -1,0 +1,51 @@
+{
+   "name": "pg_phasevec",
+   "abstract": "Readings with provenance: what a sealed reader understood of each row, and whether it still holds",
+   "description": "pg_phasevec records, for each row, what a sealed in-process reader understood of it -- an embedding tagged with the reader and model that produced it -- and lets you ask later whether that reading still holds against the row as it is now. It builds an IVF index over the readings for approximate-nearest-neighbour search, dates and proves each answer against its own clock, and when one note supersedes another the replacement takes the old one's place. No external service and no network call: the reader is sealed and runs inside the backend.",
+   "version": "0.16.0",
+   "maintainer": [
+      "Manuel Reyes <manuelreyesbravo@gmail.com>"
+   ],
+   "license": "apache_2_0",
+   "provides": {
+      "pg_phasevec": {
+         "abstract": "Readings with provenance, verifiable against the row as it is now, with IVF search over them",
+         "file": "src/phasevec_ivf.c",
+         "version": "0.16.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "18.0.0"
+         }
+      }
+   },
+   "resources": {
+      "bugtracker": {
+         "web": "https://github.com/Manuelreyesbravo/pg_phasevec/issues"
+      },
+      "repository": {
+         "url": "https://github.com/Manuelreyesbravo/pg_phasevec.git",
+         "web": "https://github.com/Manuelreyesbravo/pg_phasevec",
+         "type": "git"
+      }
+   },
+   "generated_by": "Manuel Reyes",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "vector",
+      "embeddings",
+      "search",
+      "ivf",
+      "nearest neighbor",
+      "memory",
+      "provenance",
+      "verifiable",
+      "ai",
+      "llm"
+   ]
+}

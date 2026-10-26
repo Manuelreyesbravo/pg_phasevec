@@ -150,8 +150,8 @@ phasevec_ivf_build(PG_FUNCTION_ARGS)
 	Oid			it[12] = {INT4OID, INT4OID, INT4OID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID,
 		INT4OID, BYTEAOID, BYTEAOID};
 
-	if (k < 1 || dims < 256)
-		elog(ERROR, "phasevec ivf: k >= 1 and dims >= 256");
+	if (k < 1 || k > 1000000 || dims < 256 || dims > 65536 || iters < 1 || iters > 100000)
+		elog(ERROR, "phasevec ivf: need k in 1..1000000, dims in 256..65536, iters in 1..100000");
 	SPI_connect();
 	c256 = MemoryContextAllocHuge(CurrentMemoryContext, cap * CB);
 	c8 = MemoryContextAllocHuge(CurrentMemoryContext, cap * dims);
@@ -161,7 +161,7 @@ phasevec_ivf_build(PG_FUNCTION_ARGS)
 
 	portal = SPI_cursor_open_with_args(NULL,
 									   "SELECT key, text_hash, code256, code FROM phasevec.readings "
-									   "WHERE watch = $1 AND reader = $2 AND failed IS NULL AND code256 IS NOT NULL",
+									   "WHERE watch = $1 AND reader = $2 AND failed IS NULL AND code256 IS NOT NULL AND code IS NOT NULL",
 									   2, at, av, NULL, true, 0);
 	for (;;)
 	{
@@ -175,7 +175,8 @@ phasevec_ivf_build(PG_FUNCTION_ARGS)
 			bool		isnull;
 			text	   *key = DatumGetTextPP(SPI_getbinval(tup, td, 1, &isnull));
 			bytea	   *h = DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull));
-			Datum		cd = SPI_getbinval(tup, td, 4, &isnull);
+			bool		code_null;
+			Datum		cd = SPI_getbinval(tup, td, 4, &code_null);
 			size_t		kl = VARSIZE_ANY_EXHDR(key);
 
 			if (n == cap)
@@ -190,6 +191,8 @@ phasevec_ivf_build(PG_FUNCTION_ARGS)
 				elog(ERROR, "phasevec ivf: a text hash of %zu bytes", (size_t) VARSIZE_ANY_EXHDR(h));
 			memcpy(hash + n * HB, VARDATA_ANY(h), HB);
 			memcpy(c256 + n * CB, code256_bytes(SPI_getbinval(tup, td, 3, &isnull)), CB);
+			if (code_null)
+				elog(ERROR, "phasevec ivf: a reading with a NULL code slipped the filter");
 			{
 				ArrayType  *a = DatumGetArrayTypeP(cd);
 				const int16 *p;
@@ -397,6 +400,8 @@ phasevec_ivf_build(PG_FUNCTION_ARGS)
 	 */
 	if (!(PG_NARGS() > 7 && PG_GETARG_BOOL(7)))
 		SPI_execute_with_args("DELETE FROM phasevec.ivf_dirty WHERE watch = $1", 1, at, av, NULL, false, 0);
+	if ((uint64) k * dims > (MaxAllocSize - VARHDRSZ) / sizeof(float))
+		elog(ERROR, "phasevec ivf: the coarse index would exceed the 1 GB varlena limit");
 	{
 		Oid			ct[7] = {INT4OID, INT4OID, INT4OID, INT4OID, INT4OID, BOOLOID, BYTEAOID};
 		bytea	   *cb = MemoryContextAllocHuge(CurrentMemoryContext, VARHDRSZ + sizeof(float) * k * dims);
@@ -578,6 +583,8 @@ load_index(int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 	ix.k = k;
 	ix.dims = dims;
 	ix.n = n;
+	if (k < 1 || k > 1000000 || dims < 256 || dims > 65536)
+		elog(ERROR, "phasevec ivf: a stored coarse index with an implausible shape");
 	ix.cents = MemoryContextAllocHuge(ix.cx, sizeof(float) * k * dims);
 	memcpy(ix.cents, VARDATA_ANY(cb), sizeof(float) * k * dims);
 	ix.c8 = MemoryContextAllocHuge(ix.cx, (size_t) n * dims);
@@ -1319,6 +1326,8 @@ hold_index(int32 watch)
 	{
 		bytea	   *cb = DatumGetByteaPP(SPI_getbinval(tup, td, 4, &isnull));
 
+		if (ck < 1 || ck > 1000000 || cdims < 256 || cdims > 65536)
+			elog(ERROR, "phasevec ivf: a stored coarse index with an implausible shape");
 		if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * ck * cdims)
 			elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, ck, cdims);
 		load_index(watch, ver, ck, cdims, cn, cb);
@@ -1341,6 +1350,9 @@ sweep_top(const Question *Q, int nprobe, int m, int *ncp)
 
 	if (Q->nq != dims)
 		elog(ERROR, "phasevec ivf: the question has %d dimensions, the index %d", Q->nq, dims);
+	if (m > 100000)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("phasevec ivf: m must be at most 100000 (got %d)", m)));
 	if (m < 1 || nprobe < 1)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("phasevec ivf: m and nprobe must be at least 1 (got %d and %d)", m, nprobe)));
@@ -1414,6 +1426,9 @@ phasevec_ivf_sweep(PG_FUNCTION_ARGS)
 	int32		kk = PG_GETARG_INT32(5);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
+	if (m < 1 || m > 100000 || kk < 1 || kk > 100000)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("phasevec ivf: m and kk must be in 1..100000 (got %d and %d)", m, kk)));
 	InitMaterializedSRF(fcinfo, 0);
 	SPI_connect();
 	hold_index(watch);
@@ -1659,7 +1674,7 @@ delta_read(int32 watch, int32 reader, int nq, size_t *np, MemoryContext cxt)
 	{
 		SPIPlanPtr	p = SPI_prepare("SELECT r.key, r.text_hash, r.code256, r.code FROM phasevec.ivf_dirty d "
 									"JOIN phasevec.readings r ON r.watch = d.watch AND r.key = d.key AND r.reader = $2 "
-									"AND r.failed IS NULL AND r.code256 IS NOT NULL WHERE d.watch = $1", 2, at);
+									"AND r.failed IS NULL AND r.code256 IS NOT NULL AND r.code IS NOT NULL WHERE d.watch = $1", 2, at);
 
 		if (p == NULL)
 			elog(ERROR, "phasevec ivf: cannot prepare the delta's query");
@@ -1681,11 +1696,15 @@ delta_read(int32 watch, int32 reader, int nq, size_t *np, MemoryContext cxt)
 			text	   *key = DatumGetTextPP(SPI_getbinval(tup, td, 1, &isnull));
 			bytea	   *h = DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull));
 			const uint8 *c256 = code256_bytes(SPI_getbinval(tup, td, 3, &isnull));
-			ArrayType  *ca = DatumGetArrayTypeP(SPI_getbinval(tup, td, 4, &isnull));
+			Datum		cd = SPI_getbinval(tup, td, 4, &isnull);
+			ArrayType  *ca;
 			const int16 *c;
 			int64		nn = 0;
 			DRow	   *x;
 
+			if (isnull)
+				elog(ERROR, "phasevec ivf: a reading with a NULL code slipped the filter");
+			ca = DatumGetArrayTypeP(cd);
 			if (ARR_NDIM(ca) != 1 || ARR_HASNULL(ca) || ARR_DIMS(ca)[0] != nq || VARSIZE_ANY_EXHDR(h) != HB)
 				elog(ERROR, "phasevec ivf: a reading of the delta is not a %d-dimension code with its hash", nq);
 			c = (const int16 *) ARR_DATA_PTR(ca);
@@ -1818,8 +1837,8 @@ phasevec_ivf_delta(PG_FUNCTION_ARGS)
 	DeltaHit   *hits;
 	size_t		nh;
 
-	if (kk < 1)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("phasevec ivf: kk must be at least 1")));
+	if (kk < 1 || kk > 100000)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("phasevec ivf: kk must be in 1..100000")));
 	InitMaterializedSRF(fcinfo, 0);
 	SPI_connect();
 	hits = delta_top(watch, reader, Q, &nh);
@@ -2002,7 +2021,7 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 	portal = SPI_cursor_open_with_args(NULL,
 									   "SELECT r.key, r.text_hash, r.code256, r.code FROM phasevec.ivf_dirty d "
 									   "JOIN phasevec.readings r ON r.watch = d.watch AND r.key = d.key AND r.reader = $2 "
-									   "AND r.failed IS NULL AND r.code256 IS NOT NULL "
+									   "AND r.failed IS NULL AND r.code256 IS NOT NULL AND r.code IS NOT NULL "
 									   "WHERE d.watch = $1 AND pg_catalog.pg_visible_in_snapshot(d.txid, $3::pg_snapshot) "
 									   "ORDER BY d.key",
 									   3, at, av, NULL, true, 0);
@@ -2018,11 +2037,15 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 			bool		isnull;
 			text	   *key = DatumGetTextPP(SPI_getbinval(tup, td, 1, &isnull));
 			bytea	   *h = DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull));
-			ArrayType  *ca = DatumGetArrayTypeP(SPI_getbinval(tup, td, 4, &isnull));
+			Datum		cd = SPI_getbinval(tup, td, 4, &isnull);
+			ArrayType  *ca;
 			const int16 *p;
 			Absorbed   *e;
 			int			best = 0;
 
+			if (isnull)
+				elog(ERROR, "phasevec ivf: a reading with a NULL code slipped the filter");
+			ca = DatumGetArrayTypeP(cd);
 			if (ARR_NDIM(ca) != 1 || ARR_HASNULL(ca) || ARR_DIMS(ca)[0] != dims || VARSIZE_ANY_EXHDR(h) != HB)
 				elog(ERROR, "phasevec ivf: a reading of the delta is not a %d-dimension code with its hash", dims);
 			if (na == cap)
@@ -2406,8 +2429,11 @@ find_valid(int32 watch, int32 reader, const Question *Q, int nprobe, int m, int 
 			TupleDesc	td = SPI_tuptable->tupdesc;
 			bool		isnull;
 			int			i = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull)) - 1;
-			Found	   *x = &f[i];
+			Found	   *x;
 
+			if (i < 0 || i >= nf)
+				elog(ERROR, "phasevec ivf: a validation ordinal out of range");
+			x = &f[i];
 			x->valid = true;
 			x->fam = SPI_getbinval(tup, td, 2, &x->fam_null);
 			x->read_at = SPI_getbinval(tup, td, 3, &x->read_at_null);
@@ -2468,8 +2494,8 @@ phasevec_ivf_find(PG_FUNCTION_ARGS)
 		if (PG_ARGISNULL(a))
 			elog(ERROR, "phasevec ivf: _ivf_find takes no NULL but its doubt threshold");
 	Q = question_of(PG_GETARG_VARBIT_P(2), PG_GETARG_ARRAYTYPE_P(3));
-	if (PG_GETARG_INT32(6) < 1 || PG_GETARG_INT32(7) < 1)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("phasevec ivf: kk and k must be at least 1")));
+	if (PG_GETARG_INT32(5) < 1 || PG_GETARG_INT32(5) > 100000 || PG_GETARG_INT32(6) < 1 || PG_GETARG_INT32(6) > 100000 || PG_GETARG_INT32(7) < 1 || PG_GETARG_INT32(7) > 1000)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("phasevec ivf: m and kk must be in 1..100000 and k in 1..1000")));
 	InitMaterializedSRF(fcinfo, 0);
 	SPI_connect();
 	n = find_valid(PG_GETARG_INT32(0), PG_GETARG_INT32(1), Q, PG_GETARG_INT32(4), PG_GETARG_INT32(5),
