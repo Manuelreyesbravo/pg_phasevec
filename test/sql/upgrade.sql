@@ -37,3 +37,16 @@ SELECT count(*) AS mismatches FROM phasevec.coverage_check('up');
 
 DROP TABLE up;
 DROP EXTENSION pg_phasevec;
+
+-- 0.16.0 -> 0.17.0: the recall guard arrives empty, owner-only, every function with its search_path pinned
+CREATE EXTENSION pg_phasevec VERSION '0.16.0';
+ALTER EXTENSION pg_phasevec UPDATE TO '0.17.0';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
+SELECT count(*) AS baselines FROM phasevec.recall_baseline;
+SELECT count(*) AS checked FROM phasevec.recall_check();
+SELECT p.proname, p.prosecdef, p.proconfig, has_function_privilege('public', p.oid, 'EXECUTE') AS public_exec
+  FROM pg_proc p
+ WHERE p.pronamespace = 'phasevec'::regnamespace AND p.proname IN ('recall_approve', 'recall_check', '_recall_measure')
+ ORDER BY p.proname;
+SELECT has_table_privilege('public', 'phasevec.recall_baseline', 'SELECT') AS public_reads_baselines;
+DROP EXTENSION pg_phasevec;

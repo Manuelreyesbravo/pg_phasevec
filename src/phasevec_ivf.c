@@ -515,6 +515,7 @@ typedef struct BIndex
 {
 	MemoryContext cx;
 	int32		watch;
+	Oid			rel;			/* the installation it belongs to: see cents_rel() (0.17.0) */
 	uint64		ver;			/* the copy's version: phasevec.ivf_cents.gen (0.10.0) or its xmin */
 	int			k, dims, n;
 	float	   *cents;			/* k x dims */
@@ -554,8 +555,25 @@ have_added(void)
 	return SPI_processed == 1 && DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &(bool){false}));
 }
 
+/*
+ * Which installation of the extension a kept copy belongs to: the OID of phasevec.ivf_cents (0.17.0).
+ * DROP EXTENSION and CREATE EXTENSION in one database start the watch ids and phasevec.ivf_gen over, and
+ * a server that had not restarted still held the old installation's copy under the same (database,
+ * watch, gen): find_ivf swept the OLD lists, their candidates failed validation against
+ * phasevec.sources, and neighbours went missing without a word (found by the recall guard's own test:
+ * 0.525 against 1.0). A relation's OID is not reused while the relation exists, so an old copy can no
+ * longer match.
+ */
+static Oid
+cents_rel(void)
+{
+	Oid			ns = get_namespace_oid("phasevec", true);
+
+	return OidIsValid(ns) ? get_relname_relid("ivf_cents", ns) : InvalidOid;
+}
+
 static void
-load_index(int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
+load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 {
 	Oid			at[1] = {INT4OID};
 	Datum		av[1] = {Int32GetDatum(watch)};
@@ -579,6 +597,7 @@ load_index(int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 	{
 	old = MemoryContextSwitchTo(ix.cx);
 	ix.watch = watch;
+	ix.rel = rel;
 	ix.ver = ver;
 	ix.k = k;
 	ix.dims = dims;
@@ -849,6 +868,7 @@ typedef struct Slot
 {
 	bool		used, dead;
 	Oid			db;
+	Oid			rel;			/* the installation: see cents_rel() (0.17.0) */
 	int32		watch;
 	uint64		ver;			/* the copy's version: phasevec.ivf_cents.gen (0.10.0) or its xmin */
 	dsa_pointer blob;
@@ -903,8 +923,16 @@ attach_shared(void)
 	if (g_ctl && g_area)
 		return true;
 	/* both or neither: an error between them must not leave a control block without its area */
-	ctl = GetNamedDSMSegment("phasevec_ivf_cache", sizeof(Ctl), ctl_init, &found, NULL);
-	area = GetNamedDSA("phasevec_ivf_cache_dsa", &found);
+	/*
+	 * One name per FORMAT of the shared copy, not per extension: the segment outlives a library upgrade
+	 * until the server restarts. 0.17.0 added Slot.rel; asked under the old name, a server that had
+	 * loaded 0.16.0 would hand back the old segment, and either refuse it (another size: every new
+	 * connection's find_ivf fails) or, as here where rel fills padding and the size is unchanged, let both
+	 * formats share it without a word. Change the suffix whenever Ctl, Slot or Blob change. The old
+	 * segment is only released by a restart.
+	 */
+	ctl = GetNamedDSMSegment("phasevec_ivf_cache_v2", sizeof(Ctl), ctl_init, &found, NULL);
+	area = GetNamedDSA("phasevec_ivf_cache_dsa_v2", &found);
 	before_shmem_exit(release_at_exit, (Datum) 0);
 	g_area = area;
 	g_ctl = ctl;
@@ -939,12 +967,13 @@ release_index(void)
 	LWLockRelease(&g_ctl->lock);
 	g_ix.shared = false;
 	g_ix.watch = 0;
+	g_ix.rel = InvalidOid;
 	g_ix.ver = 0;
 }
 
-/* The shared copy of (this database, watch, version), if there is one: g_ix points into it, held. */
+/* The shared copy of (this database, installation, watch, version), if there is one: g_ix points into it, held. */
 static bool
-use_shared(int32 watch, uint64 ver)
+use_shared(Oid rel, int32 watch, uint64 ver)
 {
 	int			found = -1;
 	char	   *b;
@@ -955,7 +984,7 @@ use_shared(int32 watch, uint64 ver)
 	{
 		Slot	   *sl = &g_ctl->slot[i];
 
-		if (sl->used && !sl->dead && sl->db == MyDatabaseId && sl->watch == watch && sl->ver == ver)
+		if (sl->used && !sl->dead && sl->db == MyDatabaseId && sl->rel == rel && sl->watch == watch && sl->ver == ver)
 		{
 			sl->refs++;
 			sl->tick = ++g_ctl->tick;
@@ -972,6 +1001,7 @@ use_shared(int32 watch, uint64 ver)
 	h = (Blob *) b;
 	g_ix.cx = NULL;
 	g_ix.watch = watch;
+	g_ix.rel = rel;
 	g_ix.ver = ver;
 	g_ix.k = h->k;
 	g_ix.dims = h->dims;
@@ -1041,7 +1071,7 @@ publish_index(void)
 		{
 			Slot	   *sl = &g_ctl->slot[i];
 
-			if (!sl->used || sl->dead || sl->db != MyDatabaseId || sl->watch != g_ix.watch)
+			if (!sl->used || sl->dead || sl->db != MyDatabaseId || sl->rel != g_ix.rel || sl->watch != g_ix.watch)
 				continue;
 			if (sl->ver == g_ix.ver)
 			{
@@ -1106,6 +1136,7 @@ publish_index(void)
 	g_ctl->slot[slot].used = true;
 	g_ctl->slot[slot].dead = false;
 	g_ctl->slot[slot].db = MyDatabaseId;
+	g_ctl->slot[slot].rel = g_ix.rel;
 	g_ctl->slot[slot].watch = g_ix.watch;
 	g_ctl->slot[slot].ver = g_ix.ver;
 	g_ctl->slot[slot].blob = dp;
@@ -1122,16 +1153,16 @@ publish_index(void)
  * already holds it; false if the caller must load it (load_index) and then call it again.
  */
 static bool
-acquire_index(int32 watch, uint64 ver, bool just_loaded)
+acquire_index(Oid rel, int32 watch, uint64 ver, bool just_loaded)
 {
 	if (phasevec_shared_ivf_cache && attach_shared())
 	{
 		if (just_loaded)
 			publish_index();
-		if (use_shared(watch, ver))
+		if (use_shared(rel, watch, ver))
 			return true;
 	}
-	return g_ix.cx != NULL && g_ix.watch == watch && g_ix.ver == ver;
+	return g_ix.cx != NULL && g_ix.rel == rel && g_ix.watch == watch && g_ix.ver == ver;
 }
 
 typedef struct Cand
@@ -1296,6 +1327,7 @@ hold_index(int32 watch)
 	static SPIPlanPtr plans[2] = {NULL, NULL};
 	bool		gen = have_gen();
 	SPIPlanPtr	plan = plans[gen];
+	Oid			rel = cents_rel();
 
 	if (plan == NULL)
 	{
@@ -1322,7 +1354,7 @@ hold_index(int32 watch)
 	cdims = DatumGetInt32(SPI_getbinval(tup, td, 2, &isnull));
 	cn = DatumGetInt32(SPI_getbinval(tup, td, 3, &isnull));
 	ver = (uint64) DatumGetInt64(SPI_getbinval(tup, td, 5, &isnull)) | (gen ? GEN_BIT : 0);
-	if (!acquire_index(watch, ver, false))
+	if (!acquire_index(rel, watch, ver, false))
 	{
 		bytea	   *cb = DatumGetByteaPP(SPI_getbinval(tup, td, 4, &isnull));
 
@@ -1330,8 +1362,8 @@ hold_index(int32 watch)
 			elog(ERROR, "phasevec ivf: a stored coarse index with an implausible shape");
 		if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * ck * cdims)
 			elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, ck, cdims);
-		load_index(watch, ver, ck, cdims, cn, cb);
-		if (!acquire_index(watch, ver, true))
+		load_index(rel, watch, ver, ck, cdims, cn, cb);
+		if (!acquire_index(rel, watch, ver, true))
 			elog(ERROR, "phasevec ivf: the index of watch %d was loaded and is not there", watch);
 	}
 }
@@ -1542,6 +1574,7 @@ static bool g_xact_cb = false;
 static struct
 {
 	bool		valid;
+	Oid			rel;			/* the installation: see cents_rel() (0.17.0) */
 	int32		watch;
 	int32		reader;
 	int			nq;
@@ -1741,6 +1774,7 @@ delta_rows(int32 watch, int32 reader, int nq, size_t *np)
 	uint64		gen;
 	DRow	   *rows;
 	size_t		n;
+	Oid			rel;
 
 	if (!phasevec_delta_cache || g_touched || RecoveryInProgress() || IsInParallelMode() ||
 		IsolationUsesXactSnapshot() || !ActiveSnapshotSet() || !touch_armed())
@@ -1751,7 +1785,8 @@ delta_rows(int32 watch, int32 reader, int nq, size_t *np)
 	pg_read_barrier();
 	gen = pg_atomic_read_u64(&g->gen);
 	cur = GetActiveSnapshot();
-	if (g_dc.valid && g_dc.watch == watch && g_dc.reader == reader && g_dc.nq == nq && g_dc.gen == gen)
+	rel = cents_rel();
+	if (g_dc.valid && g_dc.rel == rel && g_dc.watch == watch && g_dc.reader == reader && g_dc.nq == nq && g_dc.gen == gen)
 	{
 		if (cur->snapXactCompletionCount < g_dc.completed)
 			return delta_read(watch, reader, nq, np, CurrentMemoryContext);
@@ -1779,6 +1814,7 @@ delta_rows(int32 watch, int32 reader, int nq, size_t *np)
 	UnregisterSnapshot(s);
 	if (n <= DC_MAX_ROWS)
 	{
+		g_dc.rel = rel;
 		g_dc.watch = watch;
 		g_dc.reader = reader;
 		g_dc.nq = nq;
@@ -2256,6 +2292,7 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 			if (SPI_processed == 1)
 			{
 				nx.watch = watch;
+				nx.rel = cents_rel();
 				nx.ver = (uint64) DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)) | (gen ? GEN_BIT : 0);
 				nx.cx = NULL;
 				nx.shared = false;
