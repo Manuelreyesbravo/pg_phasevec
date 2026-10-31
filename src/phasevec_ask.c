@@ -29,6 +29,20 @@ extern bool phasevec_shared_ivf_cache;	/* phasevec_ivf.c */
 extern int	phasevec_shared_ivf_cache_mb;	/* phasevec_ivf.c */
 extern bool phasevec_delta_cache;	/* phasevec_ivf.c */
 
+/* The copy shared by every backend needs PostgreSQL 19 (GetNamedDSA): on 18 it stays off (0.17.0). */
+static bool
+check_shared_ivf_cache(bool *newval, void **extra, GucSource source)
+{
+#if PG_VERSION_NUM < 190000
+	if (*newval)
+	{
+		GUC_check_errdetail("The copy of the coarse index shared by every backend needs PostgreSQL 19 or later; here each connection keeps its own.");
+		return false;
+	}
+#endif
+	return true;
+}
+
 static char *socket_dir = NULL;
 static int	ask_timeout_ms = 10000;
 
@@ -42,7 +56,8 @@ _PG_init(void)
 	DefineCustomBoolVariable("phasevec.shared_ivf_cache",
 							 "Sweep the coarse index from the copy shared by every backend (0.10.0)",
 							 "Off: each connection loads and keeps its own copy, as before 0.10.0.",
-							 &phasevec_shared_ivf_cache, true, PGC_USERSET, 0, NULL, NULL, NULL);
+							 &phasevec_shared_ivf_cache, PG_VERSION_NUM >= 190000, PGC_USERSET, 0,
+							 check_shared_ivf_cache, NULL, NULL);
 	DefineCustomBoolVariable("phasevec.delta_cache",
 							 "Keep the coarse index's delta between questions (0.11.0)",
 							 "Off: every question reads the delta again, as before 0.11.0. The kept copy is used only while no write to readings or ivf_dirty has committed since it was read.",

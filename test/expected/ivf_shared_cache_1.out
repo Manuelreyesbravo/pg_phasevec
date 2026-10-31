@@ -1,0 +1,105 @@
+-- 0.17.0: the copy of the coarse index shared by every backend needs PostgreSQL 19 (GetNamedDSA). On 18
+-- it is off and cannot be turned on: each connection keeps its own copy, and find_ivf answers the same.
+-- Two expected files: ivf_shared_cache.out (19 and later) and ivf_shared_cache_1.out (18).
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec;
+SELECT current_setting('server_version_num')::int >= 190000 AS pg19;
+ pg19 
+------
+ f
+(1 row)
+
+SHOW phasevec.shared_ivf_cache;
+ phasevec.shared_ivf_cache 
+---------------------------
+ off
+(1 row)
+
+SET phasevec.shared_ivf_cache = on;
+ERROR:  invalid value for parameter "phasevec.shared_ivf_cache": 1
+SHOW phasevec.shared_ivf_cache;
+ phasevec.shared_ivf_cache 
+---------------------------
+ off
+(1 row)
+
+SELECT phasevec.reader_register('r256', repeat('a', 64), 256) > 0 AS r256;
+ r256 
+------
+ t
+(1 row)
+
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs SELECT g, 'doc ' || g FROM generate_series(1, 400) g;
+SELECT phasevec.watch('docs', 'docs'::regclass, 'id', 'r.body', 'r256') > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+CREATE FUNCTION code_of(g int) RETURNS smallint[] LANGUAGE sql IMMUTABLE AS $$
+    SELECT array(SELECT greatest(-127, least(127, (hashint8((g % 10) * 1000 + j) % 100)
+                                                + (hashint8(1000000 + g::int8 * 1000 + j) % 60)))::smallint
+                   FROM generate_series(1, 256) j) $$;
+CREATE FUNCTION signs_of(c smallint[]) RETURNS bit(256) LANGUAGE sql IMMUTABLE AS $$
+    SELECT string_agg(CASE WHEN x > 0 THEN '1' ELSE '0' END, '' ORDER BY o)::bit(256)
+      FROM unnest(c) WITH ORDINALITY u(x, o) $$;
+SELECT count(phasevec.record('docs', s.key, 'r256', s.text_hash, 0::bigint, code_of(s.key::int), NULL,
+                             signs_of(code_of(s.key::int)))) AS recorded
+  FROM phasevec.sources s;
+ recorded 
+----------
+      400
+(1 row)
+
+SELECT phasevec.ivf_build('docs') AS lists;
+ lists 
+-------
+    20
+(1 row)
+
+-- whatever the version, every list probed with m = every row is exactly find's answer, twice (the second
+-- question sweeps the copy the first one kept), and a few lists answer k rows
+SELECT (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find('docs', 0, code_of(5), 10, false, 400, signs_of(code_of(5))))
+     = (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find_ivf('docs', 0, code_of(5), 10, false, 400, signs_of(code_of(5)), 1000))
+       AS same_as_find;
+ same_as_find 
+--------------
+ t
+(1 row)
+
+SELECT (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find('docs', 0, code_of(6), 10, false, 400, signs_of(code_of(6))))
+     = (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find_ivf('docs', 0, code_of(6), 10, false, 400, signs_of(code_of(6)), 1000))
+       AS same_as_find_again;
+ same_as_find_again 
+--------------------
+ t
+(1 row)
+
+SELECT count(*) AS answered FROM phasevec.find_ivf('docs', 0, code_of(5), 10, false, 200, signs_of(code_of(5)), 4);
+ answered 
+----------
+       10
+(1 row)
+
+-- and the same with the shared copy off, which every version allows
+SET phasevec.shared_ivf_cache = off;
+SELECT (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find('docs', 0, code_of(5), 10, false, 400, signs_of(code_of(5))))
+     = (SELECT array_agg(key ORDER BY score DESC, key) FROM phasevec.find_ivf('docs', 0, code_of(5), 10, false, 400, signs_of(code_of(5)), 1000))
+       AS same_as_find_private;
+ same_as_find_private 
+----------------------
+ t
+(1 row)
+
+RESET phasevec.shared_ivf_cache;
+SHOW phasevec.shared_ivf_cache;
+ phasevec.shared_ivf_cache 
+---------------------------
+ off
+(1 row)
+
+DROP TABLE docs;
+DROP FUNCTION code_of(int);
+DROP FUNCTION signs_of(smallint[]);
+DROP EXTENSION pg_phasevec;

@@ -855,9 +855,16 @@ load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
  * while it sweeps, and a replaced copy is freed when its last reader lets go. Without room (no DSA
  * memory, every slot in use) the backend keeps its private copy, as before 0.10.0.
  * phasevec.shared_ivf_cache = off turns it off for the session.
+ *
+ * PostgreSQL 18 has the DSM registry but not GetNamedDSA (19), and its GetNamedDSMSegment and
+ * LWLockNewTrancheId take other arguments. There the shared copy is not built (0.17.0): every backend
+ * keeps its own, the path that already exists when the shared area has no room, and
+ * phasevec.shared_ivf_cache is off and cannot be turned on. From 0.10.0 to 0.17.0 the library did not
+ * compile on 18 at all, though META.json promised it.
  */
+#define PHASEVEC_SHARED_IVF (PG_VERSION_NUM >= 190000)
 extern bool phasevec_shared_ivf_cache;
-bool		phasevec_shared_ivf_cache = true;
+bool		phasevec_shared_ivf_cache = PHASEVEC_SHARED_IVF;
 
 #define SLOTS 32
 #define PER_WATCH 2				/* versions of one watch kept at once: old and new snapshots both served */
@@ -895,6 +902,9 @@ typedef struct Blob
 static Ctl *g_ctl = NULL;
 static dsa_area *g_area = NULL;
 
+static void release_index(void);
+
+#if PHASEVEC_SHARED_IVF
 static void
 ctl_init(void *ptr, void *arg)
 {
@@ -904,17 +914,20 @@ ctl_init(void *ptr, void *arg)
 	LWLockInitialize(&ctl->lock, LWLockNewTrancheId("phasevec_ivf_cache"));
 }
 
-static void release_index(void);
-
 static void
 release_at_exit(int code, Datum arg)
 {
 	release_index();
 }
+#endif
 
+/* False on PostgreSQL 18: no shared copy there, each backend keeps its own (see PHASEVEC_SHARED_IVF). */
 static bool
 attach_shared(void)
 {
+#if !PHASEVEC_SHARED_IVF
+	return false;
+#else
 	bool		found;
 
 	Ctl		   *ctl;
@@ -937,6 +950,7 @@ attach_shared(void)
 	g_area = area;
 	g_ctl = ctl;
 	return true;
+#endif
 }
 
 static void
@@ -1629,6 +1643,15 @@ dc_xact(XactEvent event, void *arg)
 	}
 }
 
+#if PG_VERSION_NUM < 190000
+/* PostgreSQL 18's GetNamedDSMSegment calls its initializer without an argument */
+static void
+dgen_init18(void *ptr)
+{
+	dgen_init(ptr, NULL);
+}
+#endif
+
 static DGen *
 dgen(void)
 {
@@ -1636,7 +1659,11 @@ dgen(void)
 	{
 		bool		found;
 
+#if PG_VERSION_NUM >= 190000
 		g_dgen = GetNamedDSMSegment("phasevec_delta_gen", sizeof(DGen), dgen_init, &found, NULL);
+#else
+		g_dgen = GetNamedDSMSegment("phasevec_delta_gen", sizeof(DGen), dgen_init18, &found);
+#endif
 	}
 	if (!g_xact_cb)
 	{

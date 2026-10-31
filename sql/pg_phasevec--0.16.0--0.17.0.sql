@@ -61,6 +61,9 @@
 -- Every copy now also carries the installation it belongs to, the OID of phasevec.ivf_cents.
 -- The shared copy changed format, so it lives under a new name (phasevec_ivf_cache_v2): a server that loaded
 -- 0.16.0 keeps the old segment, unused, until it restarts. Restart after installing this library.
+-- And the library builds on PostgreSQL 18 again (it had not since 0.10.0, though META.json promised 18):
+-- 18 has no GetNamedDSA, so there each backend keeps its own copy of the coarse index and
+-- phasevec.shared_ivf_cache stays off (test/sql/ivf_shared_cache.sql, one expected file per version).
 \echo Use "ALTER EXTENSION pg_phasevec UPDATE TO '0.17.0'" to load this file. \quit
 
 CREATE TABLE phasevec.recall_baseline (
