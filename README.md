@@ -79,6 +79,7 @@ Edit a watched row and its reading turns `stale` in the same transaction; `find(
 | **Lexical** | `lexical`, `lexical_maintain`, `lexical_refresh` |
 | **Audit** | `coverage`, `coverage_check`, `truncations`, `dupes`, `audit_sample`, `counts_compact` |
 | **Recall** | `recall_approve`, `recall_check` (is a watch still served the neighbours it was approved with?) |
+| **Brief** | `brief` (what a watch still holds as true, best first, inside a character budget; text read with the caller's rights) |
 
 Full signatures: `\df phasevec.*`.
 
