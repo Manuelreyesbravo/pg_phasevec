@@ -9,7 +9,8 @@
 -- Only what is still served: replaced, expired and refuted keys never come out. The budget counts the characters
 -- of the lines; a line that does not fit is skipped and a shorter one after it may still fit.
 
--- Keys and truth only (like search(): no text), with the owner's rights: the watch tables are not public.
+-- Keys and truth only (like search(): no text), with the owner's rights: the watch tables are not public. Who may
+-- call it is decided as for find/search: whoever the owner gives USAGE on schema phasevec (PUBLIC does not have it).
 CREATE FUNCTION phasevec._brief_keys(p_watch text)
 RETURNS TABLE (key text, verdict text, net_use bigint, seen timestamptz, src regclass, key_col name, recipe text)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
@@ -30,7 +31,9 @@ REVOKE ALL ON FUNCTION phasevec._brief_keys(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION phasevec._brief_keys(text) TO PUBLIC;
 
 -- The text comes from the watched table with the CALLER's rights: a brief never shows a row its caller could not
--- read. The line is the watch's own recipe over the row.
+-- read. The line is the watch's own recipe over the row. No pinned search_path, on purpose: the recipe is the
+-- table owner's SQL and is evaluated as watch() and the watch trigger evaluate it, with the caller's path; pinning
+-- it would break a recipe that calls an unqualified function, and as an invoker function it grants nothing.
 CREATE FUNCTION phasevec.brief(p_watch text, p_budget int DEFAULT 8000)
 RETURNS TABLE (key text, verdict text, net_use bigint, line text)
 LANGUAGE plpgsql STABLE AS $f$
@@ -42,6 +45,7 @@ BEGIN
         RAISE EXCEPTION $q$phasevec: a brief needs a positive budget$q$;
     END IF;
     FOR r IN SELECT * FROM phasevec._brief_keys(p_watch) LOOP
+        EXIT WHEN used >= p_budget;   -- full: reading the rest of a large watch would serve nothing
         EXECUTE pg_catalog.format($q$SELECT (%s)::text FROM %s r WHERE r.%I::text = $1$q$, r.recipe, r.src, r.key_col)
            INTO line USING r.key;
         CONTINUE WHEN line IS NULL OR used + pg_catalog.length(line) > p_budget;
