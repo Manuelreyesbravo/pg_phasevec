@@ -10,6 +10,10 @@ for f in pg_phasevec.control sql/*.sql; do ln -sfn "$PWD/$f" ".testcluster/ext/e
 make -s PG_CONFIG="$PG/pg_config" >/dev/null
 mkdir -p .testcluster/ext/lib && ln -sfn "$PWD/pg_phasevec.so" .testcluster/ext/lib/pg_phasevec.so
 grep -q "^dynamic_library_path" .testcluster/postgresql.conf || echo "dynamic_library_path = '$PWD/.testcluster/ext/lib:\$libdir'" >> .testcluster/postgresql.conf
+# Without this a fresh .testcluster reads the control file and scripts INSTALLED in the PostgreSQL
+# tree, not the ones of this checkout, and every test passes against the previous version (seen on
+# 2026-11-05: 23 "ok" that never loaded the new upgrade script).
+grep -q "^extension_control_path" .testcluster/postgresql.conf || echo "extension_control_path = '$PWD/.testcluster/ext:\$system'" >> .testcluster/postgresql.conf
 "$PG/pg_ctl" -D .testcluster -o "-p 5491 -k /tmp" -l .testcluster/server.log -w start >/dev/null
 PGHOST=/tmp PGPORT=5491 make installcheck PG_CONFIG="$PG/pg_config" 2>&1 | grep -E '^(ok|not ok|#)'
 rc=${PIPESTATUS[0]}

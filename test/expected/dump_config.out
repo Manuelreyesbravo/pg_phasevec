@@ -1,0 +1,51 @@
+-- 0.19.0: every table and sequence of the extension is a config table, so pg_dump keeps its rows
+-- (until 0.18.0 a dump of a database with watches lost the watches, the readings and the truth).
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec VERSION $v$0.18.0$v$;
+SELECT coalesce(array_length(extconfig, 1), 0) AS marked FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
+ marked 
+--------
+      0
+(1 row)
+
+ALTER EXTENSION pg_phasevec UPDATE TO $v$0.19.0$v$;
+SELECT extversion, array_length(extconfig, 1) AS marked FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
+ extversion | marked 
+------------+--------
+ 0.19.0     |     19
+(1 row)
+
+-- left out: exactly the five tables the extension's own triggers rebuild during a restore
+SELECT c.oid::regclass AS left_out
+  FROM pg_depend d JOIN pg_class c ON c.oid = d.objid JOIN pg_extension e ON e.oid = d.refobjid
+ WHERE e.extname = $e$pg_phasevec$e$ AND d.deptype = $d$e$d$ AND d.classid = $p$pg_class$p$::regclass
+   AND c.relkind IN ($r$r$r$, $s$S$s$) AND c.oid <> ALL (coalesce(e.extconfig, $z${}$z$::oid[]))
+ ORDER BY 1;
+       left_out        
+-----------------------
+ phasevec.kstate
+ phasevec.counts
+ phasevec.count_deltas
+ phasevec.ivf_dirty
+ phasevec.npu_dirty
+(5 rows)
+
+-- and nothing is filtered: a restore brings every row back
+SELECT count(*) AS with_filter
+  FROM pg_extension e, unnest(e.extcondition) AS w
+ WHERE e.extname = $e$pg_phasevec$e$ AND w <> $x$$x$;
+ with_filter 
+-------------
+           0
+(1 row)
+
+-- a fresh install lands on the same marks
+DROP EXTENSION pg_phasevec;
+CREATE EXTENSION pg_phasevec;
+SELECT extversion, array_length(extconfig, 1) AS marked FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
+ extversion | marked 
+------------+--------
+ 0.19.0     |     19
+(1 row)
+
+DROP EXTENSION pg_phasevec;
