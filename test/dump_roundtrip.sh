@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # 0.19.0: pg_dump + pg_restore bring the extension's data back (rows, sequences, verdicts), and
-# the restored database keeps working. Against the throwaway cluster of installcheck.sh (:5491).
+# the restored database keeps working. Against the throwaway cluster of installcheck.sh (run that
+# first: it creates the cluster and links the extension), with the same PV_DATA/PV_PORT/PV_SOCK.
 #   PG=~/pg19/bin test/dump_roundtrip.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
-P=(-h /tmp -p 5491 -X -q -v ON_ERROR_STOP=1)
-D=$(mktemp -d)
-"$PG/pg_ctl" -D .testcluster -o "-p 5491 -k /tmp" -l .testcluster/server.log -w start >/dev/null
-trap '"$PG/pg_ctl" -D .testcluster -w stop >/dev/null; rm -rf "$D"' EXIT
-for db in rt_src rt_dst; do "$PG/dropdb" -h /tmp -p 5491 --if-exists "$db"; "$PG/createdb" -h /tmp -p 5491 "$db"; done
+DATA=${PV_DATA:-$PWD/.testcluster}
+PORT=${PV_PORT:-5491}
+SOCK=${PV_SOCK:-/tmp}
+P=(-h "$SOCK" -p "$PORT" -X -q -v ON_ERROR_STOP=1)
+D=$(mktemp -d "${TMPDIR:-/tmp}/pv-rt.XXXXXX")
+"$PG/pg_ctl" -D "$DATA" -o "-p $PORT -k $SOCK" -l "$DATA/server.log" -w start >/dev/null
+trap '"$PG/pg_ctl" -D "$DATA" -w stop >/dev/null; rm -rf "$D"' EXIT
+for db in rt_src rt_dst; do "$PG/dropdb" -h "$SOCK" -p "$PORT" --if-exists "$db"; "$PG/createdb" -h "$SOCK" -p "$PORT" "$db"; done
 
 "$PG/psql" "${P[@]}" -d rt_src <<'SQL' >/dev/null
 CREATE EXTENSION pg_phasevec;
@@ -52,8 +56,8 @@ FIND="select array_agg(key order by score desc, key)::text from phasevec.find('d
 SEQ="select string_agg(last_value::text, ',') from (select last_value from phasevec.readers_id_seq union all select last_value from phasevec.watches_id_seq) s"
 
 a=$("$PG/psql" "${P[@]}" -At -d rt_src -c "$FOTO"); av=$("$PG/psql" "${P[@]}" -At -d rt_src -c "$VERD"); as=$("$PG/psql" "${P[@]}" -At -d rt_src -c "$SEQ"); af=$("$PG/psql" "${P[@]}" -At -d rt_src -c "$FIND")
-"$PG/pg_dump" -h /tmp -p 5491 -Fc -d rt_src -f "$D/rt.dump"
-"$PG/pg_restore" -h /tmp -p 5491 -d rt_dst --exit-on-error "$D/rt.dump"
+"$PG/pg_dump" -h "$SOCK" -p "$PORT" -Fc -d rt_src -f "$D/rt.dump"
+"$PG/pg_restore" -h "$SOCK" -p "$PORT" -d rt_dst --exit-on-error "$D/rt.dump"
 b=$("$PG/psql" "${P[@]}" -At -d rt_dst -c "$FOTO"); bv=$("$PG/psql" "${P[@]}" -At -d rt_dst -c "$VERD"); bs=$("$PG/psql" "${P[@]}" -At -d rt_dst -c "$SEQ"); bf=$("$PG/psql" "${P[@]}" -At -d rt_dst -c "$FIND")
 
 echo "src: $a | $av | seq $as"
