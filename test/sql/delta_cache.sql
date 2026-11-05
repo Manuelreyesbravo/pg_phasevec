@@ -5,7 +5,7 @@
 
 CREATE EXTENSION pg_phasevec;
 SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec';
-SELECT tgrelid::regclass AS rel, tgenabled FROM pg_trigger WHERE tgname = 'delta_touch' ORDER BY 1::text;
+SELECT tgrelid::regclass AS rel, tgenabled FROM pg_trigger WHERE tgname = 'delta_touch' ORDER BY tgrelid::regclass::text;
 SELECT phasevec.reader_register('r256', repeat('a', 64), 256) > 0 AS r256;
 CREATE TABLE docs (id int PRIMARY KEY, body text);
 INSERT INTO docs SELECT g, 'doc ' || g FROM generate_series(1, 2000) g;
