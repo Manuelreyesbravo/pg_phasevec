@@ -1,0 +1,89 @@
+-- 0.20.0: the coarse index read back from phasevec.ivf_lists and phasevec.ivf_added is checked before it is used.
+-- Up to 0.19.0 the main loader checked the length of 3 of its 9 blobs and never the key offsets, so a crafted
+-- row (an edited table, or a restored dump: the lists travel in pg_dump since 0.19.0) made it read out of bounds.
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register('r256', repeat('a', 64), 256) > 0 AS r256;
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+INSERT INTO docs SELECT g, 'doc ' || g FROM generate_series(1, 400) g;
+SELECT phasevec.watch('docs', 'docs'::regclass, 'id', 'r.body', 'r256') > 0 AS watch;
+CREATE FUNCTION code_of(g int) RETURNS smallint[] LANGUAGE sql IMMUTABLE AS $$
+    SELECT array(SELECT (((g * 31 + j * 17 * (g % 7 + 1) + (g / 13) * j) % 255) - 127)::smallint
+                   FROM generate_series(1, 256) j) $$;
+CREATE FUNCTION signs_of(c smallint[]) RETURNS bit(256) LANGUAGE sql IMMUTABLE AS $$
+    SELECT string_agg(CASE WHEN x > 0 THEN '1' ELSE '0' END, '' ORDER BY o)::bit(256)
+      FROM unnest(c) WITH ORDINALITY u(x, o) $$;
+SELECT count(phasevec.record('docs', s.key, 'r256', s.text_hash, 0::bigint, code_of(s.key::int), NULL,
+                             signs_of(code_of(s.key::int)))) AS read
+  FROM phasevec.sources s;
+SELECT phasevec.ivf_build('docs') > 0 AS built;
+-- 40 rows whose text changed, read again and absorbed: one chunk per list that gained entries, in ivf_added
+UPDATE docs SET body = 'doc ' || id || ' v1' WHERE id BETWEEN 1 AND 40;
+SELECT count(phasevec.record('docs', s.key, 'r256', s.text_hash, 0::bigint, code_of(s.key::int + 1), NULL,
+                             signs_of(code_of(s.key::int + 1)))) AS reread
+  FROM phasevec.sources s WHERE s.key::int BETWEEN 1 AND 40;
+SELECT phasevec.ivf_maintain('docs', 0.5, 30) AS absorbed;
+SELECT count(*) > 0 AS chunks FROM phasevec.ivf_added;
+
+-- the index is loaded again when its generation moves; every probe and every row, so every list is read
+CREATE FUNCTION ask() RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE phasevec.ivf_cents SET gen = nextval('phasevec.ivf_gen');
+    RETURN (SELECT count(*) FROM phasevec.find_ivf('docs', 0, code_of(7), 10, false, 400, signs_of(code_of(7)), 1000));
+END $$;
+CREATE TABLE kept_lists AS SELECT * FROM phasevec.ivf_lists;
+CREATE TABLE kept_added AS SELECT * FROM phasevec.ivf_added;
+CREATE FUNCTION put_back() RETURNS void LANGUAGE sql AS $$
+    UPDATE phasevec.ivf_lists l SET n = k.n, keys = k.keys, koff = k.koff, hashes = k.hashes, c256 = k.c256, sn = k.sn
+      FROM kept_lists k WHERE l.watch = k.watch AND l.list = k.list;
+    UPDATE phasevec.ivf_added a SET keys = k.keys, koff = k.koff
+      FROM kept_added k WHERE a.watch = k.watch AND a.seq = k.seq $$;
+-- the list to tamper with: one with several rows
+CREATE TABLE target AS SELECT min(list) AS list FROM phasevec.ivf_lists WHERE n > 2;
+SELECT ask() AS control;
+
+-- (a) a key offset far past the end of the keys
+UPDATE phasevec.ivf_lists SET koff = overlay(koff PLACING '\xa0860100'::bytea FROM 5 FOR 4)
+ WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (b) key offsets that go back
+UPDATE phasevec.ivf_lists SET koff = overlay(koff PLACING '\xffffffff'::bytea FROM 5 FOR 4)
+ WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (c) keys cut short: the offsets point past them
+UPDATE phasevec.ivf_lists SET keys = substr(keys, 1, 1) WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (d) the text hashes cut short
+UPDATE phasevec.ivf_lists SET hashes = substr(hashes, 1, 31) WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (e) the 256-bit codes cut short
+UPDATE phasevec.ivf_lists SET c256 = substr(c256, 1, 33) WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (f) the key offsets one short
+UPDATE phasevec.ivf_lists SET koff = substr(koff, 1, length(koff) - 4) WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (g) a negative count
+UPDATE phasevec.ivf_lists SET sn = -1 WHERE list = (SELECT list FROM target);
+SELECT ask();
+SELECT put_back();
+-- (h) an absorbed chunk whose key offsets point past its keys
+UPDATE phasevec.ivf_added SET koff = overlay(koff PLACING '\xa0860100'::bytea FROM 1 FOR 4)
+ WHERE seq = (SELECT min(seq) FROM phasevec.ivf_added);
+SELECT ask();
+SELECT put_back();
+
+-- put back, the same index answers again
+SELECT ask() AS control;
+
+DROP FUNCTION ask(), put_back();
+DROP TABLE kept_lists, kept_added, target;
+DROP TABLE docs;
+DROP FUNCTION code_of(int), signs_of(smallint[]);
+DROP EXTENSION pg_phasevec;

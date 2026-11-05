@@ -32,6 +32,8 @@ CREATE EXTENSION pg_phasevec;
 
 PostgreSQL 18 or newer. No other extension is required.
 
+The build is portable: it adds `-O3` to the server's own `CFLAGS` and nothing tied to the build machine's CPU. `make PHASEVEC_NATIVE=1` adds `-march=native` for a build that only has to run where it was compiled (until 0.19.0 that was the default, and a binary built on a newer CPU could stop with `SIGILL` on an older one).
+
 ## A walk through it
 
 ```sql
@@ -79,6 +81,7 @@ Edit a watched row and its reading turns `stale` in the same transaction; `find(
 | **Lexical** | `lexical`, `lexical_maintain`, `lexical_refresh` |
 | **Audit** | `coverage`, `coverage_check`, `truncations`, `dupes`, `audit_sample`, `counts_compact` |
 | **Recall** | `recall_approve`, `recall_check` (is a watch still served the neighbours it was approved with?) |
+| **Truth** | `assert`, `verify`, `verify_one`, `refute`, `supersede`, `unsupersede`, `disputes`, `recall` (what a row claims, a proof that checks it, and whether it still holds) |
 | **Brief** | `brief` (what a watch still holds as true, best first, inside a character budget; text read with the caller's rights) |
 
 Full signatures: `\df phasevec.*`.
@@ -113,6 +116,14 @@ SELECT watch, verdict, baseline, current, drift, k, sample, via, nprobe, m FROM 
 ## Security
 
 0.16.0 is a security-hardening release. The SPI cursors that drive index build and maintenance skip rows with a `NULL` code instead of dereferencing it; every count, dimension and probe argument is bounded before it reaches an allocation, and an overflow in `k * dims` is caught; the proof clock cannot re-enter itself; a path built for the reader socket is refused if it would truncate; and the maintenance functions are revoked from `PUBLIC`. The checks have a regression test in `test/sql/security.sql`.
+
+0.20.0 fixes what the review of 2026-11-05 found in the truth layer and the coarse index:
+
+* **A verdict is bound to what it judged.** `verify()` and `refute()` record a binding (sha256 of the row's text hash and the proof) with each verdict. When the row's text changes, its verdict goes back to `unproven` and its proof is due again; and a `verified` whose binding no longer matches the row and the proof is reported as `unproven` wherever the verdict is read (`brief`, `recall`). Until 0.19.0 a row edited after it was verified kept `verified`, and `brief()` served its new text as verified. If the proof still holds for the new text, the next `verify()` marks it verified again: a proof that does not read the row cannot tell one text from another (`test/sql/truth_binding.sql`).
+* **A proof runs as its author.** `assert()` records who asserted the proof (`truth.asserted_by`, the caller's current user), and `verify()` runs each proof with that role's rights, in a security-restricted operation, only when the caller already holds that role's privileges (is the author, a member of it, or a superuser); `verify()` skips the others, `verify_one()` refuses them. Until 0.19.0 a proof ran with the rights of whoever called `verify()`, so an asserter could make a privileged verifier read for it. Proofs asserted before 0.20.0 have no author and do not run until asserted again or until the owner names one: `UPDATE phasevec.truth SET asserted_by = '<role>' WHERE asserted_by IS NULL AND proof IS NOT NULL;`. Verdicts reached before 0.20.0 are not carried over as `verified` (they go back to `unproven`, with the reason in `last_error`); `refuted` ones stay refuted. A verifier other than the owner needs `EXECUTE` on `verify` (or `verify_one`), `_watch`, `_truth_due`, `_truth_of`, `_truth_set` and `_prove_as` (`test/sql/truth_author.sql`, `test/sql/upgrade_020.sql`).
+* **A proof is one expression, under the cost cap and the clock.** A proof that closed its own parenthesis made two statements: the cost step ran the second one with no clock and no cap. The wrapped proof is now parsed and must be one `SELECT`; a cost that cannot be read is refused; and the proof's clock runs from before the estimate, which can run immutable functions while planning (`test/sql/truth_cost.sql`).
+* **Closed to `PUBLIC`.** `_forget()` (callable from any user's own trigger) is revoked: the watch trigger now forgets through `_note()`, which the writers of a watched table already need, and only the owner may call `_forget()`. `_brief_keys()` and `brief()` are revoked too: whoever may brief is granted both, `GRANT EXECUTE ON FUNCTION phasevec.brief(text, int), phasevec._brief_keys(text) TO <role>;` (`test/sql/privileges.sql`).
+* **The coarse index is checked as it loads.** Every blob of `phasevec.ivf_lists` and `phasevec.ivf_added` is checked for `NULL` and for its exact length, every count for its sign, and every key offset for its place inside the keys, before anything is copied: those rows travel in `pg_dump` since 0.19.0, and a truncated or edited one made the loader read out of bounds (`test/sql/ivf_blobs.sql`).
 
 To report a vulnerability, email **manuelreyesbravo@gmail.com** with a subject starting `[pg_phasevec security]`. Please include the PostgreSQL version, `SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec'`, and the smallest sequence of statements that shows it.
 

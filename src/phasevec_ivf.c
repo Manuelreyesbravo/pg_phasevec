@@ -572,6 +572,53 @@ cents_rel(void)
 	return OidIsValid(ns) ? get_relname_relid("ivf_cents", ns) : InvalidOid;
 }
 
+/*
+ * 0.20.0: the stored lists are read back as data, not trusted as memory. Since 0.19.0 they travel in pg_dump, so a
+ * restored, truncated or edited row reaches this loader: every blob is checked for NULL and for its exact length,
+ * every count for its sign, and every key offset for its place inside the keys blob, before anything is copied.
+ */
+static int32
+stored_count(HeapTuple tup, TupleDesc td, int col, int32 watch, int list)
+{
+	bool		isnull;
+	int32		v = DatumGetInt32(SPI_getbinval(tup, td, col, &isnull));
+
+	if (isnull || v < 0)
+		elog(ERROR, "phasevec ivf: list %d of watch %d has a missing or negative count", list, watch);
+	return v;
+}
+
+/* A blob of a stored list: never NULL, and exactly want bytes long (any length when want < 0, returned in *len). */
+static const char *
+stored_blob(HeapTuple tup, TupleDesc td, int col, int64 want, int32 watch, int list, size_t *len)
+{
+	bool		isnull;
+	Datum		d = SPI_getbinval(tup, td, col, &isnull);
+	bytea	   *b;
+
+	if (isnull)
+		elog(ERROR, "phasevec ivf: list %d of watch %d has a missing blob", list, watch);
+	b = DatumGetByteaPP(d);
+	if (want >= 0 && (int64) VARSIZE_ANY_EXHDR(b) != want)
+		elog(ERROR, "phasevec ivf: list %d of watch %d has blobs of the wrong size", list, watch);
+	if (len)
+		*len = VARSIZE_ANY_EXHDR(b);
+	return VARDATA_ANY(b);
+}
+
+/* sz + 1 key offsets: from inside the keys blob, never going back, never past its end */
+static void
+check_koff(const int32 *koff, int sz, size_t keylen, int32 watch, int list)
+{
+	if (koff[0] < 0)
+		elog(ERROR, "phasevec ivf: the keys of list %d of watch %d point outside their blob", list, watch);
+	for (int t = 0; t < sz; t++)
+		if (koff[t + 1] < koff[t])
+			elog(ERROR, "phasevec ivf: the keys of list %d of watch %d point outside their blob", list, watch);
+	if ((size_t) koff[sz] > keylen)
+		elog(ERROR, "phasevec ivf: the keys of list %d of watch %d point outside their blob", list, watch);
+}
+
 static void
 load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 {
@@ -625,9 +672,9 @@ load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 		bool		isnull;
 		int			l = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull));
 
-		if (l < 0 || l >= k)
+		if (isnull || l < 0 || l >= k)
 			elog(ERROR, "phasevec ivf: list %d outside 0..%d", l, k - 1);
-		lsize[l] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull));
+		lsize[l] = stored_count(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, watch, l);
 	}
 	/* the chunks absorbed since the build (0.10.0) add to their lists */
 	bsize = palloc(sizeof(int) * k);
@@ -641,14 +688,22 @@ load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 		{
 			bool		isnull;
 			int			l = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull));
+			int32		more;
 
-			if (l < 0 || l >= k)
+			if (isnull || l < 0 || l >= k)
 				elog(ERROR, "phasevec ivf: list %d outside 0..%d", l, k - 1);
-			lsize[l] += DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull));
+			more = stored_count(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, watch, l);
+			if ((int64) lsize[l] + more > PG_INT32_MAX)
+				elog(ERROR, "phasevec ivf: list %d of watch %d holds more entries than an index can", l, watch);
+			lsize[l] += more;
 		}
 	}
 	for (int j = 0; j < k; j++)
+	{
+		if ((int64) ix.lstart[j] + lsize[j] > PG_INT32_MAX)
+			elog(ERROR, "phasevec ivf: the lists of watch %d hold more entries than an index can", watch);
 		ix.lstart[j + 1] = ix.lstart[j] + lsize[j];
+	}
 	ne = ix.lstart[k];
 	fill = palloc(sizeof(int) * k);
 	for (int j = 0; j < k; j++)
@@ -663,12 +718,12 @@ load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 		Oid			lt[2] = {INT4OID, INT4OID};
 		HeapTuple	tup;
 		TupleDesc	td;
-		bool		isnull;
 		const int32 *docs, *koff, *sdocs;
 		const char *keys;
 		const uint8 *hashes, *c256, *sc256;
 		const int8 *c8;
 		int			sz, ssz, e0 = ix.lstart[j];
+		size_t		keylen;
 
 		if (bsize[j] == 0)
 			continue;
@@ -679,22 +734,19 @@ load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 			elog(ERROR, "phasevec ivf: list %d of watch %d vanished while loading", j, watch);
 		tup = SPI_tuptable->vals[0];
 		td = SPI_tuptable->tupdesc;
-		sz = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
-		ssz = DatumGetInt32(SPI_getbinval(tup, td, 8, &isnull));
-		if (VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull))) != sizeof(int32) * (size_t) sz ||
-			VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 7, &isnull))) != (size_t) sz * dims ||
-			VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 9, &isnull))) != sizeof(int32) * (size_t) ssz)
-			elog(ERROR, "phasevec ivf: list %d of watch %d has blobs of the wrong size", j, watch);
-		if (sz + ssz != bsize[j])
+		sz = stored_count(tup, td, 1, watch, j);
+		ssz = stored_count(tup, td, 8, watch, j);
+		docs = (const int32 *) stored_blob(tup, td, 2, (int64) sizeof(int32) * sz, watch, j, NULL);
+		keys = stored_blob(tup, td, 3, -1, watch, j, &keylen);
+		koff = (const int32 *) stored_blob(tup, td, 4, (int64) sizeof(int32) * (sz + (int64) 1), watch, j, NULL);
+		hashes = (const uint8 *) stored_blob(tup, td, 5, (int64) sz * HB, watch, j, NULL);
+		c256 = (const uint8 *) stored_blob(tup, td, 6, (int64) sz * CB, watch, j, NULL);
+		c8 = (const int8 *) stored_blob(tup, td, 7, (int64) sz * dims, watch, j, NULL);
+		sdocs = (const int32 *) stored_blob(tup, td, 9, (int64) sizeof(int32) * ssz, watch, j, NULL);
+		sc256 = (const uint8 *) stored_blob(tup, td, 10, (int64) ssz * CB, watch, j, NULL);
+		check_koff(koff, sz, keylen, watch, j);
+		if ((int64) sz + ssz != bsize[j])
 			elog(ERROR, "phasevec ivf: list %d changed while loading", j);
-		docs = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 2, &isnull)));
-		keys = VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 3, &isnull)));
-		koff = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 4, &isnull)));
-		hashes = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 5, &isnull)));
-		c256 = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 6, &isnull)));
-		c8 = (const int8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 7, &isnull)));
-		sdocs = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 9, &isnull)));
-		sc256 = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 10, &isnull)));
 		for (int t = 0; t < ssz; t++)		/* the SOAR copies: ordinal and code, after the list's own */
 		{
 			if (sdocs[t] < 0 || sdocs[t] >= n)
@@ -751,25 +803,21 @@ load_index(Oid rel, int32 watch, uint64 ver, int k, int dims, int n, bytea *cb)
 				TupleDesc	td = SPI_tuptable->tupdesc;
 				bool		isnull;
 				int			l = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
-				int			sz = DatumGetInt32(SPI_getbinval(tup, td, 2, &isnull));
-				const int32 *docs = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 3, &isnull)));
-				const char *keys = VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 4, &isnull)));
-				const int32 *koff = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 5, &isnull)));
-				const uint8 *hashes = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 6, &isnull)));
-				const uint8 *c256 = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 7, &isnull)));
-				const int8 *c8 = (const int8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 8, &isnull)));
-				int			ssz = DatumGetInt32(SPI_getbinval(tup, td, 9, &isnull));
-				const int32 *sdocs = (const int32 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 10, &isnull)));
-				const uint8 *sc256 = (const uint8 *) VARDATA_ANY(DatumGetByteaPP(SPI_getbinval(tup, td, 11, &isnull)));
+				int			sz = stored_count(tup, td, 2, watch, l);
+				int			ssz = stored_count(tup, td, 9, watch, l);
+				size_t		keylen;
+				const int32 *docs = (const int32 *) stored_blob(tup, td, 3, (int64) sizeof(int32) * sz, watch, l, NULL);
+				const char *keys = stored_blob(tup, td, 4, -1, watch, l, &keylen);
+				const int32 *koff = (const int32 *) stored_blob(tup, td, 5, (int64) sizeof(int32) * (sz + (int64) 1), watch, l, NULL);
+				const uint8 *hashes = (const uint8 *) stored_blob(tup, td, 6, (int64) sz * HB, watch, l, NULL);
+				const uint8 *c256 = (const uint8 *) stored_blob(tup, td, 7, (int64) sz * CB, watch, l, NULL);
+				const int8 *c8 = (const int8 *) stored_blob(tup, td, 8, (int64) sz * dims, watch, l, NULL);
+				const int32 *sdocs = (const int32 *) stored_blob(tup, td, 10, (int64) sizeof(int32) * ssz, watch, l, NULL);
+				const uint8 *sc256 = (const uint8 *) stored_blob(tup, td, 11, (int64) ssz * CB, watch, l, NULL);
 
-				if (VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 3, &isnull))) != sizeof(int32) * (size_t) sz ||
-					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 5, &isnull))) != sizeof(int32) * (size_t) (sz + 1) ||
-					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 6, &isnull))) != (size_t) sz * HB ||
-					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 7, &isnull))) != (size_t) sz * CB ||
-					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 8, &isnull))) != (size_t) sz * dims ||
-					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 10, &isnull))) != sizeof(int32) * (size_t) ssz ||
-					VARSIZE_ANY_EXHDR(DatumGetByteaPP(SPI_getbinval(tup, td, 11, &isnull))) != (size_t) ssz * CB)
-					elog(ERROR, "phasevec ivf: a chunk of list %d of watch %d has blobs of the wrong size", l, watch);
+				check_koff(koff, sz, keylen, watch, l);
+				if (isnull)
+					elog(ERROR, "phasevec ivf: a chunk of watch %d has no list", watch);
 				if (l < 0 || l >= k || fill[l] + sz + ssz > ix.lstart[l + 1])
 					elog(ERROR, "phasevec ivf: a chunk of list %d changed while loading", l);
 				for (int t = 0; t < sz; t++)
@@ -1370,10 +1418,12 @@ hold_index(int32 watch)
 	ver = (uint64) DatumGetInt64(SPI_getbinval(tup, td, 5, &isnull)) | (gen ? GEN_BIT : 0);
 	if (!acquire_index(rel, watch, ver, false))
 	{
-		bytea	   *cb = DatumGetByteaPP(SPI_getbinval(tup, td, 4, &isnull));
+		Datum		cd = SPI_getbinval(tup, td, 4, &isnull);
+		bytea	   *cb;
 
-		if (ck < 1 || ck > 1000000 || cdims < 256 || cdims > 65536)
+		if (isnull || ck < 1 || ck > 1000000 || cdims < 256 || cdims > 65536 || cn < 0)
 			elog(ERROR, "phasevec ivf: a stored coarse index with an implausible shape");
+		cb = DatumGetByteaPP(cd);
 		if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * ck * cdims)
 			elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, ck, cdims);
 		load_index(rel, watch, ver, ck, cdims, cn, cb);

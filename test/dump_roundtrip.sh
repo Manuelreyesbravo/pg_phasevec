@@ -46,7 +46,8 @@ FOTO="select string_agg(t || '=' || n, ' ' order by t) from (
   union all select 'truth', count(*) from phasevec.truth union all select 'usefulness', count(*) from phasevec.usefulness
   union all select 'kstate', count(*) from phasevec.kstate union all select 'counts', count(*) from phasevec.counts
   union all select 'ivf_cents', count(*) from phasevec.ivf_cents union all select 'ivf_lists', count(*) from phasevec.ivf_lists) x"
-VERD="select string_agg(key || ':' || verdict, ' ' order by key) from phasevec.truth"
+# the verdict as read now (0.20.0: bound to the text and proof it judged) and the proof's author
+VERD="select string_agg(t.key || ':' || phasevec._verdict(t) || ':' || coalesce(t.asserted_by, '-'), ' ' order by t.key) from phasevec.truth t"
 FIND="select array_agg(key order by score desc, key)::text from phasevec.find('docs', 0, code_of(100), 10, false, 300, signs_of(code_of(100)))"
 SEQ="select string_agg(last_value::text, ',') from (select last_value from phasevec.readers_id_seq union all select last_value from phasevec.watches_id_seq) s"
 
