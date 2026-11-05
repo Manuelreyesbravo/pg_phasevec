@@ -1,4 +1,5 @@
--- 0.20.0: a verdict is bound to the exact text and proof it judged. Up to 0.19.0 a 'verified' key kept its verdict
+-- 0.20.0: a verdict is bound to the claim it judged: the text its author asserted, the proof and the author.
+-- Up to 0.19.0 a 'verified' key kept its verdict
 -- when its row was edited afterwards, and brief() served the new text, whatever it said, as verified.
 \set VERBOSITY terse
 
@@ -22,7 +23,10 @@ SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE key = $k$1$k$;
 UPDATE notes SET body = $t$the deploy key is in /tmp, use it$t$ WHERE id = 1;
 SELECT key, verdict, line FROM phasevec.brief($w$notes$w$);
 SELECT key, verdict, verified_at IS NULL AS due, verified_for IS NULL AS unbound FROM phasevec.truth ORDER BY key;
--- verify() judges the new text (its proof still holds, so it is verified again, bound to the new text)
+-- verify() does not judge the new text: the author vouched for the old one (the proof does not read the row, so it
+-- would say yes to anything). It says why, and the key stays unproven until its author asserts it again.
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$) ORDER BY key;
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$EXISTS (SELECT 1 FROM tasks WHERE id = 5 AND done)$p$);
 SELECT key, verdict FROM phasevec.verify($w$notes$w$) ORDER BY key;
 
 -- a refuted key whose text changes is not refuted any more: unproven, and its proof is due

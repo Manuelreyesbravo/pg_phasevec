@@ -82,6 +82,21 @@ SELECT put_back();
 -- put back, the same index answers again
 SELECT ask() AS control;
 
+-- 0.20.0 (second cut): ivf_absorb sized its lists from the row of phasevec.ivf_cents and grew the held copy, of
+-- another shape, with them: add[] in grow_index got a write far past its end, because a copy found in the cache
+-- (same watch, same version) was never checked against its row again. Every use checks the row's shape against
+-- the copy held, and the copy is grown only from the index absorb read.
+SELECT count(*) > 0 AS warmed FROM phasevec.find_ivf('docs', 0, code_of(7), 10, false, 400, signs_of(code_of(7)), 1000);
+UPDATE phasevec.ivf_cents SET soar = false, k = 2000, c = decode(repeat('00', 4 * (2000 - k) * 256), 'hex') || c;
+UPDATE docs SET body = 'doc ' || id || ' v2' WHERE id BETWEEN 41 AND 60;
+SELECT count(phasevec.record('docs', s.key, 'r256', s.text_hash, 0::bigint, code_of(s.key::int + 2), NULL,
+                             signs_of(code_of(s.key::int + 2)))) AS reread
+  FROM phasevec.sources s WHERE s.key::int BETWEEN 41 AND 60;
+SELECT phasevec.ivf_absorb('docs');
+SELECT count(*) AS chunks_past_the_lists FROM phasevec.ivf_added WHERE list >= 20;
+-- a sweep of that index is refused the same way, before anything is read from the copy
+SELECT count(*) FROM phasevec.find_ivf('docs', 0, code_of(7), 10, false, 400, signs_of(code_of(7)), 1000);
+
 DROP FUNCTION ask(), put_back();
 DROP TABLE kept_lists, kept_added, target;
 DROP TABLE docs;

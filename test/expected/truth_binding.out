@@ -1,4 +1,5 @@
--- 0.20.0: a verdict is bound to the exact text and proof it judged. Up to 0.19.0 a 'verified' key kept its verdict
+-- 0.20.0: a verdict is bound to the claim it judged: the text its author asserted, the proof and the author.
+-- Up to 0.19.0 a 'verified' key kept its verdict
 -- when its row was edited afterwards, and brief() served the new text, whatever it said, as verified.
 \set VERBOSITY terse
 CREATE EXTENSION pg_phasevec;
@@ -68,7 +69,20 @@ SELECT key, verdict, verified_at IS NULL AS due, verified_for IS NULL AS unbound
  2   | refuted  | f   | f
 (2 rows)
 
--- verify() judges the new text (its proof still holds, so it is verified again, bound to the new text)
+-- verify() does not judge the new text: the author vouched for the old one (the proof does not read the row, so it
+-- would say yes to anything). It says why, and the key stays unproven until its author asserts it again.
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$) ORDER BY key;
+ key | verdict  |                                               error                                               
+-----+----------+---------------------------------------------------------------------------------------------------
+ 1   | unproven | the row does not say what was asserted (it changed, or it was not readable then): assert it again
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$EXISTS (SELECT 1 FROM tasks WHERE id = 5 AND done)$p$);
+ assert 
+--------
+ 
+(1 row)
+
 SELECT key, verdict FROM phasevec.verify($w$notes$w$) ORDER BY key;
  key | verdict  
 -----+----------

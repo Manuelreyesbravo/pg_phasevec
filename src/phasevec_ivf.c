@@ -1376,6 +1376,39 @@ question_of(VarBit *qv, ArrayType *qa)
 }
 
 /* The index of a watch in g_ix, held until release_index(). Inside SPI. */
+/*
+ * 0.20.0: the shape of a stored coarse index (phasevec.ivf_cents: k, dims, n), checked the same way wherever it is
+ * read (hold_index on every call, cache hit or not; ivf_absorb). Returns k.
+ */
+static int
+stored_shape(HeapTuple tup, TupleDesc td, int32 watch, int *dims, int *n)
+{
+	bool		nk, nd, nn;
+	int			k = DatumGetInt32(SPI_getbinval(tup, td, 1, &nk));
+
+	*dims = DatumGetInt32(SPI_getbinval(tup, td, 2, &nd));
+	*n = DatumGetInt32(SPI_getbinval(tup, td, 3, &nn));
+	if (nk || nd || nn || k < 1 || k > 1000000 || *dims < 256 || *dims > 65536 || *n < 0)
+		elog(ERROR, "phasevec ivf: the stored coarse index of watch %d has an implausible shape", watch);
+	return k;
+}
+
+/* The centroids blob of a stored coarse index: exactly k x dims floats. */
+static bytea *
+stored_cents(HeapTuple tup, TupleDesc td, int col, int32 watch, int k, int dims)
+{
+	bool		isnull;
+	Datum		cd = SPI_getbinval(tup, td, col, &isnull);
+	bytea	   *cb;
+
+	if (isnull)
+		elog(ERROR, "phasevec ivf: the stored coarse index of watch %d has no centroids", watch);
+	cb = DatumGetByteaPP(cd);
+	if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * (size_t) k * (size_t) dims)
+		elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, k, dims);
+	return cb;
+}
+
 static void
 hold_index(int32 watch)
 {
@@ -1412,23 +1445,28 @@ hold_index(int32 watch)
 		elog(ERROR, "phasevec ivf: watch %d has no coarse index", watch);
 	tup = SPI_tuptable->vals[0];
 	td = SPI_tuptable->tupdesc;
-	ck = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
-	cdims = DatumGetInt32(SPI_getbinval(tup, td, 2, &isnull));
-	cn = DatumGetInt32(SPI_getbinval(tup, td, 3, &isnull));
+	ck = stored_shape(tup, td, watch, &cdims, &cn);
 	ver = (uint64) DatumGetInt64(SPI_getbinval(tup, td, 5, &isnull)) | (gen ? GEN_BIT : 0);
 	if (!acquire_index(rel, watch, ver, false))
 	{
-		Datum		cd = SPI_getbinval(tup, td, 4, &isnull);
-		bytea	   *cb;
+		bytea	   *cb = stored_cents(tup, td, 4, watch, ck, cdims);
 
-		if (isnull || ck < 1 || ck > 1000000 || cdims < 256 || cdims > 65536 || cn < 0)
-			elog(ERROR, "phasevec ivf: a stored coarse index with an implausible shape");
-		cb = DatumGetByteaPP(cd);
-		if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * ck * cdims)
-			elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, ck, cdims);
 		load_index(rel, watch, ver, ck, cdims, cn, cb);
 		if (!acquire_index(rel, watch, ver, true))
 			elog(ERROR, "phasevec ivf: the index of watch %d was loaded and is not there", watch);
+	}
+	else if (g_ix.k != ck || g_ix.dims != cdims || g_ix.n != cn)
+	{
+		/*
+		 * 0.20.0: the copy held (here or shared) was checked when it was loaded, under this version; a row that says
+		 * another shape under the same version was edited behind the extension. Using either would mix two shapes
+		 * (ivf_absorb sized its lists from the row, grow_index from the copy: a write past the end of add[]).
+		 */
+		int			hk = g_ix.k, hdims = g_ix.dims, hn = g_ix.n;
+
+		release_index();
+		elog(ERROR, "phasevec ivf: the coarse index of watch %d says %d x %d with %d readings, the copy of its version %d x %d with %d: rebuild it",
+			 watch, ck, cdims, cn, hk, hdims, hn);
 	}
 }
 
@@ -2014,14 +2052,20 @@ bytea_cat(bytea *old, const void *add, size_t addlen)
  * False if the held index is not the one absorbed into (another build or absorb moved it meanwhile).
  */
 static bool
-grow_index(const Absorbed *ab, size_t na, int n0, BIndex *nx)
+grow_index(const Absorbed *ab, size_t na, int n0, int k, int dims, BIndex *nx)
 {
-	int			k = g_ix.k, dims = g_ix.dims;
 	int		   *add;
 	int64		ne = 0, kold, kadd = 0;
 
-	if (g_ix.n != n0)
+	/*
+	 * 0.20.0: the assignments in ab[] were made against the centroids absorb read (k lists of dims); the held copy
+	 * is grown only if it is that same index. Each assignment is checked against k as well.
+	 */
+	if (g_ix.n != n0 || g_ix.k != k || g_ix.dims != dims)
 		return false;
+	for (size_t i = 0; i < na; i++)
+		if (ab[i].a1 < 0 || ab[i].a1 >= k || ab[i].a2 >= k)
+			return false;
 	memset(nx, 0, sizeof(BIndex));
 	nx->k = k;
 	nx->dims = dims;
@@ -2110,13 +2154,10 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 		bool		isnull;
 		bytea	   *cb;
 
-		k = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
-		dims = DatumGetInt32(SPI_getbinval(tup, td, 2, &isnull));
-		n0 = DatumGetInt32(SPI_getbinval(tup, td, 3, &isnull));
+		k = stored_shape(tup, td, watch, &dims, &n0);
 		soar = DatumGetBool(SPI_getbinval(tup, td, 4, &isnull));
-		cb = DatumGetByteaPP(SPI_getbinval(tup, td, 5, &isnull));
-		if (VARSIZE_ANY_EXHDR(cb) != sizeof(float) * k * dims)
-			elog(ERROR, "phasevec ivf: the centroids of watch %d are not %d x %d floats", watch, k, dims);
+		soar = soar && !isnull;
+		cb = stored_cents(tup, td, 5, watch, k, dims);
 		cents = palloc(sizeof(float) * k * dims);
 		memcpy(cents, VARDATA_ANY(cb), sizeof(float) * k * dims);
 	}
@@ -2248,7 +2289,7 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 		hold_index(watch);
 		PG_TRY();
 		{
-			grown = grow_index(ab, na, n0, &nx);
+			grown = grow_index(ab, na, n0, k, dims, &nx);
 		}
 		PG_FINALLY();
 		{

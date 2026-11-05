@@ -25,6 +25,8 @@ CREATE ROLE pv_author;
 GRANT USAGE ON SCHEMA phasevec TO pv_author;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_author;
 GRANT SELECT ON pv_shared TO pv_author;
+-- an author vouches for the row's text as it reads it: it must be able to read the row
+GRANT SELECT ON notes TO pv_author;
 -- the author says two things: one it can check, one that reads what only the verifier can
 SET ROLE pv_author;
 SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$(SELECT n FROM public.pv_shared) = 7$p$);
@@ -80,13 +82,11 @@ SELECT key, asserted_by FROM phasevec.truth WHERE key = $k$3$k$;
 
 -- a verifier that does not hold the author's privileges runs none of its proofs: it cannot lend itself rights it
 -- does not have, nor borrow the author's
+-- (a verifier is granted verify() or verify_one() and nothing else)
 CREATE ROLE pv_verifier;
 GRANT USAGE ON SCHEMA phasevec TO pv_verifier;
-GRANT EXECUTE ON FUNCTION phasevec._watch(text), phasevec.verify(text, int, interval, interval, int, float8),
-                          phasevec.verify_one(text, text, int, float8),
-                          phasevec._truth_due(int, int, interval, name), phasevec._truth_of(int, text),
-                          phasevec._truth_set(int, text, boolean, text, bytea),
-                          phasevec._prove_as(text, int, float8, name) TO pv_verifier;
+GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, float8),
+                          phasevec.verify_one(text, text, int, float8) TO pv_verifier;
 SET ROLE pv_verifier;
 SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$);
  run 
@@ -95,8 +95,6 @@ SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$
 (1 row)
 
 SELECT phasevec.verify_one($w$notes$w$, $k$3$k$);
-ERROR:  phasevec: role "pv_verifier" cannot run a proof as its author "pv_author"
-SELECT * FROM phasevec._prove_as($p$true$p$, 1000, 1e6, $r$pv_author$r$);
 ERROR:  phasevec: role "pv_verifier" cannot run a proof as its author "pv_author"
 RESET ROLE;
 -- once it is a member of the author, it may

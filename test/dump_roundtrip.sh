@@ -82,5 +82,23 @@ SQL
 echo "dst after restore: sources for the new row + id of a new watch = $c"
 [ "${c%% *}" = "1" ] || { echo "not ok - the watch does not see new rows after restore"; fallas=1; }
 [ "${c##* }" -gt 1 ] || { echo "not ok - the new watch reused id 1"; fallas=1; }
+
+# 0.20.0 (second cut): a dump edited by hand (a row's text changed, the extension's tables left as they were
+# dumped) does not serve 'verified' for text nobody judged: brief() and verify() read the row, not the dumped hash.
+"$PG/dropdb" -h "$SOCK" -p "$PORT" --if-exists rt_edit; "$PG/createdb" -h "$SOCK" -p "$PORT" rt_edit
+"$PG/pg_dump" -h "$SOCK" -p "$PORT" -d rt_src -f "$D/rt.sql"
+python3 -I - "$D/rt.sql" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+assert s.count("\n3\tnote 3\n") == 1, "the row to edit is not in the dump once"
+open(p, "w").write(s.replace("\n3\tnote 3\n", "\n3\tA9: crafted row text, never judged\n"))
+PY
+"$PG/psql" "${P[@]}" -d rt_edit -f "$D/rt.sql" >/dev/null
+e=$("$PG/psql" "${P[@]}" -At -d rt_edit -c "SELECT verdict || ' | ' || line FROM phasevec.brief('work') WHERE key = '3'")
+ev=$("$PG/psql" "${P[@]}" -At -d rt_edit -c "SELECT verdict FROM phasevec.verify('work', 100, interval '0') WHERE key = '3'")
+echo "edited dump: brief says $e; verify says $ev"
+case "$e" in verified*) echo "not ok - a hand-edited row is served as verified after restore"; fallas=1 ;; esac
+[ "$ev" = "unproven" ] || { echo "not ok - verify() judged a row text nobody asserted"; fallas=1; }
 [ $fallas = 0 ] && echo "ok - dump/restore keeps the extension's data and the restored database works"
 exit $fallas

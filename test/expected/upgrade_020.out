@@ -44,6 +44,7 @@ SELECT key, verdict FROM phasevec.verify($w$notes$w$) ORDER BY key;
 CREATE ROLE pv_up_asker;
 GRANT USAGE ON SCHEMA phasevec TO pv_up_asker;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_up_asker;
+GRANT SELECT ON notes TO pv_up_asker;
 ALTER EXTENSION pg_phasevec UPDATE TO $v$0.20.0$v$;
 SELECT extversion FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
  extversion 
@@ -51,13 +52,13 @@ SELECT extversion FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
  0.20.0
 (1 row)
 
--- the verified key is unproven, with the reason; the refuted one stays refuted, bound to its text
-SELECT key, verdict, asserted_by, verified_for IS NOT NULL AS bound, last_error FROM phasevec.truth ORDER BY key;
- key | verdict  | asserted_by | bound |                              last_error                              
------+----------+-------------+-------+----------------------------------------------------------------------
- 1   | unproven |             | f     | verified before 0.20.0, with the verifier's rights: not carried over
- 2   | refuted  |             | t     | 
- 3   | replaced |             | f     | 
+-- the verified key is unproven, with the reason; the refuted one stays refuted, about its text as it is now
+SELECT key, verdict, asserted_by, asserted_for IS NOT NULL AS about_text, last_error FROM phasevec.truth ORDER BY key;
+ key | verdict  | asserted_by | about_text |                              last_error                              
+-----+----------+-------------+------------+----------------------------------------------------------------------
+ 1   | unproven |             | f          | verified before 0.20.0, with the verifier's rights: not carried over
+ 2   | refuted  |             | t          | 
+ 3   | replaced |             | f          | 
 (3 rows)
 
 -- proofs without an author do not run
@@ -69,8 +70,21 @@ SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$
 
 SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
 ERROR:  phasevec: the proof of key 1 has no author (asserted before 0.20.0): assert it again
--- the owner names their author; then they run, bound to the text
+-- naming an author by hand is not enough: a claim is also the text its author read
 UPDATE phasevec.truth SET asserted_by = current_user WHERE asserted_by IS NULL AND proof IS NOT NULL;
+SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$);
+ run 
+-----
+   0
+(1 row)
+
+-- the owner adopts them (asserts them again, as itself, about the text it reads now); then they run, bound
+SELECT phasevec.adopt($w$notes$w$) AS adopted;
+ adopted 
+---------
+       2
+(1 row)
+
 SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
  key | verdict  
 -----+----------
@@ -78,12 +92,12 @@ SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i
  2   | refuted
 (2 rows)
 
-SELECT key, verdict, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
- key | verdict  | bound 
------+----------+-------
- 1   | verified | t
- 2   | refuted  | t
- 3   | replaced | f
+SELECT key, verdict, asserted_by = current_user AS by_owner, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
+ key | verdict  | by_owner | bound 
+-----+----------+----------+-------
+ 1   | verified | t        | t
+ 2   | refuted  | t        | t
+ 3   | replaced |          | f
 (3 rows)
 
 -- the grant on assert() survives its new body; the internals are closed to PUBLIC

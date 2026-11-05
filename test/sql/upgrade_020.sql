@@ -14,19 +14,23 @@ SELECT key, verdict FROM phasevec.verify($w$notes$w$) ORDER BY key;
 CREATE ROLE pv_up_asker;
 GRANT USAGE ON SCHEMA phasevec TO pv_up_asker;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_up_asker;
+GRANT SELECT ON notes TO pv_up_asker;
 
 ALTER EXTENSION pg_phasevec UPDATE TO $v$0.20.0$v$;
 SELECT extversion FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
 
--- the verified key is unproven, with the reason; the refuted one stays refuted, bound to its text
-SELECT key, verdict, asserted_by, verified_for IS NOT NULL AS bound, last_error FROM phasevec.truth ORDER BY key;
+-- the verified key is unproven, with the reason; the refuted one stays refuted, about its text as it is now
+SELECT key, verdict, asserted_by, asserted_for IS NOT NULL AS about_text, last_error FROM phasevec.truth ORDER BY key;
 -- proofs without an author do not run
 SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$);
 SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
--- the owner names their author; then they run, bound to the text
+-- naming an author by hand is not enough: a claim is also the text its author read
 UPDATE phasevec.truth SET asserted_by = current_user WHERE asserted_by IS NULL AND proof IS NOT NULL;
+SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$);
+-- the owner adopts them (asserts them again, as itself, about the text it reads now); then they run, bound
+SELECT phasevec.adopt($w$notes$w$) AS adopted;
 SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
-SELECT key, verdict, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
+SELECT key, verdict, asserted_by = current_user AS by_owner, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
 
 -- the grant on assert() survives its new body; the internals are closed to PUBLIC
 SELECT has_function_privilege($r$pv_up_asker$r$, $f$phasevec.assert(text, text, text, text, jsonb, timestamptz)$f$, $x$EXECUTE$x$) AS asker_asserts,

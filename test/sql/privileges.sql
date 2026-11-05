@@ -49,6 +49,29 @@ DELETE FROM docs WHERE id = 3;
 RESET ROLE;
 SELECT key FROM phasevec.sources ORDER BY key;
 
+-- 0.20.0 (second cut): a writer of one watched table cannot touch another watch's sources. In the first cut the
+-- watch trigger forgot through _note() (a NULL hash), so whoever was granted _note() for one table forgot, rewrote
+-- and invented the keys of every other watch from a trigger of its own.
+CREATE TABLE b_secret (id int PRIMARY KEY, body text);
+INSERT INTO b_secret VALUES (1, $t$b one$t$), (2, $t$b two$t$);
+SELECT phasevec.watch($w$b$w$, $w$b_secret$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) AS b_id \gset
+SET ROLE pv_writer;
+CREATE TEMP TABLE pv_t2 (x int);
+SELECT format($f$CREATE FUNCTION pg_temp.pv_hit() RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN
+    PERFORM phasevec._note(%s, '1', NULL, NULL);
+    PERFORM phasevec._note(%s, '2', sha256('forged'::bytea), 'forged');
+    PERFORM phasevec._note(%s, '999', sha256('x'::bytea), 'x');
+    RETURN NULL; END $b$$f$, :b_id, :b_id, :b_id) \gexec
+CREATE TRIGGER pv_hit AFTER INSERT ON pv_t2 FOR EACH ROW EXECUTE FUNCTION pg_temp.pv_hit();
+INSERT INTO pv_t2 VALUES (1);
+RESET ROLE;
+SELECT s.key, s.text_hash = sha256(convert_to(b.body, $u$UTF8$u$)) AS matches_the_table
+  FROM phasevec.sources s LEFT JOIN b_secret b ON b.id::text = s.key
+ WHERE s.watch = :b_id ORDER BY s.key;
+DROP TABLE pv_t2;
+DROP FUNCTION pg_temp.pv_hit();
+DROP TABLE b_secret;
+
 -- whoever the owner lets brief gets brief() and _brief_keys(), and reads the text with its own rights
 GRANT EXECUTE ON FUNCTION phasevec.brief(text, int), phasevec._brief_keys(text) TO pv_stranger;
 GRANT SELECT ON docs TO pv_stranger;

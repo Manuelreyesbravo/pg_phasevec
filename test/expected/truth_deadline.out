@@ -1,0 +1,214 @@
+-- 0.20.0 (second cut): the proof clock bounds the verdict, and one proof cannot stop the others. In the first cut a
+-- proof that caught query_canceled ran past its clock and was recorded verified; a proof that ran another proof
+-- reset the shared timer and ran unbounded; a proof that raised SQLSTATE 57014 itself aborted every verify() of
+-- its watch; a session advisory lock taken by a proof stayed with the verifier; and with no clock (0 ms) the cost
+-- cap, a planner estimate, was the only limit.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes SELECT g, $t$note $t$ || g FROM generate_series(1, 8) g;
+SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+CREATE ROLE pv_author;
+GRANT USAGE ON SCHEMA phasevec TO pv_author;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_author;
+GRANT SELECT ON notes TO pv_author;
+CREATE SCHEMA pv_author AUTHORIZATION pv_author;
+SET ROLE pv_author;
+-- sleeps in short naps and swallows every cancel
+CREATE FUNCTION pv_author.slow_true(secs float8) RETURNS boolean LANGUAGE plpgsql AS $f$
+DECLARE t0 timestamptz := clock_timestamp();
+BEGIN
+    WHILE clock_timestamp() - t0 < make_interval(secs => secs) LOOP
+        BEGIN PERFORM pg_sleep(0.05);
+        EXCEPTION WHEN query_canceled THEN NULL;
+        END;
+    END LOOP;
+    RETURN true;
+END $f$;
+CREATE FUNCTION pv_author.poison() RETURNS boolean LANGUAGE plpgsql AS $f$
+BEGIN RAISE SQLSTATE '57014' USING MESSAGE = 'canceling statement due to user request'; END $f$;
+RESET ROLE;
+CREATE FUNCTION elapsed_ok(t0 timestamptz, secs float8) RETURNS boolean LANGUAGE sql AS $f$
+    SELECT clock_timestamp() - t0 < make_interval(secs => secs) $f$;
+-- (a) a proof that swallows the cancel runs on, but past its clock it is refuted for its time
+SET ROLE pv_author;
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$pv_author.slow_true(1)$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET ROLE;
+SELECT phasevec.verify_one($w$notes$w$, $k$1$k$, 300, 1e6);
+ verify_one 
+------------
+ refuted
+(1 row)
+
+SELECT key, verdict, last_error FROM phasevec.truth WHERE key = $k$1$k$;
+ key | verdict |            last_error             
+-----+---------+-----------------------------------
+ 1   | refuted | the proof took longer than 300 ms
+(1 row)
+
+-- (b) a proof that runs another proof: refused, and the outer clock still holds
+SELECT phasevec.assert($w$notes$w$, $k$2$k$,
+    $p$(SELECT (phasevec._prove_as('pg_sleep(1) IS NOT NULL', 0, 0, current_user)).ok IS NOT NULL) AND pg_sleep(1.5) IS NOT NULL$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.verify_one($w$notes$w$, $k$2$k$, 300, 1e9);
+ verify_one 
+------------
+ refuted
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$2$k$,
+    $p$phasevec.verify_one('notes', '3', 300, 1e6) IS NULL AND pg_sleep(1.5) IS NOT NULL$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$3$k$, $p$pg_sleep(1) IS NOT NULL$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT now() AS t0 \gset
+SELECT phasevec.verify_one($w$notes$w$, $k$2$k$, 300, 1e9);
+ verify_one 
+------------
+ refuted
+(1 row)
+
+SELECT elapsed_ok(:'t0', 1.2) AS bounded;
+ bounded 
+---------
+ t
+(1 row)
+
+SELECT key, verdict, last_error FROM phasevec.truth WHERE key IN ($k$2$k$, $k$3$k$) ORDER BY key;
+ key | verdict  |                 last_error                 
+-----+----------+--------------------------------------------
+ 2   | refuted  | phasevec: a proof cannot run another proof
+ 3   | unproven | 
+(2 rows)
+
+-- (c) a proof that raises query_canceled itself is refuted; the other proofs of the watch are still judged
+SET ROLE pv_author;
+SELECT phasevec.assert($w$notes$w$, $k$4$k$, $p$pv_author.poison()$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$5$k$, $p$true$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$6$k$, $p$true$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET ROLE;
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, 100, interval $i$0$i$) WHERE key IN ($k$4$k$, $k$5$k$, $k$6$k$) ORDER BY key;
+ key | verdict  |                  error                  
+-----+----------+-----------------------------------------
+ 4   | refuted  | canceling statement due to user request
+ 5   | verified | 
+ 6   | verified | 
+(3 rows)
+
+-- the caller's own statement_timeout still cancels the whole statement
+SET statement_timeout = 300;
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$pg_sleep(2) IS NOT NULL$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.verify_one($w$notes$w$, $k$1$k$, 5000, 1e6);
+ERROR:  canceling statement due to statement timeout
+RESET statement_timeout;
+SELECT 1 AS alive;
+ alive 
+-------
+     1
+(1 row)
+
+-- (d) a session advisory lock taken by a proof does not stay with the verifier
+SET ROLE pv_author;
+SELECT phasevec.assert($w$notes$w$, $k$7$k$, $p$pg_advisory_lock(4242) IS NOT NULL$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET ROLE;
+SELECT pg_advisory_lock(4343);
+ pg_advisory_lock 
+------------------
+ 
+(1 row)
+
+SELECT phasevec.verify_one($w$notes$w$, $k$7$k$, 1000, 1e6);
+ verify_one 
+------------
+ verified
+(1 row)
+
+SELECT objid, mode FROM pg_locks WHERE locktype = $l$advisory$l$ AND pid = pg_backend_pid() ORDER BY objid;
+ objid |     mode      
+-------+---------------
+  4343 | ExclusiveLock
+(1 row)
+
+SELECT pg_advisory_unlock_all();
+ pg_advisory_unlock_all 
+------------------------
+ 
+(1 row)
+
+-- (e) the cost cap is an estimate (here 1000 rows where 3e7 run): a proof always runs under a clock
+SET ROLE pv_author;
+SELECT phasevec.assert($w$notes$w$, $k$8$k$, $p$(SELECT count(*) FROM generate_series(1, (random()*0 + 3e7)::int)) > 0$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET ROLE;
+SELECT phasevec.verify_one($w$notes$w$, $k$8$k$, 0, 100);
+ERROR:  phasevec: a proof runs under a clock: p_timeout_ms must be above 0
+SELECT phasevec.verify_one($w$notes$w$, $k$8$k$, 300, 100);
+ verify_one 
+------------
+ refuted
+(1 row)
+
+DROP FUNCTION elapsed_ok(timestamptz, float8);
+DROP TABLE notes;
+DROP EXTENSION pg_phasevec;
+DROP SCHEMA pv_author CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DROP OWNED BY pv_author;
+DROP ROLE pv_author;
