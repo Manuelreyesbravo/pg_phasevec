@@ -2284,12 +2284,18 @@ phasevec_ivf_absorb(PG_FUNCTION_ARGS)
 		bool		grown = false;
 		BIndex		nx;
 
-	if (na > 0 && phasevec_shared_ivf_cache)
+	/*
+	 * The row's shape is checked against the copy of its version wherever it is read, with the shared cache or
+	 * without (until the sixth review only with it: on PostgreSQL 18, where it is compiled out, an edited row was
+	 * absorbed in its own shape); the grown index is only for the shared cache.
+	 */
+	if (na > 0)
 	{
 		hold_index(watch);
 		PG_TRY();
 		{
-			grown = grow_index(ab, na, n0, k, dims, &nx);
+			if (phasevec_shared_ivf_cache)
+				grown = grow_index(ab, na, n0, k, dims, &nx);
 		}
 		PG_FINALLY();
 		{
