@@ -278,15 +278,12 @@ REVOKE ALL ON phasevec.attempts FROM PUBLIC;
 COMMENT ON COLUMN phasevec.truth.halted IS
     $q$The session that ran this proof ended while it ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
 
--- A verdict judges (text, proof, author, the author's settings). Every part is framed, so no two claims read alike.
+-- A verdict judges (text, proof, author, the author's settings): phasevec._bind, the claim's identity (src/phasevec_truth.c,
+-- phasevec_bind): every part framed, so no two claims read alike. (seventeenth review) Until then the settings were
+-- joined with a newline, and {x.a=1, x.b=2} bound as {"x.a=1<newline>x.b=2"}: a verdict judged for one claim was
+-- recorded, and served 'verified', for the other.
 CREATE FUNCTION phasevec._bind(p_text_hash bytea, p_proof text, p_author oid, p_env text[])
-RETURNS bytea LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT sha256(CASE WHEN p_text_hash IS NULL THEN $q$\x00$q$::bytea ELSE $q$\x01$q$::bytea || p_text_hash END
-                  || int8send(coalesce(p_author, 0)::bigint)
-                  || int4send(octet_length(convert_to(coalesce(p_proof, $q$$q$), $q$UTF8$q$)))
-                  || convert_to(coalesce(p_proof, $q$$q$), $q$UTF8$q$)
-                  || convert_to(coalesce(array_to_string(p_env, chr(10), $q$$q$), $q$$q$), $q$UTF8$q$))
-$f$;
+RETURNS bytea AS $q$MODULE_PATHNAME$q$, $q$phasevec_bind$q$ LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
 -- The truth a key has NOW. 'verified' only for the claim it judged, and only while the row's text, as the watch
 -- trigger last saw it, is the asserted one; 'refuted' only while it is the refuted one. (brief() also checks the text
@@ -353,6 +350,11 @@ RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_assert$q$ LANGUAGE C VOLATILE
 
 -- refute(): as in 0.14.1, and the refutation is about the text it refuted (the asserted one, or the row's text as
 -- the trigger last saw it when nothing was asserted): when that text changes, it is not refuted any more.
+-- (seventeenth review) A refutation retires the claim: its proof goes with it (proof NULL), so no verify(),
+-- verify_one() or adopt() judges it again, and it reads 'refuted', with no horizon, while its text is the refuted one;
+-- an assert() makes it a claim again. Until then the proof stayed: the next verify() past p_every judged it again and
+-- served it 'verified', and adopt() asserted every refuted claim again (yggdrasil retires a deleted memory with
+-- refute(): after the upgrade every deleted memory was served as current and verified).
 CREATE OR REPLACE FUNCTION phasevec.refute(p_watch text, p_key text, p_reason text) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
@@ -365,7 +367,9 @@ BEGIN
             (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = w.id AND s.key = p_key))
     ON CONFLICT (watch, key) DO UPDATE
        SET verdict = $q$refuted$q$, verified_at = now(), last_error = p_reason, changed_at = now(),
-           verified_for = phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
+           proof = NULL, halted = false, looked_at = NULL, looked_for = NULL,
+           interrupted_at = NULL, interrupted_why = NULL,
+           verified_for = phasevec._bind(t.asserted_for, NULL, t.asserted_by_oid, t.proof_env)
      WHERE t.verdict <> $q$replaced$q$;
 END;
 $f$;

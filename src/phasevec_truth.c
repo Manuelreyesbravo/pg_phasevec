@@ -72,6 +72,7 @@
 #include "parser/parser.h"
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "port/pg_bswap.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
@@ -250,18 +251,26 @@ typedef struct Target
 /*
  * The text of a watched row exactly as every reader of it reads it (the recipe over the row, as text, NULL as ''),
  * hashed as phasevec.sources hashes it, and the row version (xmin and ctid) it was read from.
+ *
+ * (seventeenth review) A key names a row byte for byte: its text form under COLLATE "C", here, in RENDER_WHERE and so
+ * in what a reader sees (visible_keys), as phasevec.sources and phasevec.truth hold it (the database's default
+ * collation, which is always deterministic: its equality is the bytes'). A cast to text keeps the column's
+ * collation: in the sixteenth cut a key column with a nondeterministic collation (case-insensitive ICU) and a unique
+ * index declared COLLATE "C" held 'alice' and 'ALICE' as two rows, a reader that saw only 'alice' had _render() show
+ * it 'ALICE' too, with its text, past row-level security, and _verdict() served the hidden row's verdict (an oracle
+ * on its text). The key column's own equality (READ_TYPED) only finds the row through an index.
  */
 #define READ_SQL \
 	"SELECT pg_catalog.sha256(pg_catalog.convert_to(COALESCE((%s)::pg_catalog.text, ''), 'UTF8')), " \
 	"r.xmin::pg_catalog.text OPERATOR(pg_catalog.||) '/' OPERATOR(pg_catalog.||) r.ctid::pg_catalog.text " \
-	"FROM %s r WHERE r.%s::pg_catalog.text OPERATOR(pg_catalog.=) $1%s LIMIT 1"
+	"FROM %s r WHERE r.%s::pg_catalog.text COLLATE pg_catalog.\"C\" OPERATOR(pg_catalog.=) $1%s LIMIT 1"
 #define READ_TYPED " AND r.%s OPERATOR(pg_catalog.=) $2"
 
 /* Rows by key (keys NULL: every row): key, text, text hash. */
 #define RENDER_SQL \
 	"SELECT x.k, x.b, pg_catalog.sha256(pg_catalog.convert_to(COALESCE(x.b, ''), 'UTF8')) " \
 	"FROM (SELECT r.%s::pg_catalog.text AS k, (%s)::pg_catalog.text AS b FROM %s r%s) x"
-#define RENDER_WHERE " WHERE r.%s::pg_catalog.text OPERATOR(pg_catalog.=) ANY ($1)%s"
+#define RENDER_WHERE " WHERE r.%s::pg_catalog.text COLLATE pg_catalog.\"C\" OPERATOR(pg_catalog.=) ANY ($1)%s"
 #define RENDER_TYPED " AND r.%s OPERATOR(pg_catalog.=) ANY ($2)"
 
 /* The keys of the rows a reader sees, among some (keys NULL: all). */
@@ -336,9 +345,14 @@ load_target_ext(Datum id, bool by_id, Target *t, MemoryContext keep, bool missin
 	t->key_col = pstrdup(quote_identifier(SPI_getvalue(tup, td, 5)));
 	t->recipe = pstrdup(SPI_getvalue(tup, td, 6));
 	t->keytype = DatumGetObjectId(SPI_getbinval(tup, td, 7, &isnull));
-	/* types whose text output reads back as the same value, whatever the session's settings */
+	/*
+	 * types whose text output reads back as the same value, whatever the session's settings; text and varchar too
+	 * (seventeenth review): a key is matched byte for byte (COLLATE "C", READ_SQL), and their own equality is only
+	 * the way to the row through an index of the column
+	 */
 	t->typed = !isnull && (t->keytype == INT2OID || t->keytype == INT4OID || t->keytype == INT8OID ||
-						   t->keytype == OIDOID || t->keytype == NUMERICOID || t->keytype == UUIDOID);
+						   t->keytype == OIDOID || t->keytype == NUMERICOID || t->keytype == UUIDOID ||
+						   t->keytype == TEXTOID || t->keytype == VARCHAROID);
 	if (t->typed)
 	{
 		Oid			typinput;
@@ -420,6 +434,27 @@ load_target_as(Oid owner, Datum id, bool by_id, Target *t, MemoryContext keep)
 	unbecome(&was);
 }
 
+/*
+ * A role's name for a message; never an error (seventeenth review): a role dropped since the call read it (DROP OWNED
+ * and DROP ROLE in another session) is named by its OID. In the sixteenth cut the message that a claim's author may
+ * no longer read the table looked the dropped author up with GetUserNameFromId(..., false), and the whole verify()
+ * call ended with "invalid role OID": no claim after it was judged, any author's.
+ */
+static const char *
+role_name(Oid role)
+{
+	char	   *name = GetUserNameFromId(role, true);
+
+	return name ? name : psprintf("a role dropped since (OID %u)", role);
+}
+
+/* Is this role still a role? (a claim's author, read with the call's snapshot, may have been dropped since) */
+static bool
+role_exists(Oid role)
+{
+	return SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(role));
+}
+
 /* May this role read the watched table? (SELECT on the table itself, as for any reader of it.) */
 static bool
 may_read(const Target *t, Oid role)
@@ -434,7 +469,7 @@ must_read(const Target *t, Oid role)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("phasevec: role \"%s\" may not read %s, the table of this watch",
-						GetUserNameFromId(role, false), t->src)));
+						role_name(role), t->src)));
 }
 
 /* Does row-level security filter what this role sees of the table? */
@@ -676,15 +711,112 @@ prepare_read(Target *t)
 /* A claim's key as phasevec._truth_halted names it (sha256), and a _bind: 32 bytes each. */
 #define HASH_LEN 32
 
+/*
+ * (seventeenth review) In UTF-8, as _truth_halted hashes it (sha256(convert_to(key, 'UTF8'))): until then the bytes of
+ * the database's encoding, so in a database not in UTF-8 a key with a character outside ASCII never named its claim.
+ */
 static void
 key_hash(const char *key, uint8 *out)
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	const char *u = pg_server_to_any(key, strlen(key), PG_UTF8);
 
-	if (pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, (const uint8 *) key, strlen(key)) < 0 ||
+	if (pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, (const uint8 *) u, strlen(u)) < 0 ||
 		pg_cryptohash_final(ctx, out, HASH_LEN) < 0)
 		elog(ERROR, "phasevec: could not hash a key: %s", pg_cryptohash_error(ctx));
 	pg_cryptohash_free(ctx);
+}
+
+/*
+ * phasevec._bind(text_hash bytea, proof text, author oid, env text[]) RETURNS bytea: a claim's identity, the sha256 of
+ * every part that changes what its proof means, each framed: a length (int4, big-endian; -1 for NULL) before its
+ * bytes (the text's hash; the proof and each setting in UTF-8), the author as an int8 (-1: none), the number of
+ * settings (-1: NULL) before them. No two claims read alike, so a verdict is recorded only for the claim it judged
+ * (_truth_set, _truth_halted) and served only for it (_verdict_of); the sha256 of that encoding is the claim's
+ * identity as the sha256 of a row's text is the text's (asserted_for). (seventeenth review) Until then the settings
+ * were joined with a newline (in SQL): a placeholder's value may hold one, {x.a=1, x.b=2} and
+ * {"x.a=1<newline>x.b=2"} bound alike, and a verdict judged for one claim was recorded, and served 'verified', for
+ * the other, asserted while the first was judged. In C: framed in SQL it took 4.4 us a call (the unframed 2.2), in C
+ * 0.7 (PostgreSQL 19), on every read of a 'verified' verdict.
+ */
+static void
+bind_len(pg_cryptohash_ctx *ctx, int32 len)
+{
+	uint32		be = pg_hton32((uint32) len);
+
+	if (pg_cryptohash_update(ctx, (const uint8 *) &be, sizeof(be)) < 0)
+		elog(ERROR, "phasevec: could not hash a claim: %s", pg_cryptohash_error(ctx));
+}
+
+static void
+bind_bytes(pg_cryptohash_ctx *ctx, const char *data, int len)
+{
+	bind_len(ctx, len);
+	if (len > 0 && pg_cryptohash_update(ctx, (const uint8 *) data, len) < 0)
+		elog(ERROR, "phasevec: could not hash a claim: %s", pg_cryptohash_error(ctx));
+}
+
+static void
+bind_text(pg_cryptohash_ctx *ctx, text *t)
+{
+	char	   *s = VARDATA_ANY(t);
+	int			len = VARSIZE_ANY_EXHDR(t);
+	char	   *u = pg_server_to_any(s, len, PG_UTF8);
+
+	bind_bytes(ctx, u, u == s ? len : (int) strlen(u));
+}
+
+PG_FUNCTION_INFO_V1(phasevec_bind);
+Datum
+phasevec_bind(PG_FUNCTION_ARGS)
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	uint8		out[HASH_LEN];
+	uint64		author;
+	bytea	   *res;
+
+	if (pg_cryptohash_init(ctx) < 0)
+		elog(ERROR, "phasevec: could not hash a claim: %s", pg_cryptohash_error(ctx));
+	if (PG_ARGISNULL(0))
+		bind_len(ctx, -1);
+	else
+	{
+		bytea	   *h = PG_GETARG_BYTEA_PP(0);
+
+		bind_bytes(ctx, VARDATA_ANY(h), VARSIZE_ANY_EXHDR(h));
+	}
+	author = pg_hton64(PG_ARGISNULL(2) ? (uint64) -1 : (uint64) PG_GETARG_OID(2));
+	if (pg_cryptohash_update(ctx, (const uint8 *) &author, sizeof(author)) < 0)
+		elog(ERROR, "phasevec: could not hash a claim: %s", pg_cryptohash_error(ctx));
+	if (PG_ARGISNULL(1))
+		bind_len(ctx, -1);
+	else
+		bind_text(ctx, PG_GETARG_TEXT_PP(1));
+	if (PG_ARGISNULL(3))
+		bind_len(ctx, -1);
+	else
+	{
+		Datum	   *d;
+		bool	   *nulls;
+		int			n;
+
+		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(3), TEXTOID, &d, &nulls, &n);
+		bind_len(ctx, n);
+		for (int i = 0; i < n; i++)
+		{
+			if (nulls[i])
+				bind_len(ctx, -1);
+			else
+				bind_text(ctx, DatumGetTextPP(d[i]));
+		}
+	}
+	if (pg_cryptohash_final(ctx, out, HASH_LEN) < 0)
+		elog(ERROR, "phasevec: could not hash a claim: %s", pg_cryptohash_error(ctx));
+	pg_cryptohash_free(ctx);
+	res = palloc(VARHDRSZ + HASH_LEN);
+	SET_VARSIZE(res, VARHDRSZ + HASH_LEN);
+	memcpy(VARDATA(res), out, HASH_LEN);
+	PG_RETURN_BYTEA_P(res);
 }
 
 /* ------------------------------------------------------------------------------------------- the judge -- */
@@ -1686,6 +1818,19 @@ author_still_there(Oid author)
 	return SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(author));
 }
 
+/*
+ * (seventeenth review) The watched table is locked (as any reader of it locks it) before the claim's row: the order in
+ * which DROP TABLE takes the same two (the table, then, through phasevec._on_drop and the cascade from
+ * phasevec.watches, the claim's row). In the sixteenth cut the proof's session took the claim's row first and read the
+ * table after it: a DROP TABLE of a watched table while verify() ran deadlocked with it, and was the side aborted.
+ * Now a DROP waits for the claim being judged, or the claim waits for the DROP and then finds its row gone.
+ */
+static void
+watched_table_first(const Target *t)
+{
+	LockRelationOid(t->relid, AccessShareLock);
+}
+
 static bool
 claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every)
 {
@@ -2062,6 +2207,7 @@ phasevec_proof_main(Datum arg)
 				PushActiveSnapshot(GetTransactionSnapshot());
 				MemoryContextSwitchTo(per);
 				pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
+				watched_table_first(&target);
 				taken = claim_taken(sh->owner, every ? worker_lock_plan : worker_try_plan, &target, &c, every);
 				if (taken && lock_waited_since(GetCurrentTransactionStartTimestamp()))
 				{
@@ -2086,6 +2232,7 @@ phasevec_proof_main(Datum arg)
 				PushActiveSnapshot(GetTransactionSnapshot());
 				MemoryContextSwitchTo(per);
 				pgstat_report_activity(STATE_RUNNING, "phasevec: waiting for a claim another session holds");
+				watched_table_first(&target);
 				gone = !claim_taken(sh->owner, worker_take_plan, &target, &c, NULL);
 				PopActiveSnapshot();
 				CommitTransactionCommand();
@@ -3118,7 +3265,7 @@ claim_kind(const Claim *c, const Target *t, Readers *readers, bool *rls, Judgmen
 {
 	*rls = false;
 	memset(rec, 0, sizeof(Judgment));
-	if (!c->author_known)
+	if (!c->author_known || !role_exists(c->author))
 	{
 		rec->out = OUT_UNPROVEN;
 		rec->err = "the author of this proof is gone (dropped, or its name is another role's now): "
@@ -3129,7 +3276,7 @@ claim_kind(const Claim *c, const Target *t, Readers *readers, bool *rls, Judgmen
 	{
 		rec->out = OUT_UNPROVEN;
 		rec->err = psprintf("its author \"%s\" may no longer read %s: nothing is judged",
-							GetUserNameFromId(c->author, false), t->src);
+							role_name(c->author), t->src);
 		return MSG_RECORD;
 	}
 	return MSG_JUDGE;
@@ -3484,7 +3631,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("phasevec: role \"%s\" cannot run a proof as its author \"%s\"",
-						GetUserNameFromId(caller, false), GetUserNameFromId(c.author, false)),
+						role_name(caller), role_name(c.author)),
 				 errhint("Proofs run with their author's rights: verify as the author or as a role that has its privileges.")));
 	l.cx = AllocSetContextCreate(CurrentMemoryContext, "phasevec verify queue", ALLOCSET_DEFAULT_SIZES);
 	l.owner = owner;
@@ -3575,6 +3722,25 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 }
 
 /*
+ * The settings a claim records of its caller's session for `author` (guard_env_now). (seventeenth review) PL/pgSQL,
+ * through which the claim is written (_assert_set), is loaded first: a setting of it the session named before it was
+ * loaded is then what PL/pgSQL's definition makes of it (a superuser-only one the session may not set is dropped, by
+ * PostgreSQL, with a WARNING), not a placeholder recorded as it was before the load.
+ */
+static ArrayType *
+claim_env(Oid author)
+{
+	static bool plpgsql_loaded = false;
+
+	if (!plpgsql_loaded)
+	{
+		load_file("plpgsql", false);
+		plpgsql_loaded = true;
+	}
+	return guard_env_now(author);
+}
+
+/*
  * phasevec.assert(watch text, key text, proof text, topic text, support jsonb, expires_at timestamptz)
  * Records the claim with its author, the current user of the CALLER (a SECURITY DEFINER wrapper vouches with its
  * owner's rights, and that owner is the author), and the caller's settings, which the proof will run with.
@@ -3593,7 +3759,7 @@ phasevec_assert(PG_FUNCTION_ARGS)
 				 PG_ARGISNULL(3) ? (Datum) 0 : PG_GETARG_DATUM(3), PG_ARGISNULL(3),
 				 PG_ARGISNULL(4) ? (Datum) 0 : PG_GETARG_DATUM(4), PG_ARGISNULL(4),
 				 PG_ARGISNULL(5) ? (Datum) 0 : PG_GETARG_DATUM(5), PG_ARGISNULL(5),
-				 guard_env_now());
+				 claim_env(author));
 	SPI_finish();
 	PG_RETURN_VOID();
 }
@@ -3639,7 +3805,7 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	Who			was;
 	SPITupleTable *orphans;
 	uint64		norphans;
-	ArrayType  *env = guard_env_now();
+	ArrayType  *env;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -3650,9 +3816,10 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("phasevec: role \"%s\" cannot make \"%s\" the author of proofs",
-						GetUserNameFromId(caller, false), GetUserNameFromId(author, false)),
+						role_name(caller), role_name(author)),
 				 errhint("Adopt as that role (SET ROLE), or as a role that has its privileges.")));
 	su = superuser_arg(author);
+	env = claim_env(author);
 	InitMaterializedSRF(fcinfo, 0);
 
 	spi_connect();

@@ -71,6 +71,7 @@
 #include "parser/analyze.h"
 #include "tcop/cmdtag.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -282,6 +283,27 @@ set_one(const char *name, const char *value)
 	(void) set_config_option(name, value, PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 }
 
+/*
+ * SAVE-set one setting the author's session had, with the author's own rights (seventeenth review): as if the author
+ * set it (PGC_USERSET, the author as the role that set it), so PostgreSQL decides as it would in the author's own
+ * session: a superuser-only setting (PGC_SUSET) only for a superuser, or a role granted SET on it (pg_parameter_acl),
+ * and a placeholder whose library loads later in the proof's session by that library's definition (a superuser-only
+ * one is then dropped, with a WARNING, as in the author's session). A setting the author may not set is not set (a
+ * WARNING in the log). In the sixteenth cut every recorded setting was set as SUSET: an author that named a
+ * superuser-only setting of a library its session had not loaded yet (SET plpgsql.variable_conflict) had it in the
+ * proof's session, where it then took effect.
+ */
+static void
+set_as_author(const char *name, const char *value, Oid author)
+{
+	const char *now = GetConfigOption(name, true, false);
+
+	if (now != NULL && strcmp(now, value) == 0)
+		return;
+	(void) set_config_option_ext(name, value, PGC_USERSET, PGC_S_SESSION, author, GUC_ACTION_SAVE, true, WARNING,
+								 false);
+}
+
 static bool
 named_in(const char *name, const char *const *names, int n)
 {
@@ -350,11 +372,75 @@ name_cmp(const void *a, const void *b)
  * the client named the session, and a proof or a row-level security policy may read it.
  */
 static bool
-session_made(const struct config_generic *g)
+session_made(const struct config_generic *g, GucSource source)
 {
-	if (g->source >= PGC_S_CLIENT)
+	if (source >= PGC_S_CLIENT)
 		return true;
-	return placeholder(g) && (g->source == PGC_S_DEFAULT || g->source == PGC_S_DYNAMIC_DEFAULT);
+	return placeholder(g) && (source == PGC_S_DEFAULT || source == PGC_S_DYNAMIC_DEFAULT);
+}
+
+/* A value stacked by PostgreSQL (a GucStack's prior), as text; as value_of. buf: 64 bytes. */
+static const char *
+prior_of(const struct config_generic *g, const config_var_value *p, char *buf)
+{
+	switch (g->vartype)
+	{
+		case PGC_BOOL:
+			return p->val.boolval ? "on" : "off";
+		case PGC_INT:
+			snprintf(buf, 64, "%d", p->val.intval);
+			return buf;
+		case PGC_REAL:
+			snprintf(buf, 64, "%.17g", p->val.realval);
+			return buf;
+		case PGC_STRING:
+			return p->val.stringval;
+		case PGC_ENUM:
+			return ENUM_NAME(unconstify(struct config_generic *, g), p->val.enumval);
+	}
+	return NULL;
+}
+
+/*
+ * The value a setting has in the author's SESSION, and where it came from (seventeenth review): the current one, but
+ * for what the SET clause of a function the session is inside set (a nest level saved for the length of the call,
+ * GUC_SAVE: fmgr_security_definer, a procedure's SET, an extension's own), which ends with that call and is not the
+ * session's choice. PostgreSQL's own rule, read from the stack top down: a saved level gives back its prior value; a
+ * SET LOCAL inside it (GUC_LOCAL) goes with it; a SET (GUC_SET, GUC_SET_LOCAL) outlives it, and is the session's. In
+ * the sixteenth cut a claim asserted through a SECURITY DEFINER function with SET search_path (yggdrasil's
+ * _afirmar) recorded that search_path as its author's, and the same proof, asserted from the author's session
+ * itself, meant something else: a true claim was refuted.
+ */
+static const char *
+session_value(const struct config_generic *g, GucSource *source, char *buf)
+{
+	const char *v = value_of(g, false, buf);
+
+	*source = g->source;
+	for (const GucStack *st = g->stack; st != NULL; st = st->prev)
+	{
+		if (st->state == GUC_SAVE)
+		{
+			v = prior_of(g, &st->prior, buf);
+			*source = st->source;
+		}
+		else if (st->state == GUC_SET || st->state == GUC_SET_LOCAL)
+			break;
+	}
+	return v;
+}
+
+/*
+ * May the author set this setting itself? (seventeenth review) A setting its session has that the author could not
+ * set (a superuser's session SET it, and the author is the owner of a SECURITY DEFINER function it called) is not the
+ * author's to have in its proof's session.
+ */
+static bool
+author_may_set(const struct config_generic *g, Oid author)
+{
+	if (g->context == PGC_USERSET)
+		return true;
+	return superuser_arg(author) || pg_parameter_aclcheck(g->name, author, ACL_SET) == ACLCHECK_OK;
 }
 
 static bool
@@ -364,7 +450,7 @@ recorded(const struct config_generic *g)
 }
 
 ArrayType *
-guard_env_now(void)
+guard_env_now(Oid author)
 {
 	int			n;
 	int			m = 0;
@@ -376,10 +462,13 @@ guard_env_now(void)
 	{
 		char		buf[64];
 		const char *v;
+		GucSource	source;
 
-		if (!recorded(vars[i]) || !session_made(vars[i]))
+		if (!recorded(vars[i]))
 			continue;
-		v = value_of(vars[i], false, buf);
+		v = session_value(vars[i], &source, buf);
+		if (!session_made(vars[i], source) || !author_may_set(vars[i], author))
+			continue;
 		items[m++] = psprintf("%s=%s", vars[i]->name, v ? v : "");
 	}
 	pfree(vars);
@@ -751,7 +840,7 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 				struct config_generic *rec = find_option(env->name[i], false, true, 0);
 
 				if (rec == NULL ? strchr(env->name[i], '.') != NULL : recorded(rec))
-					set_one(env->name[i], env->value[i]);
+					set_as_author(env->name[i], env->value[i], role);
 			}
 			break;
 		case GUARD_READER:

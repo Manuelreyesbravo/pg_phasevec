@@ -76,9 +76,10 @@ extern const char *guard_env_spent(char **base, int nbase, const GuardEnv *env);
 
 /*
  * The settings state a proof records: what this session changed over the configuration a new session of it starts
- * from (every replayable setting it set, every custom placeholder it made, its application_name).
+ * from (every replayable setting it set, every custom placeholder it made, its application_name), as the session has
+ * it (not what the SET clause of a function it is inside set for the call) and only what `author` may set itself.
  */
-extern ArrayType *guard_env_now(void);
+extern ArrayType *guard_env_now(Oid author);
 /* A recorded state, from its text[] (NULL: none recorded, every setting at its default). */
 extern GuardEnv *guard_env_from(ArrayType *arr);
 
