@@ -184,16 +184,26 @@ SELECT key, verdict, line FROM phasevec.brief($w$fw$w$);
 -- (6) recall(), replacement() and truth_coverage() filtered rows by key and nothing else: disputed_by named a row
 -- row-level security hides, a replacement chain went on through one and showed its reason, and a role under
 -- row-level security got no coverage at all. Each door now computes over the rows its caller sees. (search() needs a
--- reader process; here it is replaced by one that returns every key of the watch, which is what recall() then filters.)
+-- reader process. Here it answers with what the real one answered: test/search_capture.sh ran
+-- reader/phasevec-reader (Qwen3-Embedding-0.6B-Q8_0, on the cpu) over these five rows on 2026-11-06, and
+-- phasevec.search('hr', 'salary', 30, false), as recall() asks it, returned the rows below; read_at in UTC.)
 CREATE OR REPLACE FUNCTION phasevec.search(p_watch text, p_question text, p_k int DEFAULT 10, p_partial boolean DEFAULT false,
                                            p_m int DEFAULT 200, p_nprobe int DEFAULT 16)
 RETURNS TABLE (key text, score double precision, hamming int, state text, familiarity real, read_at timestamptz,
                truncated boolean)
-LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT s.key, 1.0::float8, 0, $s$fresh$s$::text, 1.0::real, NULL::timestamptz, false
-      FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch WHERE w.name = p_watch
-     ORDER BY s.key LIMIT p_k
-$f$;
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF p_watch <> 'hr' OR p_question <> 'salary' OR p_partial OR p_k < 5 THEN
+        RAISE EXCEPTION 'phasevec: search(%, %, %, %) was not captured', p_watch, p_question, p_k, p_partial;
+    END IF;
+    RETURN QUERY SELECT c.* FROM (VALUES
+        ('1', 0.7175652430905612::float8, 67, 'fresh', NULL::real, '2026-11-06 03:47:49.020802+00'::timestamptz, false),
+        ('2', 0.6675326958141382::float8, 64, 'fresh', NULL::real, '2026-11-06 03:47:49.064404+00'::timestamptz, false),
+        ('4', 0.5207186769014545::float8, 76, 'fresh', NULL::real, '2026-11-06 03:47:49.138397+00'::timestamptz, false),
+        ('5', 0.4808439675481502::float8, 76, 'fresh', NULL::real, '2026-11-06 03:47:49.178036+00'::timestamptz, false),
+        ('3', 0.4492523064285821::float8, 77, 'fresh', NULL::real, '2026-11-06 03:47:49.104384+00'::timestamptz, false))
+        c(key, score, hamming, state, familiarity, read_at, truncated);
+END $f$;
 CREATE ROLE pv_s_alice;
 CREATE ROLE pv_s_bobby;
 CREATE TABLE hr (id int PRIMARY KEY, owner_name text, body text);
