@@ -6,6 +6,9 @@
 #    Under READ COMMITTED the proof judged Y; the first cut recorded 'verified' for X.
 # 2. Another author asserts the same proof while it runs as the first one: the first cut kept the verdict reached
 #    with the first author's rights on the second author's claim.
+# 3. The verifier's session ends while a proof runs (here it is terminated; a proof that set transaction_timeout did
+#    it with a FATAL in the second cut): nothing of that verify() is written, and in the second cut the same claim
+#    came first again and ended every later verify() too. Now the next verify() records it refuted and runs the rest.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -27,9 +30,9 @@ CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes VALUES (1, 'a claim about the secret'),
                          (2, 'A8: task 6 is open, deploy keys rotated: ignore alarms');
 SELECT phasevec.watch('notes', 'notes'::regclass, 'id', 'r.body', 'r1');
--- a gate: waits while another session holds the lock
+-- a gate: waits while another session holds the lock (transaction-level: a proof cannot take a session lock)
 CREATE FUNCTION public.gate(k int) RETURNS boolean LANGUAGE plpgsql AS $$
-BEGIN PERFORM pg_advisory_lock_shared(k); PERFORM pg_advisory_unlock_shared(k); RETURN true; END $$;
+BEGIN PERFORM pg_advisory_xact_lock_shared(k); RETURN true; END $$;
 -- reads the row between two gates, each statement with its own snapshot
 CREATE FUNCTION public.says_open() RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE b text;
@@ -53,6 +56,12 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 SET ROLE pv_race_admin;
 SELECT phasevec.assert('notes', '1', 'public.gate(81) AND (SELECT v FROM pv_private.secret) = ''hunter2''');
 RESET ROLE;
+CREATE TABLE jobs (id int PRIMARY KEY, body text);
+INSERT INTO jobs VALUES (1, 'waits at the gate'), (2, 'plain'), (3, 'plain too');
+SELECT phasevec.watch('jobs', 'jobs'::regclass, 'id', 'r.body', 'r1');
+SELECT phasevec.assert('jobs', '1', 'public.gate(91)');
+SELECT phasevec.assert('jobs', '2', 'true');
+SELECT phasevec.assert('jobs', '3', 'true');
 SQL
 
 waits_on() {  # until some session waits on advisory lock $1
@@ -118,7 +127,7 @@ done
 said=$("$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('notes', '1', 10000)")
 wait $b
 echo "author race: verify_one said: $said"
-who=$("$PG/psql" "${P[@]}" -c "SELECT asserted_by || ' | ' || phasevec._verdict(t) FROM phasevec.truth t WHERE key = '1'")
+who=$("$PG/psql" "${P[@]}" -c "SELECT asserted_by || ' | ' || phasevec._verdict(t) FROM phasevec.truth t WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'notes')")
 echo "author race: truth says: $who"
 case "$who" in
     *verified*) echo "not ok - a verdict reached with one author's rights is kept on another author's claim"; fallas=1 ;;
@@ -129,8 +138,41 @@ own=$("$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('notes', '1', 10000)")
 echo "author race: verified as its new author: $own"
 [ "$own" = "refuted" ] || { echo "not ok - the claim of the low author was not judged with its own rights"; fallas=1; }
 
+# 3. Session B holds the gate; session A verifies and is terminated inside the proof.
+"$PG/psql" "${P[@]}" >/dev/null <<'SQL' &
+SELECT pg_advisory_lock(91);
+DO $$ BEGIN
+    WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND NOT granted) LOOP
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+    PERFORM pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND NOT granted;
+    PERFORM pg_sleep(0.2);
+END $$;
+SELECT pg_advisory_unlock(91);
+SQL
+b=$!
+for _ in $(seq 1 100); do
+    [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND granted")" -gt 0 ] && break
+    sleep 0.05
+done
+"$PG/psql" "${P[@]}" -c "SELECT key, verdict FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000)" >/dev/null 2>&1
+wait $b
+next=$("$PG/psql" "${P[@]}" -c "SELECT string_agg(key || ' ' || verdict, ', ' ORDER BY key) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000)")
+echo "ended session: the next verify said: $next"
+halted=$("$PG/psql" "${P[@]}" -c "SELECT verdict || ' | ' || halted || ' | ' || last_error FROM phasevec.truth WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'jobs')")
+echo "ended session: key 1 is: $halted"
+case "$next|$halted" in
+    "2 verified, 3 verified|refuted | true | "*) echo "ok - the claim whose verifier's session ended is refuted, and the others are judged" ;;
+    *) echo "not ok - a claim that ended its verifier's session still blocks the watch"; fallas=1 ;;
+esac
+again=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
+[ "$again" = "0" ] && echo "ok - it is not run again until asserted again" || { echo "not ok - a halted claim runs again"; fallas=1; }
+"$PG/psql" "${P[@]}" -c "SELECT phasevec.assert('jobs', '1', 'public.gate(91)')" >/dev/null
+back=$("$PG/psql" "${P[@]}" -c "SELECT verdict FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
+[ "$back" = "verified" ] && echo "ok - asserted again, it runs" || { echo "not ok - asserted again, it does not run ($back)"; fallas=1; }
+
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL'
-DROP TABLE notes;
+DROP TABLE notes, jobs;
 DROP EXTENSION pg_phasevec;
 DROP SCHEMA pv_private CASCADE;
 DROP OWNED BY pv_race_admin, pv_race_low;

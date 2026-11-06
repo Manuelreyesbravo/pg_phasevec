@@ -46,7 +46,7 @@ SELECT phasevec._truth_set(:notes_id, $k$1$k$, true, NULL,
        (SELECT bound FROM phasevec._truth_of(:notes_id, $k$1$k$))) AS forged;
 -- the internals of this version, even granted, write and read nothing: they carry no rights of their own
 SELECT key FROM phasevec._truth_due(:notes_id, 100, interval $i$0$i$, $r$pv_admin$r$::regrole::oid);
-SELECT phasevec._truth_set(:notes_id, $k$1$k$, $v$verified$v$, NULL, NULL, NULL, NULL);
+SELECT phasevec._truth_set(:notes_id, $k$1$k$, $v$verified$v$, NULL, NULL);
 RESET ROLE;
 SELECT key, verdict, phasevec._verdict(t) AS now FROM phasevec.truth t WHERE key = $k$1$k$;
 SELECT phasevec.verify_one($w$notes$w$, $k$1$k$) AS real_verdict;
@@ -63,8 +63,9 @@ ALTER ROLE pv_admin RENAME TO pv_low;
 SELECT phasevec.verify_one($w$notes$w$, $k$2$k$);
 SELECT key, verdict, last_error FROM phasevec.truth WHERE key = $k$2$k$;
 ALTER ROLE pv_low RENAME TO pv_admin;
--- the owner adopts it: asserted again as the owner, about the text it reads now
-SELECT phasevec.adopt($w$notes$w$) AS adopted;
+-- the owner adopts it, naming the author: a superuser only for the keys it names (test/sql/truth_guard.sql)
+SELECT key, proof, former_author, adopted, note FROM phasevec.adopt($w$notes$w$, current_user::regrole);
+SELECT key, former_author, adopted, note FROM phasevec.adopt($w$notes$w$, current_user::regrole, p_superuser_keys => ARRAY[$k$2$k$]);
 SELECT key, asserted_by = current_user AS by_owner, phasevec.verify_one($w$notes$w$, key) FROM phasevec.truth WHERE key = $k$2$k$;
 
 DROP TABLE notes;

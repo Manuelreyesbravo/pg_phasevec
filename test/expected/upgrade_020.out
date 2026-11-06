@@ -78,13 +78,18 @@ SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$
    0
 (1 row)
 
--- the owner adopts them (asserts them again, as itself, about the text it reads now); then they run, bound
-SELECT phasevec.adopt($w$notes$w$) AS adopted;
- adopted 
----------
-       2
-(1 row)
+-- adopt() names their author; granted, the author adopts them itself (every proof comes back); then they run as
+-- it, bound
+GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv_up_asker;
+SET ROLE pv_up_asker;
+SELECT key, proof, adopted, note FROM phasevec.adopt($w$notes$w$, $r$pv_up_asker$r$) ORDER BY key;
+ key |    proof     | adopted |  note   
+-----+--------------+---------+---------
+ 1   | SELECT true  | t       | adopted
+ 2   | SELECT false | t       | adopted
+(2 rows)
 
+RESET ROLE;
 SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
  key | verdict  
 -----+----------
@@ -92,12 +97,12 @@ SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i
  2   | refuted
 (2 rows)
 
-SELECT key, verdict, asserted_by = current_user AS by_owner, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
- key | verdict  | by_owner | bound 
------+----------+----------+-------
- 1   | verified | t        | t
- 2   | refuted  | t        | t
- 3   | replaced |          | f
+SELECT key, verdict, asserted_by, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
+ key | verdict  | asserted_by | bound 
+-----+----------+-------------+-------
+ 1   | verified | pv_up_asker | t
+ 2   | refuted  | pv_up_asker | t
+ 3   | replaced |             | f
 (3 rows)
 
 -- the grant on assert() survives its new body; the internals are closed to PUBLIC

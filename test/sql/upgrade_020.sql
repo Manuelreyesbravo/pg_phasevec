@@ -27,10 +27,14 @@ SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
 -- naming an author by hand is not enough: a claim is also the text its author read
 UPDATE phasevec.truth SET asserted_by = current_user WHERE asserted_by IS NULL AND proof IS NOT NULL;
 SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$);
--- the owner adopts them (asserts them again, as itself, about the text it reads now); then they run, bound
-SELECT phasevec.adopt($w$notes$w$) AS adopted;
+-- adopt() names their author; granted, the author adopts them itself (every proof comes back); then they run as
+-- it, bound
+GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv_up_asker;
+SET ROLE pv_up_asker;
+SELECT key, proof, adopted, note FROM phasevec.adopt($w$notes$w$, $r$pv_up_asker$r$) ORDER BY key;
+RESET ROLE;
 SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
-SELECT key, verdict, asserted_by = current_user AS by_owner, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
+SELECT key, verdict, asserted_by, verified_for IS NOT NULL AS bound FROM phasevec.truth ORDER BY key;
 
 -- the grant on assert() survives its new body; the internals are closed to PUBLIC
 SELECT has_function_privilege($r$pv_up_asker$r$, $f$phasevec.assert(text, text, text, text, jsonb, timestamptz)$f$, $x$EXECUTE$x$) AS asker_asserts,

@@ -66,7 +66,8 @@ SELECT phasevec.verify_one($w$notes$w$, $k$1$k$, 5000, 1e6);
 RESET statement_timeout;
 SELECT 1 AS alive;
 
--- (d) a session advisory lock taken by a proof does not stay with the verifier
+-- (d) a session advisory lock taken by a proof does not stay with the verifier: since 0.20.0 a proof cannot take
+-- one (it would outlive the proof), and the verifier's own stay held (test/sql/truth_guard.sql)
 SET ROLE pv_author;
 SELECT phasevec.assert($w$notes$w$, $k$7$k$, $p$pg_advisory_lock(4242) IS NOT NULL$p$);
 RESET ROLE;

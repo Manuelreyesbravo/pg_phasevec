@@ -34,23 +34,64 @@
 --    the first cut _note() with a NULL hash did the same for whoever was granted _note(). _note() is C now and
 --    refuses a caller that does not write the watch's own table; _forget() is the owner's.
 -- 7. _brief_keys() is SECURITY DEFINER and was executable by PUBLIC: any role with USAGE on the schema read the
---    keys, verdicts, usefulness and recipes of every watch. It and brief() are granted together, by the owner.
+--    keys, verdicts, usefulness and recipes of every watch. It is the owner's; brief() is granted by the owner.
+--
+-- Then a second adversarial review ran attacks against that second cut (also never released), and they come from
+-- one root: phasevec ran code that was not its own (the recipe, the proof) in more than one way, and in some of them
+-- with the rights or the settings of whoever happened to call it. Now there is one guard (src/phasevec_guard.c):
+--
+-- 8. brief() ran the recipe as its caller with full rights, outside the read-only, security-restricted guard of
+--    assert() and verify(): a table owner swapped a column's type for one whose cast was its own code, and a
+--    superuser reading the brief made it superuser. A recipe now renders as the table's OWNER (as PostgreSQL runs an
+--    index expression in VACUUM or REINDEX), in the guard, everywhere: the watch trigger, assert, verify, brief,
+--    next, lexical, audit_sample, watch. Who may read the text is the reader's own right (SELECT on the table; with
+--    row-level security, the rows it sees, found as the reader).
+-- 9. The text and the proof depended on the session's settings: a writer in another TimeZone (or DateStyle) made an
+--    edited row print as the text its author had vouched for, and it was served 'verified'; a verifier in another
+--    DateStyle read the author's '01/11/2026' as 11 January and recorded 'verified' for a row the proof, as written,
+--    refutes. A recipe renders in pinned settings (DateStyle ISO, TimeZone UTC, extra_float_digits 1, bytea_output
+--    hex, search_path pg_catalog, pg_temp, lc_* C, ...), so every reader reads one text; a claim records its
+--    author's settings (truth.proof_env) and its proof runs with them, so it means what it meant to its author.
+-- 10. A proof could change the verifier's session for good: set transaction_timeout and end the verifier's
+--    connection with a FATAL before any verdict was written (every later verify() of the watch died the same way);
+--    release the verifier's own session advisory locks; reseed its random(). In the guard the timeouts cannot be
+--    changed, and the functions that change the session past a rollback cannot be called. A proof whose verifier's
+--    session ends anyway is refuted by the next verify() of the watch, and not run again until asserted again.
+-- 11. adopt() made its caller (usually the superuser owner) the author of any orphaned proof, unseen; a role could
+--    orphan its own proof on purpose to have it adopted. adopt() now names the author, needs its privileges, works
+--    granted and after SET ROLE, returns every proof with its former author, and makes a superuser the author of a
+--    key only when that key is named.
+-- 12. recall(), disputes(), replacement() and truth_coverage() showed every watch's keys, verdicts, topics, reasons
+--    and support to any role with USAGE on the schema. They are one C door now: a watch is shown only to a role that
+--    may SELECT its table (and with row-level security, only the keys of the rows it sees).
+-- 13. _note() checked that its caller wrote the watched table at all: a writer limited by row-level security, or
+--    with UPDATE on one unrelated column, forged, invented or forgot every key of the watch. The watch trigger is C
+--    now and renders the row it fires for; _note() is gone.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
-                           ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea;
+                           ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
+                           ADD COLUMN proof_env text[], ADD COLUMN halted boolean NOT NULL DEFAULT false;
 COMMENT ON COLUMN phasevec.truth.asserted_by IS
     $q$The name of the role that asserted the proof, when it did (0.20.0). With asserted_by_oid: the proof runs as that role only while the OID still has this name.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by_oid IS
     $q$The role that asserted the proof (0.20.0): the proof runs with its rights. NULL for a proof asserted before 0.20.0, which does not run until asserted again (phasevec.adopt).$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_for IS
-    $q$What the author vouched for (0.20.0): sha256 of the row's text, read through the recipe with the author's rights when it asserted. NULL when there was no row.$q$;
+    $q$What the author vouched for (0.20.0): sha256 of the row's text as the recipe renders it (as the table's owner, in pinned settings) when it asserted. NULL when there was no row it could see.$q$;
 COMMENT ON COLUMN phasevec.truth.verified_for IS
-    $q$What the verdict judged (0.20.0): sha256 of asserted_for, the proof and the author. A 'verified' that does not match the claim, or whose text is not the row's, reads 'unproven'.$q$;
+    $q$What the verdict judged (0.20.0): phasevec._bind of the claim (asserted_for, proof, author, proof_env). A 'verified' that does not match the claim, or whose text is not the row's, reads 'unproven'.$q$;
+COMMENT ON COLUMN phasevec.truth.proof_env IS
+    $q$The author's settings when it asserted ("name=value": DateStyle, TimeZone, search_path, ...): the proof runs with them (0.20.0).$q$;
+COMMENT ON COLUMN phasevec.truth.halted IS
+    $q$The verifier's session ended while this proof ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
 
--- A verdict judges (text, proof, author): fixed-size text hash, then the proof, then the author's OID.
-CREATE FUNCTION phasevec._bind(p_text_hash bytea, p_proof text, p_author oid)
+-- A verdict judges (text, proof, author, the author's settings). Every part is framed, so no two claims read alike.
+CREATE FUNCTION phasevec._bind(p_text_hash bytea, p_proof text, p_author oid, p_env text[])
 RETURNS bytea LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT sha256(p_text_hash || convert_to(coalesce(p_proof, $q$$q$), $q$UTF8$q$) || int8send(p_author::bigint))
+    SELECT sha256(CASE WHEN p_text_hash IS NULL THEN $q$\x00$q$::bytea ELSE $q$\x01$q$::bytea || p_text_hash END
+                  || int8send(coalesce(p_author, 0)::bigint)
+                  || int4send(octet_length(convert_to(coalesce(p_proof, $q$$q$), $q$UTF8$q$)))
+                  || convert_to(coalesce(p_proof, $q$$q$), $q$UTF8$q$)
+                  || convert_to(coalesce(array_to_string(p_env, chr(10), $q$$q$), $q$$q$), $q$UTF8$q$))
 $f$;
 
 -- The truth a key has NOW. 'verified' only for the claim it judged, and only while the row's text, as the watch
@@ -61,15 +102,16 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 WHEN t.expires_at IS NOT NULL AND t.expires_at <= now() THEN $q$expired$q$
                 WHEN t.verdict = $q$verified$q$
                  AND (t.verified_for IS NULL
-                      OR t.verified_for IS DISTINCT FROM phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid)
+                      OR t.verified_for IS DISTINCT FROM phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid,
+                                                                        t.proof_env)
                       OR t.asserted_for IS DISTINCT FROM (SELECT s.text_hash FROM phasevec.sources s
                                                           WHERE s.watch = t.watch AND s.key = t.key))
                 THEN $q$unproven$q$
                 ELSE t.verdict END
 $f$;
 
--- A row whose text changes away from what was judged loses its verdict, verified or refuted. Runs inside _note()
--- (as the owner).
+-- A row whose text changes away from what was judged loses its verdict, verified or refuted. Runs inside the watch
+-- trigger's write to phasevec.sources (as the owner).
 CREATE FUNCTION phasevec._truth_text_changed() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 BEGIN
@@ -87,21 +129,22 @@ $f$;
 CREATE TRIGGER truth_text_changed AFTER INSERT OR UPDATE OF text_hash ON phasevec.sources
     FOR EACH ROW EXECUTE FUNCTION phasevec._truth_text_changed();
 
--- assert(): the same signature and grants; now C (src/phasevec_truth.c): it sees who calls it and reads the row
--- with that role's rights. It writes through _assert_set, as the owner.
+-- assert(): the same signature and grants; now C (src/phasevec_truth.c): it sees who calls it, renders the row as
+-- the table's owner in pinned settings, records the caller's settings, and writes through _assert_set, as the owner.
 CREATE FUNCTION phasevec._assert_set(p_watch text, p_key text, p_proof text, p_topic text, p_support jsonb,
-                                     p_expires_at timestamptz, p_author oid, p_text_hash bytea)
+                                     p_expires_at timestamptz, p_author oid, p_text_hash bytea, p_env text[])
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
 BEGIN
     INSERT INTO phasevec.truth AS t (watch, key, proof, topic, support, expires_at,
-                                     asserted_by, asserted_by_oid, asserted_for)
+                                     asserted_by, asserted_by_oid, asserted_for, proof_env)
     VALUES (w.id, p_key, p_proof, p_topic, p_support, p_expires_at,
-            pg_get_userbyid(p_author), p_author, p_text_hash)
+            pg_get_userbyid(p_author), p_author, p_text_hash, p_env)
     ON CONFLICT (watch, key) DO UPDATE
        SET proof = EXCLUDED.proof, topic = EXCLUDED.topic, support = EXCLUDED.support,
            expires_at = EXCLUDED.expires_at, asserted_by = EXCLUDED.asserted_by,
            asserted_by_oid = EXCLUDED.asserted_by_oid, asserted_for = EXCLUDED.asserted_for,
+           proof_env = EXCLUDED.proof_env, halted = false,
            verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$unproven$q$ END,
            verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now();
 END;
@@ -124,7 +167,7 @@ BEGIN
             (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = w.id AND s.key = p_key))
     ON CONFLICT (watch, key) DO UPDATE
        SET verdict = $q$refuted$q$, verified_at = now(), last_error = p_reason, changed_at = now(),
-           verified_for = phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid)
+           verified_for = phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
      WHERE t.verdict <> $q$replaced$q$;
 END;
 $f$;
@@ -134,53 +177,64 @@ $f$;
 -- The C side passes the caller's OID, which a caller cannot choose.
 --
 -- The due proofs p_verifier may run, oldest first; a proof whose author is gone (no role with that OID and name)
--- is due for anyone: what verify() records for it is 'unproven'.
+-- is due for anyone: what verify() records for it is 'unproven'. A halted claim is not due.
 DROP FUNCTION phasevec._truth_due(int, int, interval);
 CREATE FUNCTION phasevec._truth_due(p_watch int, p_n int, p_every interval, p_verifier oid)
-RETURNS TABLE (key text, proof text, author oid, author_known boolean, asserted_for bytea)
+RETURNS TABLE (key text, proof text, author oid, author_known boolean, asserted_for bytea, env text[], bind bytea)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT t.key, t.proof, t.asserted_by_oid, r.oid IS NOT NULL, t.asserted_for
+    SELECT t.key, t.proof, t.asserted_by_oid, r.oid IS NOT NULL, t.asserted_for, t.proof_env,
+           phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
      WHERE t.watch = p_watch AND t.proof IS NOT NULL AND t.verdict <> $q$replaced$q$
-       AND t.asserted_by_oid IS NOT NULL
+       AND t.asserted_by_oid IS NOT NULL AND NOT t.halted
        AND (t.verified_at IS NULL OR t.verified_at < now() - p_every)
        AND (r.oid IS NULL OR pg_catalog.pg_has_role(p_verifier, r.oid, $q$USAGE$q$))
      ORDER BY t.verified_at NULLS FIRST, t.key
      LIMIT p_n
 $f$;
 
--- One key's claim (verify_one); no row when it has no proof or was replaced.
+-- One key's claim (verify_one, which runs a halted claim too: it was asked for); no row when it has no proof or was
+-- replaced.
 CREATE FUNCTION phasevec._truth_of(p_watch int, p_key text)
-RETURNS TABLE (key text, proof text, author oid, author_known boolean, asserted_for bytea)
+RETURNS TABLE (key text, proof text, author oid, author_known boolean, asserted_for bytea, env text[], bind bytea)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT t.key, t.proof, t.asserted_by_oid, r.oid IS NOT NULL, t.asserted_for
+    SELECT t.key, t.proof, t.asserted_by_oid, r.oid IS NOT NULL, t.asserted_for, t.proof_env,
+           phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
      WHERE t.watch = p_watch AND t.key = p_key AND t.proof IS NOT NULL AND t.verdict <> $q$replaced$q$
 $f$;
 
--- Record what a proof's run found, only for the claim it judged: the same proof, the same author, and (for a
--- verdict) the same asserted text. Anything else changed meanwhile: nothing is recorded. p_outcome NULL records
--- nothing (the row moved while the proof ran). Returns the verdict as it reads now.
+-- Record what a proof's run found, only for the claim it judged (p_bind: the same text, proof, author and settings).
+-- Anything else changed meanwhile: nothing is recorded. p_outcome NULL records nothing (the row moved while the
+-- proof ran). Returns the verdict as it reads now.
 DROP FUNCTION phasevec._truth_set(int, text, boolean, text);
-CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_error text, p_text_hash bytea,
-                                    p_proof text, p_author oid)
+CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_error text, p_bind bytea)
 RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE v text;
 BEGIN
     IF p_outcome IS NOT NULL THEN
         UPDATE phasevec.truth t
-           SET verdict = p_outcome, verified_at = now(), last_error = p_error,
-               verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$)
-                                   THEN phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid) END
+           SET verdict = p_outcome, verified_at = now(), last_error = p_error, halted = false,
+               verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
-           AND t.proof IS NOT DISTINCT FROM p_proof AND t.asserted_by_oid IS NOT DISTINCT FROM p_author
-           AND (p_outcome = $q$unproven$q$ OR t.asserted_for = p_text_hash);
+           AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     END IF;
     SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
     RETURN v;
 END;
+$f$;
+
+-- A claim whose verifier's session ended while its proof ran (src/phasevec_truth.c keeps the mark in shared memory;
+-- the next verify() of the watch finds it): refuted, and not due again until asserted again.
+CREATE FUNCTION phasevec._truth_halted(p_watch int, p_bind bytea)
+RETURNS void LANGUAGE sql SET search_path = pg_catalog, pg_temp AS $f$
+    UPDATE phasevec.truth t
+       SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
+           last_error = $q$the verifier's session ended while this proof ran: not run again until it is asserted again$q$
+     WHERE t.watch = p_watch AND t.verdict <> $q$replaced$q$
+       AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
 $f$;
 
 -- verify() and verify_one(): the same signatures and grants; now C. See src/phasevec_truth.c.
@@ -197,30 +251,15 @@ RETURNS text AS $q$MODULE_PATHNAME$q$, $q$phasevec_verify_one$q$ LANGUAGE C VOLA
 DROP FUNCTION phasevec._prove_c(text, int, float8);
 
 -- Proofs asserted before 0.20.0 have no author, and after a restore into another cluster (or a DROP ROLE) an author
--- OID may name no role, or another one. adopt() asserts every such proof of a watch again AS THE CALLER (it becomes
--- their author, and they are bound to the text the caller reads now). The owner runs it, as itself or after SET
--- ROLE to the role that should own them. Replaced keys are left as they are.
-CREATE FUNCTION phasevec.adopt(p_watch text) RETURNS int
-LANGUAGE plpgsql AS $f$
-DECLARE
-    w phasevec.watches := phasevec._watch(p_watch);
-    t record;
-    n int := 0;
-BEGIN
-    FOR t IN SELECT x.key, x.proof, x.topic, x.support, x.expires_at FROM phasevec.truth x
-              WHERE x.watch = w.id AND x.proof IS NOT NULL AND x.verdict OPERATOR(pg_catalog.<>) $q$replaced$q$
-                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
-                                 WHERE r.oid OPERATOR(pg_catalog.=) x.asserted_by_oid
-                                   AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by)
-              ORDER BY x.key LOOP
-        PERFORM phasevec.assert(p_watch, t.key, t.proof, t.topic, t.support, t.expires_at);
-        n := n OPERATOR(pg_catalog.+) 1;
-    END LOOP;
-    RETURN n;
-END;
-$f$;
-COMMENT ON FUNCTION phasevec.adopt(text) IS
-    $q$Asserts again, as the caller, every proof of a watch whose author is unknown (asserted before 0.20.0) or gone. Owner only.$q$;
+-- OID may name no role, or another one. adopt() asserts such proofs again in the name of the author it is given
+-- (C, src/phasevec_truth.c): the caller must hold that role's privileges, every proof comes back with its former
+-- author, and a superuser becomes the author only of the keys named in p_superuser_keys. Replaced keys are left.
+CREATE FUNCTION phasevec.adopt(p_watch text, p_author regrole, p_keys text[] DEFAULT NULL,
+                               p_superuser_keys text[] DEFAULT NULL)
+RETURNS TABLE (key text, proof text, former_author text, adopted boolean, note text)
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_adopt$q$ LANGUAGE C VOLATILE;
+COMMENT ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) IS
+    $q$Asserts again, in the name of p_author (the caller must hold its privileges), the proofs of a watch whose author is unknown (asserted before 0.20.0) or gone; returns each one. A superuser becomes the author only of keys named in p_superuser_keys. Owner only, or granted.$q$;
 
 -- Verdicts reached before 0.20.0 were reached with the verifier's rights and about no claim: a 'verified' is not
 -- carried over (back to unproven, with the reason in last_error). A 'refuted' stays refuted, about the row's text
@@ -233,26 +272,25 @@ UPDATE phasevec.truth t SET asserted_for = s.text_hash
   FROM phasevec.sources s
  WHERE s.watch = t.watch AND s.key = t.key AND t.verdict = $q$refuted$q$;
 
--- 6. The watch trigger notes and forgets through _note(), now C: it passes its caller to _note_set, which refuses a
--- role that does not write the watch's table. A NULL hash forgets the key.
-CREATE FUNCTION phasevec._note_set(p_watch int, p_key text, p_hash bytea, p_body text, p_writer oid)
+-- ------------------------------------------------------------------------------------------ rendering a row --
+-- 8, 9, 13. One way to read a watched row's text: phasevec._render() (C), the recipe as the table's owner in the
+-- guard and the pinned settings, for a caller that may SELECT the table (and its rows, with row-level security).
+CREATE FUNCTION phasevec._render(p_watch text, p_keys text[])
+RETURNS TABLE (key text, body text, text_hash bytea)
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_render$q$ LANGUAGE C STABLE;
+COMMENT ON FUNCTION phasevec._render(text, text[]) IS
+    $q$The rows of a watch (p_keys NULL: all) as its recipe renders them: as the table's owner, read-only and security-restricted, in pinned settings. For a caller that may SELECT the table (0.20.0).$q$;
+
+-- The watch trigger's write, as the owner: notes a key's text (lexemes too), or with a NULL hash forgets the key.
+CREATE FUNCTION phasevec._note_set(p_watch int, p_key text, p_hash bytea, p_body text)
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
-    src regclass;
     cfg regconfig;
     lx  tsvector;
 BEGIN
-    IF pg_trigger_depth() = 0 THEN
-        RAISE EXCEPTION 'phasevec: _note() is called by a watch trigger, not directly';
-    END IF;
-    SELECT w.source, w.lexical INTO src, cfg FROM phasevec.watches w WHERE w.id = p_watch;
+    SELECT w.lexical INTO cfg FROM phasevec.watches w WHERE w.id = p_watch;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'phasevec: no watch %', p_watch;
-    END IF;
-    IF NOT (has_table_privilege(p_writer, src, 'INSERT, UPDATE, DELETE')
-            OR has_any_column_privilege(p_writer, src, 'INSERT, UPDATE')) THEN
-        RAISE EXCEPTION 'phasevec: role % does not write %, so it may not note its rows',
-            pg_get_userbyid(p_writer), src;
     END IF;
     IF p_hash IS NULL THEN
         DELETE FROM phasevec.sources WHERE watch = p_watch AND key = p_key;
@@ -272,47 +310,122 @@ BEGIN
     PERFORM pg_notify('phasevec', p_watch::text);
 END;
 $$;
-CREATE OR REPLACE FUNCTION phasevec._note(p_watch int, p_key text, p_hash bytea, p_body text)
-RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_note$q$ LANGUAGE C VOLATILE;
 
-CREATE OR REPLACE FUNCTION phasevec._observe()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
+-- The watch trigger: C. Same name, so every trigger already installed (phasevec_watch_<id>) keeps working.
+CREATE OR REPLACE FUNCTION phasevec._observe() RETURNS trigger
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_observe$q$ LANGUAGE C;
+DROP FUNCTION phasevec._note(int, text, bytea, text);
+
+CREATE OR REPLACE FUNCTION phasevec.next(p_watch text, p_limit integer DEFAULT 64)
+RETURNS TABLE(key text, body text, text_hash bytea)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT x.key, x.body, x.text_hash
+      FROM phasevec._render(p_watch, ARRAY(SELECT t.key FROM phasevec._todo(p_watch, p_limit) t)) x
+$f$;
+
+CREATE OR REPLACE FUNCTION phasevec.audit_sample(p_watch text, p_n integer)
+RETURNS TABLE(key text, body text, text_hash bytea, code smallint[], code256 bit)
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE
-    old_key text;
-    new_key text;
-    body    text;
+    w phasevec.watches := phasevec._watch(p_watch);
 BEGIN
-    IF TG_OP IN ('UPDATE', 'DELETE') THEN
-        EXECUTE format('SELECT ($1).%I::text', TG_ARGV[1]) INTO old_key USING OLD;
-    END IF;
-    IF TG_OP IN ('INSERT', 'UPDATE') THEN
-        EXECUTE format('SELECT r.%I::text, (%s)::text FROM (SELECT ($1).*) r', TG_ARGV[1], TG_ARGV[2])
-           INTO new_key, body USING NEW;
-    END IF;
-    IF old_key IS NOT NULL AND old_key IS DISTINCT FROM new_key THEN
-        PERFORM phasevec._note(TG_ARGV[0]::int, old_key, NULL, NULL);
-    END IF;
-    IF new_key IS NOT NULL THEN
-        PERFORM phasevec._note(TG_ARGV[0]::int, new_key,
-                             sha256(convert_to(coalesce(body, ''), 'UTF8')), body);
-    END IF;
-    RETURN NULL;
+    RETURN QUERY
+    WITH cand AS (
+        SELECT rd.key, rd.text_hash, rd.code, rd.code256
+          FROM phasevec.readings rd
+          JOIN phasevec.kstate k ON k.watch = rd.watch AND k.key = rd.key AND k.main IN ('fresh', 'doubtful')
+         WHERE rd.watch = w.id AND rd.reader = w.reader AND rd.failed IS NULL)
+    SELECT c.key, x.body, c.text_hash, c.code, c.code256
+      FROM cand c
+      JOIN phasevec._render(p_watch, ARRAY(SELECT cand.key FROM cand)) x ON x.key = c.key
+     ORDER BY md5(c.key || clock_timestamp()::text) LIMIT p_n;
 END;
-$$;
+$f$;
 
--- 7. brief(): a key reads 'verified' only if the line served is the text the verdict judged, as it is read now with
--- the caller's rights. _brief_keys() gives, for a verified key, the hash of that text (judged).
+CREATE OR REPLACE FUNCTION phasevec.lexical(p_watch text, p_config regconfig)
+RETURNS bigint LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+    w    phasevec.watches := phasevec._watch(p_watch);
+    x    record;
+    n    bigint := 0;
+BEGIN
+    IF NOT pg_has_role(current_user, (SELECT c.relowner FROM pg_class c WHERE c.oid = w.source), 'USAGE') THEN
+        RAISE EXCEPTION 'phasevec: only the owner of % may change how watch % is read', w.source, p_watch;
+    END IF;
+    UPDATE phasevec.watches SET lexical = p_config WHERE id = w.id;
+    IF p_config IS NULL THEN
+        UPDATE phasevec.sources SET lexemes = NULL, lexeme_n = NULL WHERE watch = w.id AND lexemes IS NOT NULL;
+        DELETE FROM phasevec.lexstats WHERE watch = w.id;
+        DELETE FROM phasevec.lexdocs WHERE watch = w.id;
+        RETURN 0;
+    END IF;
+    FOR x IN SELECT r.key, r.body, r.text_hash FROM phasevec._render(p_watch, NULL) r LOOP
+        UPDATE phasevec.sources s
+           SET lexemes = l.lx, lexeme_n = length(l.lx)
+          FROM (SELECT phasevec._lexemes(p_config, x.body) AS lx) l
+         WHERE s.watch = w.id AND s.key = x.key AND s.text_hash = x.text_hash;
+        IF FOUND THEN
+            n := n + 1;
+        END IF;
+    END LOOP;
+    PERFORM phasevec.lexical_refresh(p_watch);
+    RETURN n;
+END;
+$f$;
+
+CREATE OR REPLACE FUNCTION phasevec.watch(p_name text, p_source regclass, p_key name, p_recipe text, p_reader text,
+                                          p_min_coverage numeric DEFAULT 0.95, p_doubt_below real DEFAULT NULL::real)
+RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+    tbl_owner oid;
+    rid       int;
+    wid       int;
+BEGIN
+    SELECT c.relowner INTO tbl_owner FROM pg_class c WHERE c.oid = p_source AND c.relkind IN ('r', 'p');
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'phasevec: % is not a table', p_source;
+    END IF;
+    IF NOT pg_has_role(current_user, tbl_owner, 'USAGE') THEN
+        RAISE EXCEPTION 'phasevec: a watch is a trigger on %, so only its owner may create one', p_source;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = p_source AND a.attname = p_key
+                   AND a.attnum > 0 AND NOT a.attisdropped) THEN
+        RAISE EXCEPTION 'phasevec: % has no column %', p_source, p_key;
+    END IF;
+    SELECT id INTO rid FROM phasevec.readers WHERE name = p_reader;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'phasevec: no reader named %', p_reader
+            USING HINT = 'Register it with phasevec.reader_register(); nothing is read without a sealed reader.';
+    END IF;
+
+    INSERT INTO phasevec.watches (name, source, key_col, recipe, reader, min_coverage, doubt_below)
+    VALUES (p_name, p_source, p_key, p_recipe, rid, p_min_coverage, p_doubt_below)
+    RETURNING id INTO wid;
+    -- The recipe must be an expression over the row, aliased r; it is read as every reader reads it (0.20.0).
+    PERFORM 1 FROM phasevec._render(p_name, ARRAY[]::text[]);
+
+    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s '
+                   'FOR EACH ROW EXECUTE FUNCTION phasevec._observe(%L, %L, %L)',
+                   'phasevec_watch_' || wid, p_source, wid, p_key, p_recipe);
+
+    -- Every row already there is noted, so it is pending until read -- not invisible.
+    INSERT INTO phasevec.sources (watch, key, text_hash)
+    SELECT wid, x.key, x.text_hash FROM phasevec._render(p_name, NULL) x;
+    RETURN wid;
+END;
+$f$;
+
+-- ---------------------------------------------------------------------------------- the doors to verdicts --
+-- 7, 8. brief(): C. It shows a watch only to a role that may SELECT its table; each line is the row's text as the
+-- recipe renders it (as the table's owner, in the guard); a key reads 'verified' only if that line is the text its
+-- verdict judged. _brief_keys() is its internal, the owner's.
 DROP FUNCTION phasevec._brief_keys(text);
 CREATE FUNCTION phasevec._brief_keys(p_watch text)
-RETURNS TABLE (key text, verdict text, net_use bigint, seen timestamptz, src regclass, key_col name, recipe text,
-               judged bytea)
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+RETURNS TABLE (key text, verdict text, net_use bigint, seen timestamptz, judged bytea)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT s.key, coalesce(phasevec._verdict(t), $q$unproven$q$),
            coalesce(u.helped, 0) - coalesce(u.not_helped, 0),
-           coalesce(t.verified_at, t.changed_at), w.source, w.key_col, w.recipe,
+           coalesce(t.verified_at, t.changed_at),
            CASE WHEN phasevec._verdict(t) = $q$verified$q$ THEN t.asserted_for END
       FROM phasevec.watches w
       JOIN phasevec.sources s ON s.watch = w.id
@@ -326,43 +439,116 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f
 $f$;
 CREATE OR REPLACE FUNCTION phasevec.brief(p_watch text, p_budget int DEFAULT 8000)
 RETURNS TABLE (key text, verdict text, net_use bigint, line text)
-LANGUAGE plpgsql STABLE AS $f$
-DECLARE
-    r    record;
-    used int := 0;
-BEGIN
-    IF p_budget IS NULL OR p_budget < 1 THEN
-        RAISE EXCEPTION $q$phasevec: a brief needs a positive budget$q$;
-    END IF;
-    FOR r IN SELECT * FROM phasevec._brief_keys(p_watch) LOOP
-        EXIT WHEN used >= p_budget;   -- full: reading the rest of a large watch would serve nothing
-        EXECUTE pg_catalog.format($q$SELECT (%s)::text FROM %s r WHERE r.%I::text = $1$q$, r.recipe, r.src, r.key_col)
-           INTO line USING r.key;
-        CONTINUE WHEN line IS NULL OR used + pg_catalog.length(line) > p_budget;
-        used := used + pg_catalog.length(line);
-        key := r.key; net_use := r.net_use;
-        -- 0.20.0: the verdict is about a text; this is the text served
-        verdict := CASE WHEN r.verdict = $q$verified$q$
-                         AND r.judged IS DISTINCT FROM pg_catalog.sha256(pg_catalog.convert_to(line, $q$UTF8$q$))
-                        THEN $q$unproven$q$ ELSE r.verdict END;
-        RETURN NEXT;
-    END LOOP;
-END;
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_brief$q$ LANGUAGE C STABLE;
+
+-- 12. recall(), disputes(), replacement(), truth_coverage(): the same signatures and grants, now one C door that
+-- shows a watch only to a role that may SELECT its table, and runs the body (phasevec._door_<name>) as the owner.
+CREATE FUNCTION phasevec._door_recall(p_watch text, p_question text, p_k int, p_partial boolean)
+RETURNS TABLE (key text, score double precision, adjusted double precision, verdict text, support jsonb,
+               verified_at timestamptz, topic text, disputed_by text[], usefulness integer, state text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    WITH w AS (SELECT (phasevec._watch(p_watch)).id AS id),
+    hits AS (SELECT * FROM phasevec.search(p_watch, p_question, least(p_k * 3, 1000), p_partial)),
+    th AS (SELECT h.key, t.topic AS tp, t.support AS sp, t.verified_at AS va,
+                  coalesce(phasevec._verdict(t), $q$unproven$q$) AS v
+             FROM hits h CROSS JOIN w LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = h.key),
+    vivas AS (SELECT t.topic, t.key, s.text_hash FROM phasevec.truth t CROSS JOIN w
+                JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
+               WHERE t.watch = w.id AND t.topic IN (SELECT th.tp FROM th WHERE th.tp IS NOT NULL)
+                 AND phasevec._verdict(t) IN ($q$verified$q$, $q$unproven$q$)),
+    disp AS (SELECT a.key, array_agg(b.key ORDER BY b.key) AS keys
+               FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key <> a.key AND b.text_hash <> a.text_hash
+              GROUP BY a.key)
+    SELECT h.key, h.score,
+           h.score * (1 + 0.1 * tanh(coalesce(us.helped - us.not_helped, 0) / 5.0)),
+           CASE WHEN dp.keys IS NOT NULL THEN $q$disputed$q$ ELSE th.v END,
+           th.sp, th.va, th.tp, dp.keys, coalesce(us.helped - us.not_helped, 0)::int, h.state
+      FROM hits h
+      JOIN th ON th.key = h.key
+      CROSS JOIN w
+      LEFT JOIN phasevec.usefulness us ON us.watch = w.id AND us.key = h.key
+      LEFT JOIN disp dp ON dp.key = h.key
+     ORDER BY 3 DESC NULLS LAST, (th.v = $q$verified$q$) DESC, h.key
+     LIMIT p_k
 $f$;
+CREATE FUNCTION phasevec._door_disputes(p_watch text)
+RETURNS TABLE (topic text, key_a text, key_b text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    WITH vivas AS (
+        SELECT t.topic, t.key, s.text_hash FROM phasevec.truth t
+          JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
+         WHERE t.watch = (phasevec._watch(p_watch)).id AND t.topic IS NOT NULL
+           AND phasevec._verdict(t) IN ($q$verified$q$, $q$unproven$q$))
+    SELECT a.topic, a.key, b.key FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key > a.key
+     WHERE a.text_hash <> b.text_hash
+     ORDER BY 1, 2, 3
+$f$;
+CREATE FUNCTION phasevec._door_replacement(p_watch text, p_key text)
+RETURNS TABLE (step integer, key text, reason text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    WITH RECURSIVE c(step, key, reason, seen) AS (
+        SELECT 0, p_key, NULL::text, ARRAY[p_key]
+      UNION ALL
+        SELECT c.step + 1, t.replaced_by, t.reason, c.seen || t.replaced_by
+          FROM c JOIN phasevec.truth t ON t.watch = (phasevec._watch(p_watch)).id AND t.key = c.key
+         WHERE t.verdict = $q$replaced$q$ AND c.step < 50 AND NOT t.replaced_by = ANY (c.seen))
+    SELECT step, key, reason FROM c ORDER BY step
+$f$;
+CREATE FUNCTION phasevec._door_truth_coverage(p_watch text)
+RETURNS TABLE (verdict text, n bigint)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT coalesce(phasevec._verdict(t), $q$unproven$q$) AS verdict, count(*)
+      FROM phasevec.sources s
+      LEFT JOIN phasevec.truth t ON t.watch = s.watch AND t.key = s.key
+     WHERE s.watch = (phasevec._watch(p_watch)).id
+     GROUP BY 1 ORDER BY 1
+$f$;
+CREATE OR REPLACE FUNCTION phasevec.recall(p_watch text, p_question text, p_k int DEFAULT 10, p_partial boolean DEFAULT false)
+RETURNS TABLE (key text, score double precision, adjusted double precision, verdict text, support jsonb,
+               verified_at timestamptz, topic text, disputed_by text[], usefulness integer, state text)
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
+CREATE OR REPLACE FUNCTION phasevec.disputes(p_watch text)
+RETURNS TABLE (topic text, key_a text, key_b text)
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
+CREATE OR REPLACE FUNCTION phasevec.replacement(p_watch text, p_key text)
+RETURNS TABLE (step integer, key text, reason text)
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
+CREATE OR REPLACE FUNCTION phasevec.truth_coverage(p_watch text)
+RETURNS TABLE (verdict text, n bigint)
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
 
 -- ---------------------------------------------------------------- privileges --
 -- New internals: the owner only (and they carry no rights of their own). A verifier other than the owner is
--- granted verify() or verify_one(), nothing else; it runs only the proofs whose author it may act as.
-REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid), phasevec._truth_text_changed(),
-    phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea),
+-- granted verify() or verify_one(), nothing else; it runs only the proofs whose author it may act as. _render()
+-- stays open: it checks its caller itself.
+REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_text_changed(),
+    phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
-    phasevec._truth_set(int, text, text, text, bytea, text, oid),
-    phasevec._note_set(int, text, bytea, text, oid), phasevec.adopt(text)
+    phasevec._truth_set(int, text, text, text, bytea), phasevec._truth_halted(int, bytea),
+    phasevec._note_set(int, text, bytea, text), phasevec.adopt(text, regrole, text[], text[]),
+    phasevec._door_recall(text, text, int, boolean), phasevec._door_disputes(text),
+    phasevec._door_replacement(text, text), phasevec._door_truth_coverage(text)
   FROM PUBLIC;
--- 6 and 7: closed to PUBLIC. brief() needs _brief_keys(), so whoever may brief gets both:
---   GRANT EXECUTE ON FUNCTION phasevec.brief(text, int), phasevec._brief_keys(text) TO <role>;
+-- 6 and 7: closed to PUBLIC. brief() calls _brief_keys() as the owner: whoever may brief is granted brief() only.
 REVOKE ALL ON FUNCTION phasevec._forget(int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION phasevec._brief_keys(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION phasevec.brief(text, int) FROM PUBLIC;
 COMMENT ON FUNCTION phasevec._brief_keys(text) IS
-    $q$Keys, verdicts, usefulness, recipe and judged text hash of a watch, with the owner's rights, for brief(). Not PUBLIC (0.20.0): granted with brief().$q$;
+    $q$Keys, verdicts, usefulness and judged text hash of a watch, for brief() (which runs it as the owner). The owner's only (0.20.0).$q$;
+
+-- 9. Every row's text in the pinned settings: what the watch trigger noted before 0.20.0 was rendered in its
+-- writer's settings. A text that now reads otherwise is noted again (its reading turns stale, its verdict unproven).
+DO $d$
+DECLARE
+    w record;
+    x record;
+BEGIN
+    FOR w IN SELECT id, name FROM phasevec.watches ORDER BY id LOOP
+        FOR x IN SELECT r.key, r.body, r.text_hash FROM phasevec._render(w.name, NULL) r
+                   JOIN phasevec.sources s ON s.watch = w.id AND s.key = r.key
+                  WHERE s.text_hash IS DISTINCT FROM r.text_hash LOOP
+            PERFORM phasevec._note_set(w.id, x.key, x.text_hash, x.body);
+        END LOOP;
+    END LOOP;
+END
+$d$;

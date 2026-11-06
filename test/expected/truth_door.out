@@ -63,7 +63,7 @@ ERROR:  column "bound" does not exist at character 67
 -- the internals of this version, even granted, write and read nothing: they carry no rights of their own
 SELECT key FROM phasevec._truth_due(:notes_id, 100, interval $i$0$i$, $r$pv_admin$r$::regrole::oid);
 ERROR:  permission denied for table truth
-SELECT phasevec._truth_set(:notes_id, $k$1$k$, $v$verified$v$, NULL, NULL, NULL, NULL);
+SELECT phasevec._truth_set(:notes_id, $k$1$k$, $v$verified$v$, NULL, NULL);
 ERROR:  permission denied for table truth
 RESET ROLE;
 SELECT key, verdict, phasevec._verdict(t) AS now FROM phasevec.truth t WHERE key = $k$1$k$;
@@ -109,17 +109,23 @@ SELECT phasevec.verify_one($w$notes$w$, $k$2$k$);
 (1 row)
 
 SELECT key, verdict, last_error FROM phasevec.truth WHERE key = $k$2$k$;
- key | verdict  |                                               last_error                                               
------+----------+--------------------------------------------------------------------------------------------------------
- 2   | unproven | the author of this proof is gone (dropped, or its name is another role's now): assert it again (adopt)
+ key | verdict  |                                                                   last_error                                                                   
+-----+----------+------------------------------------------------------------------------------------------------------------------------------------------------
+ 2   | unproven | the author of this proof is gone (dropped, or its name is another role's now): assert it again, or adopt it naming its author (phasevec.adopt)
 (1 row)
 
 ALTER ROLE pv_low RENAME TO pv_admin;
--- the owner adopts it: asserted again as the owner, about the text it reads now
-SELECT phasevec.adopt($w$notes$w$) AS adopted;
- adopted 
----------
-       1
+-- the owner adopts it, naming the author: a superuser only for the keys it names (test/sql/truth_guard.sql)
+SELECT key, proof, former_author, adopted, note FROM phasevec.adopt($w$notes$w$, current_user::regrole);
+ key |                     proof                     | former_author | adopted |                                           note                                           
+-----+-----------------------------------------------+---------------+---------+------------------------------------------------------------------------------------------
+ 2   | (SELECT v FROM pv_private.secret) = 'hunter2' | pv_low        | f       | not adopted: its author would be a superuser; name the key in superuser_keys to adopt it
+(1 row)
+
+SELECT key, former_author, adopted, note FROM phasevec.adopt($w$notes$w$, current_user::regrole, p_superuser_keys => ARRAY[$k$2$k$]);
+ key | former_author | adopted |                    note                    
+-----+---------------+---------+--------------------------------------------
+ 2   | pv_low        | t       | adopted: it runs with a superuser's rights
 (1 row)
 
 SELECT key, asserted_by = current_user AS by_owner, phasevec.verify_one($w$notes$w$, key) FROM phasevec.truth WHERE key = $k$2$k$;

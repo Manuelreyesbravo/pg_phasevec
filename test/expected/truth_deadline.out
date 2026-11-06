@@ -155,7 +155,8 @@ SELECT 1 AS alive;
      1
 (1 row)
 
--- (d) a session advisory lock taken by a proof does not stay with the verifier
+-- (d) a session advisory lock taken by a proof does not stay with the verifier: since 0.20.0 a proof cannot take
+-- one (it would outlive the proof), and the verifier's own stay held (test/sql/truth_guard.sql)
 SET ROLE pv_author;
 SELECT phasevec.assert($w$notes$w$, $k$7$k$, $p$pg_advisory_lock(4242) IS NOT NULL$p$);
  assert 
@@ -173,7 +174,7 @@ SELECT pg_advisory_lock(4343);
 SELECT phasevec.verify_one($w$notes$w$, $k$7$k$, 1000, 1e6);
  verify_one 
 ------------
- verified
+ refuted
 (1 row)
 
 SELECT objid, mode FROM pg_locks WHERE locktype = $l$advisory$l$ AND pid = pg_backend_pid() ORDER BY objid;

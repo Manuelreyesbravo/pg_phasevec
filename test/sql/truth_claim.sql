@@ -87,17 +87,19 @@ SELECT phasevec.assert($w$notes$w$, $k$2$k$, $p$true$p$);
 SELECT phasevec.verify_one($w$notes$w$, $k$2$k$);
 SELECT key, verdict, line FROM phasevec.brief($w$notes$w$) WHERE key = $k$2$k$;
 
--- (g) the recipe is the table owner's SQL: assert() runs it as the asserting role, read-only and in a
--- security-restricted operation, as a proof runs
+-- (g) the recipe is the table owner's SQL: everywhere it runs (the watch trigger, watch(), assert(), verify(),
+-- brief()...) it runs as the table's owner, read-only and in a security-restricted operation (0.20.0): a recipe
+-- that writes cannot read a row, for a writer or for anyone else
 CREATE TABLE side_effects (n int);
 CREATE FUNCTION noisy(t text) RETURNS text LANGUAGE plpgsql AS $f$
 BEGIN INSERT INTO public.side_effects VALUES (1); RETURN t; END $f$;
 CREATE TABLE loud (id int PRIMARY KEY, body text);
+INSERT INTO loud VALUES (1, $t$written$t$);
+SELECT phasevec.watch($w$loud$w$, $w$loud$w$::regclass, $k$id$k$, $r$public.noisy(r.body)$r$, $n$r1$n$) > 0 AS watch;
+DELETE FROM loud;
 SELECT phasevec.watch($w$loud$w$, $w$loud$w$::regclass, $k$id$k$, $r$public.noisy(r.body)$r$, $n$r1$n$) > 0 AS watch;
 INSERT INTO loud VALUES (1, $t$written$t$);
 SELECT count(*) AS by_the_writer FROM side_effects;
-SELECT phasevec.assert($w$loud$w$, $k$1$k$, $p$true$p$);
-SELECT count(*) AS by_assert FROM side_effects;
 DROP TABLE loud, side_effects;
 DROP FUNCTION noisy(text);
 

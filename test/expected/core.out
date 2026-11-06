@@ -173,8 +173,8 @@ SELECT key, state, failed FROM phasevec.reading_states WHERE key = '2';
 (1 row)
 
 -- ------------------------------------------------ the trigger's writers cannot be called directly
-SELECT phasevec._note((SELECT id FROM phasevec.watches WHERE name = 'docs'), '1', '\x00', 'forged');
-ERROR:  phasevec: _note() is called by a watch trigger, not directly
+SELECT phasevec._observe();
+ERROR:  phasevec: _observe() is the watch trigger, not a function to call
 SELECT phasevec._forget((SELECT id FROM phasevec.watches WHERE name = 'docs'), '1');
 ERROR:  phasevec: _forget() is called by a watch trigger, not directly
 -- ------------------------------------------------ a new reader makes every old reading foreign
@@ -255,7 +255,7 @@ ERROR:  phasevec: no reader named nobody
 SELECT phasevec.watch('w2', 'docs'::regclass, 'nope', 'r.body', 'r1');
 ERROR:  phasevec: public.docs has no column nope
 SELECT phasevec.watch('w2', 'docs'::regclass, 'id', 'r.missing_column', 'r1');
-ERROR:  column r.missing_column does not exist at character 9
+ERROR:  column r.missing_column does not exist at character 128
 DROP OWNED BY regress_phasevec_stranger;
 DROP ROLE regress_phasevec_stranger;
 -- ------------------------------------------------ a reading the reader did not recognize is doubtful

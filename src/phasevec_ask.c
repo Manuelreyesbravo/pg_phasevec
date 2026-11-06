@@ -25,6 +25,7 @@
 #include "utils/timestamp.h"
 
 void		_PG_init(void);
+extern void phasevec_guard_init(void);	/* phasevec_guard.c */
 extern bool phasevec_shared_ivf_cache;	/* phasevec_ivf.c */
 extern int	phasevec_shared_ivf_cache_mb;	/* phasevec_ivf.c */
 extern bool phasevec_delta_cache;	/* phasevec_ivf.c */
@@ -69,6 +70,7 @@ _PG_init(void)
 							"How long phasevec.search() waits for a reader.",
 							NULL, &ask_timeout_ms, 10000, 100, 600000, PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("phasevec");
+	phasevec_guard_init();
 }
 
 static void

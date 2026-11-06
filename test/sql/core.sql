@@ -75,7 +75,7 @@ SELECT phasevec.record_failure('docs', '2', 'r1', (SELECT text_hash FROM phaseve
 SELECT key, state, failed FROM phasevec.reading_states WHERE key = '2';
 
 -- ------------------------------------------------ the trigger's writers cannot be called directly
-SELECT phasevec._note((SELECT id FROM phasevec.watches WHERE name = 'docs'), '1', '\x00', 'forged');
+SELECT phasevec._observe();
 SELECT phasevec._forget((SELECT id FROM phasevec.watches WHERE name = 'docs'), '1');
 
 -- ------------------------------------------------ a new reader makes every old reading foreign
