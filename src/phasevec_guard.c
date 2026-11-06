@@ -27,7 +27,11 @@
  *   only reads (stable or immutable) runs, and of the volatile ones only a reviewed few (the clock, sleep, random
  *   numbers, set_config): pg_notify, the advisory locks, setseed, currval, the large-object descriptors, signalling a
  *   backend, and every volatile system function no one reviewed are refused, as are pg_cursor and
- *   pg_prepared_statement, which read the session's own statements.
+ *   pg_prepared_statement, which read the session's own statements, EXPLAIN EXECUTE, which shows one, and
+ *   txid_current and pg_current_xact_id, which give the session's transaction an id no rollback takes back.
+ *   The session's temporary objects: pg_temp is searched last, and a temporary table or function is refused
+ *   however it is reached (named, found through search_path, inherited from, inlined). Until the fourth review a
+ *   verifier's temporary table named like the author's took its place in the proof.
  * - Nothing it keeps outlives what it was kept for: a guard and a pin (the settings and cursors a call reads once)
  *   end with their subtransaction and with their transaction, however they end (guard_subxact, guard_xact).
  */
@@ -35,8 +39,10 @@
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "access/htup_details.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -58,6 +64,7 @@
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
+#include "utils/varlena.h"
 
 #include "phasevec_guard.h"
 
@@ -443,6 +450,31 @@ guard_unpin_settings(int nest)
 	AtEOXact_GUC(false, nest);
 }
 
+/*
+ * The session's temporary schema is searched first unless search_path names it: a temporary table of whoever runs
+ * the code would take the place of the table it names. Inside a guard pg_temp is searched last (as PostgreSQL
+ * advises for SECURITY DEFINER functions), and a temporary relation is refused anyway (guard_start).
+ */
+static void
+temp_last(void)
+{
+	const char *sp = GetConfigOption("search_path", false, false);
+	char	   *copy = pstrdup(sp ? sp : "");
+	List	   *names;
+	ListCell   *lc;
+	bool		named = false;
+
+	if (!SplitIdentifierString(copy, ',', &names))
+		named = true;			/* a value no one could set: leave it to PostgreSQL */
+	foreach(lc, names)
+		if (strcmp((const char *) lfirst(lc), "pg_temp") == 0)
+			named = true;
+	if (!named)
+		set_one("search_path", names == NIL ? "pg_temp" : psprintf("%s, pg_temp", sp));
+	list_free(names);
+	pfree(copy);
+}
+
 /* ----------------------------------------------------------------------------- the session's cursors -- */
 
 /* The names of the cursors pg_cursors lists (every one but the protocol's). */
@@ -579,6 +611,9 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 		case GUARD_ASIS:
 			break;
 	}
+	/* a recipe and a reader run with the pins, which name pg_temp last */
+	if (mode == GUARD_AUTHOR || mode == GUARD_ASIS)
+		temp_last();
 	/* LOCAL (it cannot be SAVEd): the rollback of the subtransaction takes it back all the same */
 	(void) set_config_option("transaction_read_only", "on", PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_LOCAL, true, 0, false);
@@ -675,9 +710,34 @@ static ExecutorRun_hook_type prev_run = NULL;
 static ExecutorEnd_hook_type prev_end = NULL;
 static ProcessUtility_hook_type prev_utility = NULL;
 
+/*
+ * A temporary relation is the session's, as its cursors are: whoever runs the code made it, not the code's author or
+ * owner. None can be made inside a guard (it is a security-restricted operation), so every one is refused there,
+ * named or found through search_path, or reached as the child of a permanent table it inherits from.
+ */
+static void
+refuse_temp(const PlannedStmt *ps)
+{
+	ListCell   *lc;
+
+	foreach(lc, ps->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION && get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table \"%s\"",
+							get_rel_name(rte->relid)),
+					 errdetail("A temporary table is the session's that runs the code, not the code's author's.")));
+	}
+}
+
 static void
 guard_start(QueryDesc *qd, int eflags)
 {
+	if (guard_depth > 0)
+		refuse_temp(qd->plannedstmt);
 	if (prev_start)
 		prev_start(qd, eflags);
 	else
@@ -748,9 +808,21 @@ guard_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree, Pr
 
 		switch (nodeTag(stmt))
 		{
+			case T_ExplainStmt:
+				{
+					Node	   *q = ((ExplainStmt *) stmt)->query;
+
+					/* EXPLAIN EXECUTE shows (and with ANALYZE runs) a statement the session prepared */
+					if (IsA(q, Query) && ((Query *) q)->commandType == CMD_UTILITY &&
+						IsA(((Query *) q)->utilityStmt, ExecuteStmt))
+						ereport(ERROR,
+								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+								 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot explain a prepared statement"),
+								 errdetail("The session's prepared statements are its caller's.")));
+				}
+				break;
 			case T_VariableSetStmt:
 			case T_VariableShowStmt:
-			case T_ExplainStmt:
 			case T_DeclareCursorStmt:
 			case T_CallStmt:
 			case T_DoStmt:
@@ -789,9 +861,14 @@ static const char *const volatile_allowed[] = {
 	"pg_try_advisory_xact_lock_shared"
 };
 
-/* Functions that read the session's own statements and channels, whatever their volatility. */
+/*
+ * Functions that read the session's own statements and channels, or its transaction's id, whatever their volatility:
+ * txid_current() and pg_current_xact_id() are stable, yet they give the caller's transaction an id, which no
+ * rollback of the guard takes back.
+ */
 static const char *const session_readers[] = {
-	"pg_cursor", "pg_prepared_statement", "pg_listening_channels", "pg_notification_queue_usage"
+	"pg_cursor", "pg_prepared_statement", "pg_listening_channels", "pg_notification_queue_usage",
+	"txid_current", "pg_current_xact_id", "txid_current_if_assigned", "pg_current_xact_id_if_assigned"
 };
 
 typedef struct FnVerdict
@@ -841,6 +918,27 @@ refused_function(Oid fn)
 }
 
 static object_access_hook_type prev_object_access = NULL;
+static needs_fmgr_hook_type prev_needs_fmgr = NULL;
+
+static bool
+temp_function(Oid fn)
+{
+	return fn >= FirstNormalObjectId && isAnyTempNamespace(get_func_namespace(fn));
+}
+
+/*
+ * Inside a guard a temporary function is never inlined (PostgreSQL does not inline a function a plugin hooks), so
+ * that it is set up as a call, and refused there (guard_object_access): inlined, a SQL function's body ran as if the
+ * proof had written it.
+ */
+static bool
+guard_needs_fmgr(Oid fn)
+{
+	if (prev_needs_fmgr && prev_needs_fmgr(fn))
+		return true;
+	return guard_depth > 0 && temp_function(fn);
+}
+
 static void
 guard_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId, void *arg)
 {
@@ -848,6 +946,13 @@ guard_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subI
 		prev_object_access(access, classId, objectId, subId, arg);
 	if (access != OAT_FUNCTION_EXECUTE || guard_depth == 0)
 		return;
+	/* a temporary function is the session's, as a temporary table is (refuse_temp) */
+	if (temp_function(objectId))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot call temporary function %s()",
+						get_func_name(objectId)),
+				 errdetail("A temporary function is the session's that runs the code, not the code's author's.")));
 	if (refused_function(objectId))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -937,6 +1042,8 @@ phasevec_guard_init(void)
 	freeze_settings();
 	prev_object_access = object_access_hook;
 	object_access_hook = guard_object_access;
+	prev_needs_fmgr = needs_fmgr_hook;
+	needs_fmgr_hook = guard_needs_fmgr;
 	prev_start = ExecutorStart_hook;
 	ExecutorStart_hook = guard_start;
 	prev_run = ExecutorRun_hook;

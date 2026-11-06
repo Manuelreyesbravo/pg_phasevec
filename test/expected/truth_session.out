@@ -1,0 +1,183 @@
+-- 0.20.0 (fourth review): what of the verifier's session still reached a proof. Each block worked against 7f37426.
+-- (1) Its temporary tables (and functions): the author's search_path (as recorded, or the default) does not name pg_temp, so
+-- PostgreSQL searched the verifier's temporary schema first, and a temporary table named like the author's took its
+-- place: verify() recorded 'verified', and brief() served it, for claims the real tables refute. Inside a guard
+-- pg_temp is searched last, and a temporary relation is refused however it is reached.
+-- (2) Its prepared statements, through EXPLAIN EXECUTE (constants and filters, in the proof's error text).
+-- (3) Its transaction's id: txid_current() and pg_current_xact_id() are stable, and gave it one.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes VALUES (1, $t$widget is in stock$t$), (2, $t$no order is open$t$), (3, $t$some stock is left$t$),
+                         (4, $t$a statement$t$), (5, $t$a transaction$t$), (6, $t$named outright$t$),
+                         (7, $t$a function$t$);
+SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+CREATE TABLE stock (item text, qty int);
+INSERT INTO stock VALUES ($i$widget$i$, 0);
+CREATE TABLE orders (id int, open boolean);
+INSERT INTO orders VALUES (1, true);
+CREATE TABLE ledger (item text, qty int);
+INSERT INTO ledger VALUES ($i$widget$i$, 0);
+CREATE FUNCTION pv_t_explain() RETURNS boolean LANGUAGE plpgsql AS $f$
+DECLARE r text; acc text := '';
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (VERBOSE, COSTS OFF) EXECUTE vstmt' LOOP acc := acc || ' | ' || r; END LOOP;
+    RAISE EXCEPTION 'leak:%', acc;
+END $f$;
+-- a temporary function of the session the claim is asserted in
+CREATE FUNCTION pg_temp.pv_t_says() RETURNS boolean LANGUAGE sql AS $f$ SELECT false $f$;
+CREATE ROLE pv_t_author;
+GRANT USAGE ON SCHEMA phasevec TO pv_t_author;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_t_author;
+GRANT SELECT ON notes, stock, orders, ledger TO pv_t_author;
+SET ROLE pv_t_author;
+SET search_path = public;
+SELECT (SELECT qty FROM stock WHERE item = $i$widget$i$) > 0 AS in_stock, NOT EXISTS (SELECT 1 FROM orders WHERE open) AS none_open;
+ in_stock | none_open 
+----------+-----------
+ f        | f
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$(SELECT qty FROM stock WHERE item = 'widget') > 0$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$2$k$, $p$NOT EXISTS (SELECT 1 FROM orders WHERE open)$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$3$k$, $p$EXISTS (SELECT 1 FROM ledger WHERE qty > 0)$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$4$k$, $p$public.pv_t_explain()$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$5$k$, $p$txid_current() > 0 AND pg_current_xact_id() IS NOT NULL$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$6$k$, $p$(SELECT qty FROM pg_temp.stock WHERE item = 'widget') > 0$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$7$k$, $p$pg_temp.pv_t_says()$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET search_path;
+RESET ROLE;
+-- control: no temporary table
+BEGIN;
+SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval '0') WHERE key IN ($k$1$k$, $k$2$k$, $k$3$k$)
+ ORDER BY key;
+ key | verdict 
+-----+---------
+ 1   | refuted
+ 2   | refuted
+ 3   | refuted
+(3 rows)
+
+ROLLBACK;
+-- (1) the verifier puts temporary tables with the same names in front of the real ones, and one that inherits from a
+-- real one, and grants them to the author
+CREATE TEMP TABLE stock (item text, qty int);
+INSERT INTO stock VALUES ($i$widget$i$, 99);
+CREATE TEMP TABLE orders (id int, open boolean);
+CREATE TEMP TABLE ledger_more () INHERITS (public.ledger);
+INSERT INTO ledger_more VALUES ($i$gadget$i$, 5);
+GRANT SELECT ON pg_temp.stock, pg_temp.orders, pg_temp.ledger_more TO pv_t_author;
+CREATE OR REPLACE FUNCTION pg_temp.pv_t_says() RETURNS boolean LANGUAGE sql AS $f$ SELECT true $f$;
+-- (2) and prepares a statement with a secret in it
+PREPARE vstmt AS SELECT $k$sk_live_verifier-api-key$k$::text AS k, id FROM notes WHERE body <> $s$hunter2$s$;
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key;
+ key | verdict |                                              error                                               
+-----+---------+--------------------------------------------------------------------------------------------------
+ 1   | refuted | 
+ 2   | refuted | 
+ 3   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table "ledger_more"
+ 4   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot explain a prepared statement
+ 5   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call txid_current()
+ 6   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table "stock"
+ 7   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call temporary function pv_t_says()
+(7 rows)
+
+SELECT t.key, t.verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
+ WHERE w.name = $w$notes$w$ ORDER BY t.key;
+ key | verdict 
+-----+---------
+ 1   | refuted
+ 2   | refuted
+ 3   | refuted
+ 4   | refuted
+ 5   | refuted
+ 6   | refuted
+ 7   | refuted
+(7 rows)
+
+DISCARD TEMP;
+DEALLOCATE vstmt;
+SELECT t.key, t.verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
+ WHERE w.name = $w$notes$w$ ORDER BY t.key;
+ key | verdict 
+-----+---------
+ 1   | refuted
+ 2   | refuted
+ 3   | refuted
+ 4   | refuted
+ 5   | refuted
+ 6   | refuted
+ 7   | refuted
+(7 rows)
+
+-- (1) a recipe does not read one either, and a temporary table cannot be watched
+CREATE TEMP TABLE leak (v text);
+INSERT INTO leak VALUES ($s$a writer's$s$);
+SELECT phasevec.watch($w$leaky$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body || (SELECT max(v) FROM pg_temp.leak)$r$,
+                      $n$r1$n$);
+ERROR:  phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table "leak"
+CREATE TEMP TABLE tnotes (id int PRIMARY KEY, body text);
+SELECT phasevec.watch($w$tnotes$w$, $w$tnotes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$);
+ERROR:  phasevec: tnotes is a temporary table: a watch outlives its session
+DISCARD TEMP;
+-- the verifier itself reads its temporary tables as before
+CREATE TEMP TABLE stock (item text, qty int);
+INSERT INTO stock VALUES ($i$widget$i$, 99);
+SELECT qty FROM stock;
+ qty 
+-----
+  99
+(1 row)
+
+DISCARD TEMP;
+DROP TABLE notes, stock, orders, ledger;
+DROP FUNCTION pv_t_explain();
+DROP EXTENSION pg_phasevec;
+DROP OWNED BY pv_t_author CASCADE;
+DROP ROLE pv_t_author;

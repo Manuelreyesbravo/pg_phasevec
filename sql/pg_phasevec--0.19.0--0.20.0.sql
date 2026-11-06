@@ -418,6 +418,10 @@ BEGIN
     IF NOT pg_has_role(current_user, tbl_owner, 'USAGE') THEN
         RAISE EXCEPTION 'phasevec: a watch is a trigger on %, so only its owner may create one', p_source;
     END IF;
+    -- A recipe never reads a temporary table (0.20.0): one is its session's, and a watch outlives the session.
+    IF EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = p_source AND c.relpersistence = 't') THEN
+        RAISE EXCEPTION 'phasevec: % is a temporary table: a watch outlives its session', p_source;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = p_source AND a.attname = p_key
                    AND a.attnum > 0 AND NOT a.attisdropped) THEN
         RAISE EXCEPTION 'phasevec: % has no column %', p_source, p_key;
