@@ -89,6 +89,19 @@
 --    "could not find function". The trigger is in a library of its own that says to reconnect.
 -- 20. A watch over a FORCE ROW LEVEL SECURITY table rendered nothing as its owner; a key column that is not unique let
 --    a writer forget another's key. The owner renders without FORCE; watch() needs a unique key.
+--
+-- Then a fifth adversarial review ran attacks against the fifth cut (ce02558, never released):
+--
+-- 21. The watch trigger kept its plan per session after ALTER TABLE: a session that wrote before a RENAME, DROP and
+--    ADD, or ALTER COLUMN TYPE hashed the old column (a changed row stayed fresh) or failed every write until it
+--    reconnected. The plan is kept with the table's row type and parsed again when it changes (src/phasevec_truth.c).
+-- 22. A temporary view, type, domain, operator or collation of the verifier's session decided a proof (only tables
+--    and functions were refused). Everything a query run in the guard uses is checked (src/phasevec_guard.c).
+-- 23. A write that changed a row's text waited on every open transaction that had judged that key (a trigger on
+--    phasevec.sources wrote the verdict). Staleness is computed when read again, in _verdict(); no writer waits on a
+--    verifier.
+-- 24. Two verify() of one watch deadlocked on verdict rows under writes, and the aborted call lost every verdict it
+--    had reached. verify() takes each claim's row before judging it, or leaves it to whoever holds it.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -117,7 +130,11 @@ RETURNS bytea LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp AS $f
 $f$;
 
 -- The truth a key has NOW. 'verified' only for the claim it judged, and only while the row's text, as the watch
--- trigger last saw it, is the asserted one. (brief() also checks the text it serves; verify() checks the live row.)
+-- trigger last saw it, is the asserted one; 'refuted' only while it is the refuted one. (brief() also checks the text
+-- it serves; verify() checks the live row.) Computed when read: a writer never touches a verdict. In the fifth cut a
+-- trigger on phasevec.sources set the verdict of a row whose text changed to 'unproven' as it was written, and so the
+-- write waited for every open transaction that had judged that key (a verify() for its whole budget, or longer inside
+-- a larger transaction): under load a writer went from 0.2 ms to 13-36 ms, and failed on lock_timeout.
 CREATE OR REPLACE FUNCTION phasevec._verdict(t phasevec.truth) RETURNS text
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT CASE WHEN t.verdict = $q$replaced$q$ THEN $q$replaced$q$
@@ -125,31 +142,14 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 WHEN t.verdict = $q$verified$q$
                  AND (t.verified_for IS NULL
                       OR t.verified_for IS DISTINCT FROM phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid,
-                                                                        t.proof_env)
-                      OR t.asserted_for IS DISTINCT FROM (SELECT s.text_hash FROM phasevec.sources s
-                                                          WHERE s.watch = t.watch AND s.key = t.key))
+                                                                        t.proof_env))
+                THEN $q$unproven$q$
+                WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$)
+                 AND t.asserted_for IS DISTINCT FROM (SELECT s.text_hash FROM phasevec.sources s
+                                                      WHERE s.watch = t.watch AND s.key = t.key)
                 THEN $q$unproven$q$
                 ELSE t.verdict END
 $f$;
-
--- A row whose text changes away from what was judged loses its verdict, verified or refuted. Runs inside the watch
--- trigger's write to phasevec.sources (as the owner).
-CREATE FUNCTION phasevec._truth_text_changed() RETURNS trigger
-LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
-BEGIN
-    IF TG_OP = $q$UPDATE$q$ AND OLD.text_hash IS NOT DISTINCT FROM NEW.text_hash THEN
-        RETURN NULL;
-    END IF;
-    UPDATE phasevec.truth t
-       SET verdict = $q$unproven$q$, verified_at = NULL, verified_for = NULL, changed_at = now(),
-           last_error = $q$the row's text changed after it was judged$q$
-     WHERE t.watch = NEW.watch AND t.key = NEW.key AND t.verdict IN ($q$verified$q$, $q$refuted$q$)
-       AND t.asserted_for IS DISTINCT FROM NEW.text_hash;
-    RETURN NULL;
-END;
-$f$;
-CREATE TRIGGER truth_text_changed AFTER INSERT OR UPDATE OF text_hash ON phasevec.sources
-    FOR EACH ROW EXECUTE FUNCTION phasevec._truth_text_changed();
 
 -- assert(): the same signature and grants; now C (src/phasevec_truth.c): it sees who calls it, renders the row as
 -- the table's owner in pinned settings, records the caller's settings, and writes through _assert_set, as the owner.
@@ -199,7 +199,15 @@ $f$;
 -- The C side passes the caller's OID, which a caller cannot choose.
 --
 -- The due proofs p_verifier may run, oldest first; a proof whose author is gone (no role with that OID and name)
--- is due for anyone: what verify() records for it is 'unproven'. A halted claim is not due.
+-- is due for anyone: what verify() records for it is 'unproven'. A halted claim is not due. A verdict whose row's
+-- text changed since (it reads 'unproven' already, _verdict) is due first, so verify() says why: the writer that
+-- changed the text did not touch the verdict (_truth_stale; verify() checks it again when it takes the claim).
+CREATE FUNCTION phasevec._truth_stale(t phasevec.truth) RETURNS boolean
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT t.verdict IN ($q$verified$q$, $q$refuted$q$)
+       AND t.asserted_for IS DISTINCT FROM (SELECT s.text_hash FROM phasevec.sources s
+                                            WHERE s.watch = t.watch AND s.key = t.key)
+$f$;
 DROP FUNCTION phasevec._truth_due(int, int, interval);
 CREATE FUNCTION phasevec._truth_due(p_watch int, p_n int, p_every interval, p_verifier oid)
 RETURNS TABLE (key text, proof text, author oid, author_known boolean, asserted_for bytea, env text[], bind bytea)
@@ -208,11 +216,12 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
            phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
+     CROSS JOIN LATERAL (SELECT phasevec._truth_stale(t) AS stale) x
      WHERE t.watch = p_watch AND t.proof IS NOT NULL AND t.verdict <> $q$replaced$q$
        AND t.asserted_by_oid IS NOT NULL AND NOT t.halted
-       AND (t.verified_at IS NULL OR t.verified_at < now() - p_every)
+       AND (t.verified_at IS NULL OR t.verified_at < now() - p_every OR x.stale)
        AND (r.oid IS NULL OR pg_catalog.pg_has_role(p_verifier, r.oid, $q$USAGE$q$))
-     ORDER BY t.verified_at NULLS FIRST, t.key
+     ORDER BY CASE WHEN x.stale THEN NULL ELSE t.verified_at END NULLS FIRST, t.key
      LIMIT p_n
 $f$;
 
@@ -571,7 +580,7 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
 -- New internals: the owner only (and they carry no rights of their own). A verifier other than the owner is
 -- granted verify() or verify_one(), nothing else; it runs only the proofs whose author it may act as. _render()
 -- stays open: it checks its caller itself.
-REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_text_changed(),
+REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_stale(phasevec.truth),
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
     phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea),

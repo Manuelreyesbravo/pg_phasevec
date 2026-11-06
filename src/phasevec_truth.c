@@ -1222,6 +1222,35 @@ judge_claim(const Claim *c, int timeout_ms, double max_cost, const Target *t, Re
 	PG_END_TRY();
 }
 
+/*
+ * Take the claim's row before judging it, or leave it: another verify() (or an assert()) holds it. Without this, two
+ * verify() calls of one watch locked the rows of their due lists in different orders when the table took writes
+ * (in the fifth cut the watch trigger wrote verdict rows too) and deadlocked: 54-70% of the calls failed, and an
+ * aborted call lost every verdict it had reached. With it no verify() waits on a verdict row, so none deadlocks on
+ * one, and none judges a claim another is judging, or judged since its due list was read (it is no longer due).
+ */
+#define CLAIM_LOCK_SQL \
+	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
+	"AND NOT t.halted AND (t.verified_at IS NULL OR t.verified_at OPERATOR(pg_catalog.<) " \
+	"(pg_catalog.now() OPERATOR(pg_catalog.-) $3) OR phasevec._truth_stale(t)) FOR NO KEY UPDATE SKIP LOCKED"
+
+static bool
+claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, Datum every)
+{
+	Datum		av[3] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), every};
+	bool		taken;
+	Who			was;
+
+	become(owner, &was);
+	spi_connect();
+	if (SPI_execute_plan(plan, av, NULL, false, 1) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: a claim could not be taken");
+	taken = SPI_processed == 1;
+	SPI_finish();
+	unbecome(&was);
+	return taken;
+}
+
 static int64
 interval_usec(const Interval *iv)
 {
@@ -1255,6 +1284,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	Who			was;
 	Readers		readers = {0};
 	int			nest;
+	SPIPlanPtr	lock_plan = NULL;
 
 	for (int i = 0; i < 6; i++)
 		if (PG_ARGISNULL(i))
@@ -1301,6 +1331,14 @@ phasevec_verify(PG_FUNCTION_ARGS)
 		if (target.record_plan == NULL)
 			elog(ERROR, "phasevec: verdicts cannot be recorded: %s", SPI_result_code_string(SPI_result));
 		SPI_keepplan(target.record_plan);
+		{
+			Oid			lt[3] = {INT4OID, TEXTOID, INTERVALOID};
+
+			lock_plan = SPI_prepare(CLAIM_LOCK_SQL, 3, lt);
+			if (lock_plan == NULL)
+				elog(ERROR, "phasevec: claims cannot be taken: %s", SPI_result_code_string(SPI_result));
+			SPI_keepplan(lock_plan);
+		}
 		unbecome(&was);
 		SPI_finish();
 	}
@@ -1321,6 +1359,12 @@ phasevec_verify(PG_FUNCTION_ARGS)
 			if (c->author_known && !has_privs_of_role(caller, c->author))
 				continue;
 			o = MemoryContextSwitchTo(per);
+			if (!claim_taken(owner, lock_plan, &target, c, PG_GETARG_DATUM(2)))
+			{
+				MemoryContextSwitchTo(o);
+				MemoryContextReset(per);
+				continue;
+			}
 			judge_claim(c, timeout_ms, max_cost, &target, &readers, &j);
 			v = record(owner, &target, c, &j);
 			values[0] = CStringGetTextDatum(c->key);
@@ -1341,6 +1385,9 @@ phasevec_verify(PG_FUNCTION_ARGS)
 		if (target.record_plan)
 			SPI_freeplan(target.record_plan);
 		target.record_plan = NULL;
+		if (lock_plan)
+			SPI_freeplan(lock_plan);
+		lock_plan = NULL;
 	}
 	PG_END_TRY();
 	MemoryContextDelete(per);

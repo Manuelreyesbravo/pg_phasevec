@@ -48,7 +48,7 @@ SELECT key, asserted_by FROM phasevec.truth WHERE key = $k$4$k$;
 
 -- the watch trigger installed by 0.19.0 still notes and forgets
 UPDATE notes SET body = $t$holds, said again$t$ WHERE id = 1;
-SELECT key, verdict FROM phasevec.truth WHERE key = $k$1$k$;
+SELECT t.key, phasevec._verdict(t) AS verdict FROM phasevec.truth t WHERE t.key = $k$1$k$;
 DELETE FROM notes WHERE id = 2;
 SELECT key FROM phasevec.sources ORDER BY key;
 
