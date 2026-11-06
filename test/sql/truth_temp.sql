@@ -64,12 +64,20 @@ RESET client_min_messages;
 GRANT EXECUTE ON FUNCTION public.pv_tt_atomic() TO pv_tt_author;
 -- the verifier runs the function first: its plan is made out of the guard, with the temporary type in it, folded
 SELECT public.pv_tt_kept() AS kept_out;
+SELECT public.pv_tt_kept() AS kept_out;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
 
 -- out of the guard the verifier uses its objects as before
 SELECT qty FROM sv;
 SELECT 'b'::pg_temp.e < 'a'::pg_temp.e AS out_of_guard;
+
+-- (sixth review) Since then a verdict is judged only in a session with no temporary object (truth_lookup): above,
+-- verify() refuses to run. Dropped, they may leave behind the plan the verifier's session made of pv_tt_kept() with
+-- the temporary enum folded in: verify() throws away a plan the session made with one, a proof that calls the
+-- function parses it again, and every claim reads as the control's.
+DISCARD TEMP;
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
 
 -- a recipe does not read a writer's temporary objects either: here a function the recipe calls searches pg_temp first
 -- (its owner's mistake), and a writer's temporary type named like the owner's would decide the text the watch trigger

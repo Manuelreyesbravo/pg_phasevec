@@ -33,7 +33,9 @@
  *   by what the query depends on, however it is reached (named, found through search_path, inherited from, inside a
  *   SQL function, in a plan cached before the guard ran: guard_analyze, guard_plan). Until the fourth review a
  *   verifier's temporary table named like the author's took its place in the proof; until the fifth its temporary
- *   view, type, domain or operator did.
+ *   view, type, domain or operator did. And a verdict is judged only in a session that has no temporary object at
+ *   all (guard_require_no_temp): until the sixth review a name looked up while the code ran (to_regclass(text), a
+ *   cast of text to regclass) found the verifier's.
  * - Nothing it keeps outlives what it was kept for: a guard and a pin (the settings and cursors a call reads once)
  *   end with their subtransaction and with their transaction, however they end (guard_subxact, guard_xact).
  */
@@ -52,6 +54,12 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_ts_config.h"
+#include "catalog/pg_ts_dict.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "utils/fmgroids.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
@@ -834,10 +842,11 @@ refuse_if_temp(Oid classId, Oid objectId)
 	}
 }
 
-#if PG_VERSION_NUM < 190000
 /*
- * PostgreSQL 18 has no collectDependenciesOfExpr(): the same walk, over what a query can name. A type is followed to
- * its domain's base type and its array's element type.
+ * The walk over what a query can name. PostgreSQL 18 has no collectDependenciesOfExpr(), and PostgreSQL 19's does not
+ * record every type a query uses (in the sixth review the RETURNING type of JSON_VALUE and JSON_QUERY went past it, as
+ * past this walk, which had no case for them): on 19 both run. A type is followed to its domain's base type and its
+ * array's element type.
  */
 static void
 refuse_temp_type(Oid typid)
@@ -937,6 +946,21 @@ temp_walker(Node *node, void *context)
 						case REGCOLLATIONOID:
 							refuse_if_temp(CollationRelationId, DatumGetObjectId(c->constvalue));
 							break;
+						case REGCONFIGOID:
+							refuse_if_temp(TSConfigRelationId, DatumGetObjectId(c->constvalue));
+							break;
+						case REGDICTIONARYOID:
+							refuse_if_temp(TSDictionaryRelationId, DatumGetObjectId(c->constvalue));
+							break;
+						case REGNAMESPACEOID:
+							if (isAnyTempNamespace(DatumGetObjectId(c->constvalue)))
+							{
+								if (probing)
+									probed = true;
+								else
+									refuse_temp_object(NamespaceRelationId, DatumGetObjectId(c->constvalue));
+							}
+							break;
 					}
 			}
 			break;
@@ -1033,28 +1057,42 @@ temp_walker(Node *node, void *context)
 		case T_NextValueExpr:
 			refuse_if_temp(RelationRelationId, ((NextValueExpr *) node)->seqid);
 			break;
+		case T_JsonExpr:
+			/* JSON_VALUE, JSON_QUERY, JSON_EXISTS ... RETURNING t: with NULL ON ERROR, t is in no other node */
+			if (((JsonExpr *) node)->returning)
+				refuse_temp_type(((JsonExpr *) node)->returning->typid);
+			refuse_if_temp(CollationRelationId, ((JsonExpr *) node)->collation);
+			break;
+		case T_JsonConstructorExpr:
+			if (((JsonConstructorExpr *) node)->returning)
+				refuse_temp_type(((JsonConstructorExpr *) node)->returning->typid);
+			break;
+		case T_XmlExpr:
+			refuse_temp_type(((XmlExpr *) node)->type);
+			break;
 		default:
 			break;
 	}
 	return expression_tree_walker(node, temp_walker, context);
 }
-#endif
 
 /* Does a query (or an expression with no range table) use a temporary object? Inside a guard: refused if so. */
 static bool
 temp_in(Node *node, bool refuse)
 {
-	bool		found;
 #if PG_VERSION_NUM >= 190000
 	ObjectAddresses *addrs = new_object_addresses();
 	ObjectAddress obj;
+	bool		found;
 
 	collectDependenciesOfExpr(addrs, node, NIL);
 	found = find_temp_object(addrs, false, &obj);
 	free_object_addresses(addrs);
 	if (found && refuse)
 		refuse_temp_object(obj.classId, obj.objectId);
-#else
+	if (found)
+		return true;
+#endif
 	probing = !refuse;
 	probed = false;
 	PG_TRY();
@@ -1066,9 +1104,7 @@ temp_in(Node *node, bool refuse)
 		probing = false;
 	}
 	PG_END_TRY();
-	found = probed;
-#endif
-	return found;
+	return probed;
 }
 
 static void
@@ -1121,12 +1157,22 @@ calls_sql_walker(Node *node, void *context)
 static bool plans_dirty = false;
 
 static void
-note_plan_outside(Query *query)
+note_plan_outside(Query *query, const char *source)
 {
 	Oid			nsp;
 	Oid			toast;
 
 	if (plans_dirty)
+		return;
+	/*
+	 * A statement the client sent (its text is the one the server is running: debug_query_string, also for a
+	 * protocol-level prepared statement it binds) is planned for that statement alone, and no code in a guard can run
+	 * its plan: only a statement of a function's body (PL/pgSQL, SQL), kept in the plan cache, can be used again
+	 * there. Until the sixth review every statement marked the session, and a session that wrote to its temporary
+	 * table in each transaction threw away every cached plan (the watch trigger's, its own prepared statements) at
+	 * the next write to a watched table: 5.5 times the latency of a single-row write.
+	 */
+	if (source != NULL && source == debug_query_string)
 		return;
 	GetTempNamespaceState(&nsp, &toast);
 	if (!OidIsValid(nsp))
@@ -1145,6 +1191,60 @@ reset_plans_if_dirty(void)
 	}
 }
 
+/*
+ * A verdict outlives the session that reached it: it is recorded, and served to everyone. So it is judged only in a
+ * session that has no temporary object at all (the sixth review). The walk above refuses what a query names; it
+ * cannot see a name looked up while the code runs: to_regclass('pg_temp.v'), a cast of text to regclass or regtype,
+ * pg_input_is_valid(text, 'pg_temp.d'), set_config('default_text_search_config', 'pg_temp.cfg'), the RETURNING type
+ * of JSON_VALUE ... NULL ON ERROR, a record or an array read from text. Each found the verifier's objects, and four
+ * rounds of closing them one by one left the next one open. Hiding the temporary schema inside the guard
+ * (SetTempNamespaceState, as a parallel worker starts) was tried and is not sound: it fails an assertion of
+ * namespace.c on a server built with assertions, and a relation of the session opened inside the guard is cached
+ * as another session's (its own temporary table then fails with "cannot access temporary tables of other
+ * sessions"). Here nothing is hidden: there is nothing to find. Every object of the session's temporary schema
+ * depends on it in pg_depend (that is how PostgreSQL drops them when the session ends), so one probe of that
+ * index answers. DISCARD TEMP empties it.
+ */
+static bool
+temp_objects(void)
+{
+	Oid			nsp;
+	Oid			toast;
+	Relation	dep;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	bool		any;
+
+	GetTempNamespaceState(&nsp, &toast);
+	if (!OidIsValid(nsp))
+		return false;
+	dep = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(NamespaceRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
+	scan = systable_beginscan(dep, DependReferenceIndexId, true, NULL, 2, key);
+	any = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(dep, AccessShareLock);
+	return any;
+}
+
+void
+guard_require_no_temp(const char *what)
+{
+	if (guard_depth > 0)
+		return;					/* inside a guard none can be made, and the outermost call checked */
+	if (temp_objects())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("phasevec: %s does not run in a session that has temporary objects", what),
+				 errdetail("A proof would find them by name while it runs, and they are this session's, not its "
+						   "author's; the verdict is recorded for everyone."),
+				 errhint("Verify from a session with no temporary objects, or drop them first (DISCARD TEMP).")));
+	/* and no plan this session cached with one in it (since dropped) is used in a proof */
+	reset_plans_if_dirty();
+}
+
 static post_parse_analyze_hook_type prev_analyze = NULL;
 static planner_hook_type prev_planner = NULL;
 
@@ -1160,7 +1260,7 @@ guard_analyze(ParseState *pstate, Query *query, JUMBLE *jstate)
 		prev_analyze(pstate, query, jstate);
 	if (guard_depth == 0)
 	{
-		note_plan_outside(query);
+		note_plan_outside(query, pstate ? pstate->p_sourcetext : NULL);
 		return;
 	}
 	refuse_temp_in((Node *) query);
@@ -1183,7 +1283,7 @@ guard_plan(Query *parse, const char *query_string, int cursorOptions, ParamListI
 	if (guard_depth > 0)
 		refuse_temp_in((Node *) parse);
 	else
-		note_plan_outside(parse);
+		note_plan_outside(parse, query_string);
 #if PG_VERSION_NUM >= 190000
 	if (prev_planner)
 		return prev_planner(parse, query_string, cursorOptions, boundParams, es);
@@ -1441,7 +1541,31 @@ guard_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subI
 {
 	if (prev_object_access)
 		prev_object_access(access, classId, objectId, subId, arg);
-	if (access != OAT_FUNCTION_EXECUTE || guard_depth == 0)
+	if (guard_depth == 0)
+		return;
+	if (access == OAT_NAMESPACE_SEARCH && objectId >= FirstNormalObjectId && isAnyTempNamespace(objectId))
+	{
+		ObjectAccessNamespaceSearch *ns = (ObjectAccessNamespaceSearch *) arg;
+		Oid			mine;
+		Oid			toast;
+
+		/*
+		 * A temporary schema named by its own name (pg_temp_3.v), the session's or another's: refused. In a
+		 * search_path, another session's is left out (the session's own is put first if it is left out: it stays
+		 * where pg_temp puts it, last).
+		 */
+		GetTempNamespaceState(&mine, &toast);
+		if (ns->ereport_on_violation)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary schema \"%s\"",
+							get_namespace_name(objectId)),
+					 errdetail("A temporary schema is a session's, not the code's author's.")));
+		if (objectId != mine && objectId != toast)
+			ns->result = false;
+		return;
+	}
+	if (access != OAT_FUNCTION_EXECUTE)
 		return;
 	/* a temporary function is the session's, as a temporary table is (refuse_temp) */
 	if (temp_function(objectId))

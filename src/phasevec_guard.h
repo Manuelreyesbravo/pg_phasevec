@@ -55,6 +55,9 @@ extern int	guard_pin_settings(void);
 extern void guard_unpin_settings(int nest);
 extern bool guard_active(void);
 
+/* A verdict is judged only in a session with no temporary object (see phasevec_guard.c): ERROR otherwise. */
+extern void guard_require_no_temp(const char *what);
+
 /* The settings state of this session that a proof runs with: every replayable setting off its default. */
 extern ArrayType *guard_env_now(void);
 /* A recorded state, from its text[] (NULL: none recorded, every setting at its default). */

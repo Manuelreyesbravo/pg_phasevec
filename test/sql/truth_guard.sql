@@ -194,6 +194,8 @@ SELECT format($f$CREATE FUNCTION pg_temp.t_forget() RETURNS trigger LANGUAGE plp
 CREATE TRIGGER t_forget AFTER INSERT ON t_scratch FOR EACH ROW EXECUTE FUNCTION pg_temp.t_forget();
 INSERT INTO t_scratch VALUES (1);
 RESET ROLE;
+-- (sixth review) proofs are judged below, in this session: it may have no temporary object then
+DISCARD TEMP;
 SELECT s.key, s.text_hash = sha256(convert_to(t.body, $u$UTF8$u$)) AS the_rows_text
   FROM phasevec.sources s LEFT JOIN tnotes t ON t.id::text = s.key
  WHERE s.watch = :tid ORDER BY s.key;

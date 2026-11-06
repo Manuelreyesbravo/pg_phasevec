@@ -1293,6 +1293,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	max_cost = PG_GETARG_FLOAT8(5);
 	require_clock(timeout_ms);
 	require_fresh_snapshots();
+	guard_require_no_temp("verify()");
 	budget_us = interval_usec(PG_GETARG_INTERVAL_P(3));
 	InitMaterializedSRF(fcinfo, 0);
 	nest = guard_pin_settings();
@@ -1421,6 +1422,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	timeout_ms = PG_GETARG_INT32(2);
 	require_clock(timeout_ms);
 	require_fresh_snapshots();
+	guard_require_no_temp("verify_one()");
 	nest = guard_pin_settings();
 
 	become(owner, &was);

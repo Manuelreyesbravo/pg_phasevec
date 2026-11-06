@@ -146,27 +146,18 @@ SELECT public.pv_tt_kept() AS kept_out;
  t
 (1 row)
 
-SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
- key | verdict  |                                           error                                           
------+----------+-------------------------------------------------------------------------------------------
- 1   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary view "sv"
- 2   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary view "sv2"
- 3   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary type "e"
- 4   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary type "d"
- 5   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary operator "<"
- 6   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary collation "ci"
- 7   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary view "sv"
- 8   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary type "e"
- 9   | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary type "e"
- 10  | verified | 
- 11  | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary type "e"
-(11 rows)
-
-SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
- key | verdict  
------+----------
- 10  | verified
+SELECT public.pv_tt_kept() AS kept_out;
+ kept_out 
+----------
+ t
 (1 row)
+
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
+ERROR:  phasevec: verify() does not run in a session that has temporary objects
+SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
+ key | verdict 
+-----+---------
+(0 rows)
 
 -- out of the guard the verifier uses its objects as before
 SELECT qty FROM sv;
@@ -180,6 +171,27 @@ SELECT 'b'::pg_temp.e < 'a'::pg_temp.e AS out_of_guard;
 --------------
  t
 (1 row)
+
+-- (sixth review) Since then a verdict is judged only in a session with no temporary object (truth_lookup): above,
+-- verify() refuses to run. Dropped, they may leave behind the plan the verifier's session made of pv_tt_kept() with
+-- the temporary enum folded in: verify() throws away a plan the session made with one, a proof that calls the
+-- function parses it again, and every claim reads as the control's.
+DISCARD TEMP;
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
+ key | verdict  |                           error                           
+-----+----------+-----------------------------------------------------------
+ 1   | refuted  | relation "pg_temp.sv" does not exist
+ 2   | refuted  | relation "pg_temp.sv2" does not exist
+ 3   | refuted  | type "pg_temp.e" does not exist
+ 4   | refuted  | type "pg_temp.d" does not exist
+ 5   | refuted  | operator does not exist: integer pg_temp.< integer
+ 6   | refuted  | collation "pg_temp.ci" for encoding "UTF8" does not exist
+ 7   | refuted  | relation "pg_temp.sv" does not exist
+ 8   | refuted  | type "pg_temp.e" does not exist
+ 9   | refuted  | type "e" does not exist
+ 10  | verified | 
+ 11  | refuted  | function public.pv_tt_atomic() does not exist
+(11 rows)
 
 -- a recipe does not read a writer's temporary objects either: here a function the recipe calls searches pg_temp first
 -- (its owner's mistake), and a writer's temporary type named like the owner's would decide the text the watch trigger

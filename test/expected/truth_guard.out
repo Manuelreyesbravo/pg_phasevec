@@ -390,6 +390,8 @@ CREATE TRIGGER t_forget AFTER INSERT ON t_scratch FOR EACH ROW EXECUTE FUNCTION 
 INSERT INTO t_scratch VALUES (1);
 ERROR:  function phasevec._note(integer, unknown, unknown, unknown) does not exist at character 8
 RESET ROLE;
+-- (sixth review) proofs are judged below, in this session: it may have no temporary object then
+DISCARD TEMP;
 SELECT s.key, s.text_hash = sha256(convert_to(t.body, $u$UTF8$u$)) AS the_rows_text
   FROM phasevec.sources s LEFT JOIN tnotes t ON t.id::text = s.key
  WHERE s.watch = :tid ORDER BY s.key;
