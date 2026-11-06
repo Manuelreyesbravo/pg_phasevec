@@ -1209,6 +1209,7 @@ typedef struct ProofSession
 	BackgroundWorkerHandle *handle;
 	shm_mq_handle *req;
 	shm_mq_handle *ans;
+	bool		ended;			/* TerminateBackgroundWorker() was called for it */
 } ProofSession;
 
 typedef struct Msg
@@ -1551,6 +1552,16 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
 	"FOR NO KEY UPDATE"
 
+/*
+ * (fourteenth review) verify_one() takes its claim without waiting, in the transaction that judges it; when another
+ * holds it, it waits for it in a transaction of its own (CLAIM_TAKE_SQL), and tries again in a new one. In the
+ * thirteenth cut it waited in the transaction that judged: the proof's now() was that transaction's start, from
+ * before the wait, while its snapshot and its verified_at were from after it. A claim past due during the wait was
+ * recorded 'verified' and served fresh for a whole max_age; a true one that read a row stamped after its now() was
+ * recorded 'refuted'.
+ */
+#define CLAIM_TRY_SQL CLAIM_TAKE_SQL " SKIP LOCKED"
+
 static bool
 claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every)
 {
@@ -1639,6 +1650,7 @@ proof_sigterm(int signo, siginfo_t *info, void *context)
 
 static SPIPlanPtr worker_lock_plan = NULL;
 static SPIPlanPtr worker_take_plan = NULL;
+static SPIPlanPtr worker_try_plan = NULL;
 static SPIPlanPtr worker_attempt_plan = NULL;
 
 /*
@@ -1759,6 +1771,7 @@ phasevec_proof_main(Datum arg)
 		(void) kept_plan(&target.record_plan, RECORD_SQL, 6, at);
 		(void) kept_plan(&worker_lock_plan, CLAIM_LOCK_SQL, 3, lt);
 		(void) kept_plan(&worker_take_plan, CLAIM_TAKE_SQL, 2, lt);
+		(void) kept_plan(&worker_try_plan, CLAIM_TRY_SQL, 2, lt);
 		(void) kept_plan(&worker_attempt_plan, ATTEMPT_SQL, 2, lt);
 	}
 	SPI_finish();
@@ -1889,17 +1902,45 @@ phasevec_proof_main(Datum arg)
 				MemoryContextSwitchTo(per);
 			}
 
-			SetCurrentStatementStartTimestamp();
-			StartTransactionCommand();
-			/* each statement in a new snapshot, whatever default_transaction_isolation says; it records, so read-write */
-			XactIsoLevel = XACT_READ_COMMITTED;
-			XactReadOnly = RecoveryInProgress();
-			PushActiveSnapshot(GetTransactionSnapshot());
-			MemoryContextSwitchTo(per);
-			pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
-			if (!claim_taken(sh->owner, every ? worker_lock_plan : worker_take_plan, &target, &c, every))
-				what = ANSWER_SKIPPED;
-			else
+			/*
+			 * (fourteenth review) The claim is taken in the transaction that judges it without a wait in between:
+			 * the proof's now() (this transaction's start), its snapshot and its verified_at are one instant.
+			 */
+			for (bool gone = false;;)
+			{
+				bool		taken;
+
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				/* each statement in a new snapshot, whatever default_transaction_isolation says; it records, so read-write */
+				XactIsoLevel = XACT_READ_COMMITTED;
+				XactReadOnly = RecoveryInProgress();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				MemoryContextSwitchTo(per);
+				pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
+				taken = claim_taken(sh->owner, every ? worker_lock_plan : worker_try_plan, &target, &c, every);
+				if (taken || every != NULL || gone)
+				{
+					if (!taken)
+						what = ANSWER_SKIPPED;
+					break;
+				}
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+				/* held by another session: waited for here, in a transaction that judges nothing */
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				XactIsoLevel = XACT_READ_COMMITTED;
+				XactReadOnly = RecoveryInProgress();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				MemoryContextSwitchTo(per);
+				pgstat_report_activity(STATE_RUNNING, "phasevec: waiting for a claim another session holds");
+				gone = !claim_taken(sh->owner, worker_take_plan, &target, &c, NULL);
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+				MemoryContextSwitchTo(per);
+			}
+			if (what != ANSWER_SKIPPED)
 			{
 				if (kind == MSG_JUDGE)
 				{
@@ -1909,6 +1950,9 @@ phasevec_proof_main(Datum arg)
 					judge(c.proof, timeout_ms, max_cost, sh->author, GUARD_AUTHOR, c.env, &target, rls, c.key,
 						  c.asserted_for, &j);
 					pg_atomic_write_u32(&sh->judging, 0);
+					/* stamped with the proof's own now(): a verdict is never fresher than the clock it read */
+					if (j.at != 0)
+						j.at = GetCurrentTransactionStartTimestamp();
 				}
 				v = record_judgment(sh->owner, verifier, &target, &c, &j);
 			}
@@ -1947,15 +1991,23 @@ static ProofSession *proof_cur = NULL;
 /* (twelfth review) The call's keeper: a session of the owner that spends its claims' turns. */
 static ProofSession *keeper_cur = NULL;
 
+/*
+ * (fourteenth review) A session this verifier is waiting for to leave (proof_stop): no longer the call's, still to be
+ * freed. A cancel during the wait leaves it here, and the cleanup of the call ends and frees it.
+ */
+static ProofSession *proof_leaving = NULL;
+
 static void
 proof_on_exit(int code, Datum arg)
 {
-	if (proof_cur != NULL)
-		TerminateBackgroundWorker(proof_cur->handle);
-	proof_cur = NULL;
-	if (keeper_cur != NULL)
-		TerminateBackgroundWorker(keeper_cur->handle);
-	keeper_cur = NULL;
+	ProofSession **all[] = {&proof_cur, &keeper_cur, &proof_leaving};
+
+	for (int i = 0; i < lengthof(all); i++)
+	{
+		if (*all[i] != NULL)
+			TerminateBackgroundWorker((*all[i])->handle);
+		*all[i] = NULL;
+	}
 }
 
 /* The library this verifier runs: the worker loads the very same file. */
@@ -2042,25 +2094,52 @@ proof_start(Oid owner, int32 watch, Oid author, char **why)
 }
 
 /*
- * Done with a worker: detached (it ends by itself), or ended now (it may be inside a proof, or gone already). An
- * ended one is waited for (`wait`: not on the way out of an error), up to PROOF_GRACE_MS, so that the claim's row it
- * took and its slot of max_worker_processes are free again for the session that records it.
+ * Done with the worker in `*slot`: detached (it ends by itself), or ended now (it may be inside a proof, or gone
+ * already). An ended one is waited for (`wait`: not on the way out of an error), up to PROOF_GRACE_MS, so that the
+ * claim's row it took and its slot of max_worker_processes are free again for the session that records it.
+ *
+ * (fourteenth review) Safe to call again on what is left of it, at any point: each part is cleared before it is freed,
+ * and nothing that can be interrupted runs while the session is the call's. In the thirteenth cut the wait (it
+ * checks for interrupts) ran with the queues freed and the session still in proof_cur; a cancel there reached the
+ * cleanup of verify(), which freed the queues again: the server PANICked (stuck spinlock in shm_mq_detach_internal)
+ * and restarted, at the hands of any role that may call verify(). Now the session leaves the call's slot first and
+ * waits in proof_leaving, which the cleanup of the call (proof_stop_all) ends and frees.
  */
 static void
-proof_stop(ProofSession *ps, bool end_it, bool wait)
+proof_stop(ProofSession **slot, bool end_it, bool wait)
 {
+	ProofSession *ps = *slot;
+	shm_mq_handle *h;
+	dsm_segment *seg;
+
 	if (ps == NULL)
 		return;
-	if (end_it)
+	if (end_it && !ps->ended)
+	{
+		ps->ended = true;
 		TerminateBackgroundWorker(ps->handle);
+	}
 	/* detached first: a worker that is not ended leaves when it finds its verifier gone */
-	shm_mq_detach(ps->req);
-	shm_mq_detach(ps->ans);
-	if (wait)
+	if ((h = ps->req) != NULL)
+	{
+		ps->req = NULL;
+		shm_mq_detach(h);
+	}
+	if ((h = ps->ans) != NULL)
+	{
+		ps->ans = NULL;
+		shm_mq_detach(h);
+	}
+	if (wait && slot != &proof_leaving)
 	{
 		TimestampTz t0 = GetCurrentTimestamp();
 		pid_t		pid;
 
+		/* one at a time: one still here (it cannot be: its wait ended, or its call did) is ended now */
+		proof_stop(&proof_leaving, true, false);
+		proof_leaving = ps;
+		*slot = NULL;
+		slot = &proof_leaving;
 		while (GetBackgroundWorkerPid(ps->handle, &pid) != BGWH_STOPPED &&
 			   !TimestampDifferenceExceeds(t0, GetCurrentTimestamp(), PROOF_GRACE_MS))
 		{
@@ -2069,9 +2148,22 @@ proof_stop(ProofSession *ps, bool end_it, bool wait)
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
-	dsm_detach(ps->seg);
+	*slot = NULL;
+	seg = ps->seg;
+	ps->seg = NULL;
+	if (seg != NULL)
+		dsm_detach(seg);
 	pfree(ps->handle);
 	pfree(ps);
+}
+
+/* The end of a call (`end_it`: on its way out of an error): every session it has, or is waiting for, is let go. */
+static void
+proof_stop_all(bool end_it)
+{
+	proof_stop(&proof_cur, end_it, false);
+	proof_stop(&keeper_cur, end_it, false);
+	proof_stop(&proof_leaving, true, false);
 }
 
 /*
@@ -2262,8 +2354,7 @@ line_takes(const Line *l, Oid author)
 static void
 line_restart(Line *l, bool end_it)
 {
-	proof_stop(proof_cur, end_it, true);
-	proof_cur = NULL;
+	proof_stop(&proof_cur, end_it, true);
 	l->nsent = 0;
 	l->since = GetCurrentTimestamp();
 }
@@ -2333,8 +2424,7 @@ line_unspent(const Line *l)
 static void
 keeper_stop(bool end_it)
 {
-	proof_stop(keeper_cur, end_it, false);
-	keeper_cur = NULL;
+	proof_stop(&keeper_cur, end_it, false);
 }
 
 /*
@@ -3121,15 +3211,11 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
-		proof_stop(proof_cur, true, false);
-		proof_cur = NULL;
-		keeper_stop(true);
+		proof_stop_all(true);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	proof_stop(proof_cur, false, false);
-	proof_cur = NULL;
-	keeper_stop(false);
+	proof_stop_all(false);
 	MemoryContextDelete(l.cx);
 	MemoryContextDelete(per);
 	return (Datum) 0;
@@ -3212,13 +3298,11 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
-		proof_stop(proof_cur, true, false);
-		proof_cur = NULL;
+		proof_stop_all(true);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	proof_stop(proof_cur, false, false);
-	proof_cur = NULL;
+	proof_stop_all(false);
 	if (!d.recorded || d.j.out == OUT_INTERRUPTED || d.j.out == OUT_NO_VERDICT)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

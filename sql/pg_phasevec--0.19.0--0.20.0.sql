@@ -2,6 +2,15 @@
 -- judged in one state under one clock, and the only door to it is a function that knows who calls it.
 \echo Use "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" to load this file. \quit
 
+-- (fourteenth review) The extension's tables are taken first, in the order its writers take them: a write to a watched
+-- table reads its watch (phasevec.watches), notes the row's text (sources, and lexstats and lexdocs for a lexical
+-- watch), and an assert() in the same transaction writes phasevec.truth. Below, truth is altered before watches: in
+-- the thirteenth cut a writer that held watches on its way to truth and this script, holding truth on its way to
+-- watches, deadlocked, and one of them was aborted. Run the update alone, not in a transaction with DDL on watched
+-- tables (that DDL waits for their writers while this holds the extension's tables they wait for).
+LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdocs, phasevec.truth
+    IN ACCESS EXCLUSIVE MODE;
+
 -- Found by the public-readiness review of 2026-11-05, then by an adversarial review of the first cut of 0.20.0
 -- (never released) that ran the attacks:
 --
