@@ -5,7 +5,9 @@
 # 1. A session that ends is the proof's failure only when the proof ended it. A role with only pg_signal_backend (or
 #    the verifier, from another session of its own) terminated a proof's worker, and a true claim was recorded refuted
 #    and halted for good (it left brief()). Now a worker ended by another process leaves the claim due, with the reason
-#    ('interrupted'); one the proof ends itself (here its author's transaction_timeout) is still refuted and halted.
+#    ('interrupted'); one the proof ends itself (here it terminates its own session) is still refuted and halted.
+#    (Until the tenth review the author's transaction_timeout did it here; a worker no longer takes its author's
+#    session timeouts: test/truth_unjudged.sh.)
 # 2. A proof that waits for a lock the verifier holds through a third session (an ALTER TABLE queued behind the
 #    verifier's lock): the check saw only a direct wait, the proof waited for its clock and was recorded refuted, and
 #    the ALTER and every reader of the table waited n times the clock. The verifier walks the waits now: an error.
@@ -42,6 +44,10 @@ GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, fl
                           phasevec.verify_one(text, text, int, float8), phasevec.brief(text, int) TO pv_w_v;
 CREATE FUNCTION public.gate(k int) RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN PERFORM pg_advisory_xact_lock_shared(k); RETURN true; END $$;
+-- a proof's own way to end its session (in practice a C function's FATAL): pg_terminate_backend of itself, under a
+-- name the guard does not know
+CREATE FUNCTION public.end_my_session(pid int, timeout bigint DEFAULT 0) RETURNS boolean
+    LANGUAGE internal STRICT VOLATILE AS 'pg_terminate_backend';
 CREATE TABLE jobs (id int PRIMARY KEY, body text);
 INSERT INTO jobs VALUES (1, 'waits at the gate'), (2, 'plain'), (3, 'sleeps');
 CREATE TABLE inv (id int, overdue boolean);
@@ -101,8 +107,8 @@ for killer in pv_w_mon pv_w_v; do
     next=$(q -c "SET ROLE pv_w_v" -c "SELECT string_agg(key || ' ' || verdict, ', ' ORDER BY key) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
     [ "$next" = "1 verified" ] && echo "ok - it is due, and the next verify() judges it" || { echo "not ok - the next verify() did not judge it ($next)"; fallas=1; }
 done
-# the proof that ends its own session: its author's every session ends a transaction after 400 ms, and it sleeps 1 s
-q -c "ALTER ROLE pv_w_b SET transaction_timeout = '400ms'" -c "SET ROLE pv_w_b" -c "SELECT phasevec.assert('jobs', '3', '(SELECT true FROM pg_sleep(1))')" >/dev/null
+# the proof that ends its own session
+q -c "SET ROLE pv_w_b" -c "SELECT phasevec.assert('jobs', '3', 'public.end_my_session(pg_backend_pid())')" >/dev/null
 ended=$(q -c "SET ROLE pv_w_v" -c "SELECT key || ' ' || verdict FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '3'" 2>&1)
 halted=$(q -c "SELECT verdict || ' ' || halted FROM phasevec.truth WHERE key = '3' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'jobs')")
 echo "a proof that ends its own session: verify said: $ended; it is: $halted"

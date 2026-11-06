@@ -147,12 +147,27 @@
 -- 33. A verifier with an uncommitted write that refuted a claim committed, together with that write, a 'verified' its
 --    proof reached on the state before it. A transaction that has written may not verify, and the worker takes,
 --    judges and records each claim in a transaction of its own, committing each verdict as it is reached.
+--
+-- Then a tenth adversarial review ran attacks against the ninth cut (c1461cf, never released):
+--
+-- 34. verify_one() judged before it took the claim's row, then waited for the row a verify() was judging; when that
+--    one had recorded 'refuted' (the claim had turned false), verify_one() wrote its older 'verified' over it, and
+--    brief() served it. Every worker takes the claim's row before it judges, and _truth_set does not replace a
+--    verdict (or an interruption) read later than the judgment it records.
+-- 35. An ordinary author set its own role's transaction_timeout to 1 ms: its proofs' sessions ended before they judged,
+--    and its claims kept their old 'verified' forever. The worker pins the session timeouts before it connects.
+-- 36. A claim that cannot be judged for its author's sake (a new session of the author fails as it starts) kept serving
+--    its verdict, and with p_n such claims held the head of the queue and kept other authors' claims from being
+--    judged. It is recorded (unjudged_at, unjudged_until, unjudged_why), reads 'unproven' once that has lasted
+--    longer than p_every, and waits behind the claims judged since (tried_at).
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
                            ADD COLUMN proof_env text[], ADD COLUMN halted boolean NOT NULL DEFAULT false,
                            ADD COLUMN looked_at timestamptz, ADD COLUMN looked_for bytea,
-                           ADD COLUMN interrupted_at timestamptz, ADD COLUMN interrupted_why text;
+                           ADD COLUMN interrupted_at timestamptz, ADD COLUMN interrupted_why text,
+                           ADD COLUMN unjudged_at timestamptz, ADD COLUMN unjudged_until timestamptz,
+                           ADD COLUMN unjudged_why text, ADD COLUMN tried_at timestamptz;
 COMMENT ON COLUMN phasevec.truth.asserted_by IS
     $q$The name of the role that asserted the proof, when it did (0.20.0). With asserted_by_oid: the proof runs as that role only while the OID still has this name.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by_oid IS
@@ -171,6 +186,14 @@ COMMENT ON COLUMN phasevec.truth.interrupted_at IS
     $q$When the session that ran this proof was last ended by another process while it ran (0.20.0, ninth review): nothing was judged, the claim stays due, and it waits behind the claims judged since. Cleared by a verdict or an assert.$q$;
 COMMENT ON COLUMN phasevec.truth.interrupted_why IS
     $q$Who ended the session that ran this proof (interrupted_at): the process that terminated it.$q$;
+COMMENT ON COLUMN phasevec.truth.unjudged_at IS
+    $q$Since when this claim cannot be judged for its author's sake (0.20.0, tenth review): a new session of its author ended before it judged (its configuration, its connection), or failed outside the proof. Cleared by a verdict or an assert.$q$;
+COMMENT ON COLUMN phasevec.truth.unjudged_until IS
+    $q$Until when the verdict stands although the claim cannot be judged (unjudged_at plus the p_every of the verify() that found it; 10 minutes for verify_one()): from then on it reads 'unproven' (0.20.0).$q$;
+COMMENT ON COLUMN phasevec.truth.unjudged_why IS
+    $q$Why the last attempt to judge this claim did not judge it (unjudged_at) (0.20.0).$q$;
+COMMENT ON COLUMN phasevec.truth.tried_at IS
+    $q$When the last attempt that judged nothing found this claim unjudgeable (unjudged_at): it waits behind the claims judged since (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.halted IS
     $q$The session that ran this proof ended while it ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
 
@@ -194,6 +217,8 @@ CREATE OR REPLACE FUNCTION phasevec._verdict(t phasevec.truth) RETURNS text
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT CASE WHEN t.verdict = $q$replaced$q$ THEN $q$replaced$q$
                 WHEN t.expires_at IS NOT NULL AND t.expires_at <= now() THEN $q$expired$q$
+                -- (tenth review) a verdict whose claim has not been judgeable for longer than it was fresh
+                WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.unjudged_until <= now() THEN $q$unproven$q$
                 WHEN t.verdict = $q$verified$q$
                  AND (t.verified_for IS NULL
                       OR t.verified_for IS DISTINCT FROM phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid,
@@ -224,7 +249,8 @@ BEGIN
            proof_env = EXCLUDED.proof_env, halted = false,
            verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$unproven$q$ END,
            verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now(),
-           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
+           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL,
+           unjudged_at = NULL, unjudged_until = NULL, unjudged_why = NULL, tried_at = NULL;
 END;
 $f$;
 CREATE OR REPLACE FUNCTION phasevec.assert(p_watch text, p_key text, p_proof text DEFAULT NULL, p_topic text DEFAULT NULL,
@@ -284,8 +310,10 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 THEN t.looked_at IS NULL OR t.looked_at < now() - p_every OR t.looked_for IS DISTINCT FROM s.text_hash
                 ELSE t.verified_at IS NULL OR t.verified_at < now() - p_every END
        AND (r.oid IS NULL OR pg_catalog.pg_has_role(p_verifier, r.oid, $q$USAGE$q$))
-     -- a claim whose proof's session another process ended (interrupted_at) stays due, behind those judged since
-     ORDER BY CASE WHEN x.stale THEN NULL ELSE greatest(t.verified_at, t.interrupted_at) END NULLS FIRST, t.key
+     -- a claim whose proof's session another process ended (interrupted_at), or that could not be judged for its
+     -- author's sake (tried_at, tenth review), stays due, behind those judged since: it never holds the head of p_n
+     ORDER BY CASE WHEN x.stale THEN t.tried_at ELSE greatest(t.verified_at, t.interrupted_at, t.tried_at) END
+              NULLS FIRST, t.key
      LIMIT p_n
 $f$;
 
@@ -304,7 +332,10 @@ $f$;
 -- Record what a proof's run found, only for the claim it judged (p_bind: the same text, proof, author and settings).
 -- Anything else changed meanwhile: nothing is recorded. p_outcome NULL records nothing (the row moved while the
 -- proof ran). p_at: when the row was read for it, the state it judged (verified_at). Returns the verdict as it
--- reads now.
+-- reads now. (tenth review) A verdict (or an interruption) read after p_at is not replaced: verdicts only move
+-- forward in time. A worker takes the claim's row before it judges, so of two judgments of one claim the later one
+-- commits later; a record of what a verifier found about an earlier run (a proof that took too long) can still come
+-- after a newer verdict, and is dropped.
 DROP FUNCTION phasevec._truth_set(int, text, boolean, text);
 CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_error text, p_bind bytea,
                                     p_at timestamptz)
@@ -317,7 +348,8 @@ BEGIN
         -- the trigger did not see it (_truth_stale is false), the row and the claim disagree: 'unproven'.
         UPDATE phasevec.truth t
            SET looked_at = now(),
-               looked_for = (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = t.watch AND s.key = t.key)
+               looked_for = (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = t.watch AND s.key = t.key),
+               unjudged_at = NULL, unjudged_until = NULL, unjudged_why = NULL, tried_at = NULL
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict IN ($q$verified$q$, $q$refuted$q$)
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
            AND phasevec._truth_stale(t);
@@ -327,9 +359,12 @@ BEGIN
         UPDATE phasevec.truth t
            SET verdict = p_outcome, verified_at = coalesce(p_at, now()), last_error = p_error, halted = false,
                verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END,
-               looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL
+               looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL,
+               unjudged_at = NULL, unjudged_until = NULL, unjudged_why = NULL, tried_at = NULL
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
-           AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
+           AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+           AND (t.verified_at IS NULL OR t.verified_at <= coalesce(p_at, now()))
+           AND (t.interrupted_at IS NULL OR t.interrupted_at <= coalesce(p_at, now()));
     END IF;
     SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
     RETURN v;
@@ -355,7 +390,9 @@ BEGIN
      WHERE t.watch = p_watch AND t.verdict <> $q$replaced$q$
        AND sha256(convert_to(t.key, $q$UTF8$q$)) = p_key_hash
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
-       AND (t.changed_at IS NULL OR t.changed_at <= p_started);
+       AND (t.changed_at IS NULL OR t.changed_at <= p_started)
+       -- (tenth review) a verdict read after this proof began stands
+       AND (t.verified_at IS NULL OR t.verified_at <= p_started);
     IF NOT FOUND THEN
         RETURN 0;
     END IF;
@@ -365,6 +402,7 @@ BEGIN
     UPDATE phasevec.truth t
        SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
            interrupted_at = NULL, interrupted_why = NULL,
+           unjudged_at = NULL, unjudged_until = NULL, unjudged_why = NULL, tried_at = NULL,
            last_error = $q$the session that ran this proof ended while it ran: not run again until it is asserted again$q$
      WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
@@ -383,6 +421,27 @@ DECLARE v text;
 BEGIN
     UPDATE phasevec.truth t
        SET interrupted_at = now(), interrupted_why = p_why
+     WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
+       AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
+    SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
+    RETURN v;
+END;
+$f$;
+
+-- (tenth review) A claim that could not be judged for its author's sake: a new session of its author ended before it
+-- judged (its configuration: a library it preloads that fails, a connection it may not make) or failed outside the
+-- proof. Nothing is judged; the claim stays due, behind the claims judged since (tried_at), and keeps its verdict
+-- until unjudged_until (when this began, plus p_every: 10 minutes when NULL, as verify_one() passes), then reads
+-- 'unproven' (_verdict). An author can keep its claims from being judged, never keep their verdicts.
+-- Returns the verdict as it reads now.
+CREATE FUNCTION phasevec._truth_unjudged(p_watch int, p_key text, p_bind bytea, p_why text, p_every interval)
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE v text;
+BEGIN
+    UPDATE phasevec.truth t
+       SET unjudged_at = coalesce(t.unjudged_at, now()),
+           unjudged_until = coalesce(t.unjudged_until, now() + coalesce(p_every, interval $q$10 minutes$q$)),
+           unjudged_why = p_why, tried_at = now()
      WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
@@ -701,7 +760,7 @@ REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
     phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea, oid, timestamptz),
-    phasevec._truth_interrupted(int, text, bytea, text),
+    phasevec._truth_interrupted(int, text, bytea, text), phasevec._truth_unjudged(int, text, bytea, text, interval),
     phasevec._note_set(int, text, bytea, text), phasevec.adopt(text, regrole, text[], text[]),
     phasevec._door_recall(text, text, int, boolean, text[]), phasevec._door_disputes(text, text[]),
     phasevec._door_replacement(text, text, text[]), phasevec._door_truth_coverage(text, text[])
