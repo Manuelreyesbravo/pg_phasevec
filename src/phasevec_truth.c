@@ -1654,6 +1654,11 @@ static const char *const worker_clocks[] = {
 	"idle_session_timeout"
 };
 
+/* (thirteenth review) No parallel worker runs any part of a proof: see phasevec_proof_main. */
+static const char *const worker_one_process[][2] = {
+	{"max_parallel_workers_per_gather", "0"}, {"max_parallel_workers", "0"}, {"debug_parallel_query", "off"}
+};
+
 /*
  * The proof's own session: a background worker, a new session of the claim's author (or of the owner, to record
  * what needs no proof). Claims come in one at a time; each is taken, judged and recorded in a transaction of its own,
@@ -1717,6 +1722,17 @@ phasevec_proof_main(Datum arg)
 	for (int i = 0; i < lengthof(worker_clocks); i++)
 		SetConfigOption(worker_clocks[i], "0", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("exit_on_error", "off", PGC_SUSET, PGC_S_OVERRIDE);
+	/*
+	 * (thirteenth review) A proof runs in one process: every wait it makes is this session's own, the one that judges
+	 * it (lock_waited_since, prove_timeout_handler). A wait for a lock in a parallel worker of the proof was not seen:
+	 * the leader waits on the Gather's queue, so a lock another session held past the clock got a true claim
+	 * recorded refuted for its time. The author's role chose that (debug_parallel_query, or a parallel plan with
+	 * parallel_leader_participation off). No planner setting of the author's, a SET in the proof or a function's SET
+	 * clause, is applied over these (a lower source): no Gather is planned, and none forced by debug_parallel_query
+	 * gets a worker. The planner's cost of a proof (its max_cost) is then the cost of a plan with no parallelism.
+	 */
+	for (int i = 0; i < lengthof(worker_one_process); i++)
+		SetConfigOption(worker_one_process[i][0], worker_one_process[i][1], PGC_SUSET, PGC_S_OVERRIDE);
 	/* a new session of the author: it may be a role that does not log in (the verifier may act as it) */
 	BackgroundWorkerInitializeConnectionByOid(sh->db, sh->author, BGWORKER_BYPASS_ROLELOGINCHECK);
 	process_session_preload_libraries();
@@ -2037,7 +2053,10 @@ proof_stop(ProofSession *ps, bool end_it, bool wait)
 		return;
 	if (end_it)
 		TerminateBackgroundWorker(ps->handle);
-	if (end_it && wait)
+	/* detached first: a worker that is not ended leaves when it finds its verifier gone */
+	shm_mq_detach(ps->req);
+	shm_mq_detach(ps->ans);
+	if (wait)
 	{
 		TimestampTz t0 = GetCurrentTimestamp();
 		pid_t		pid;
@@ -2050,8 +2069,6 @@ proof_stop(ProofSession *ps, bool end_it, bool wait)
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
-	shm_mq_detach(ps->req);
-	shm_mq_detach(ps->ans);
 	dsm_detach(ps->seg);
 	pfree(ps->handle);
 	pfree(ps);
@@ -2237,11 +2254,15 @@ line_takes(const Line *l, Oid author)
 	return l->qn == 0 || !OidIsValid(now) || now == author;
 }
 
-/* The worker is done: the claims it had not answered go to the next one. */
+/*
+ * The worker is done: the claims it had not answered go to the next one. One that is not ended (another author's
+ * claims come next) is waited for too: (thirteenth review) its slot is the one the next author's session takes, and
+ * with no other free that one did not start, and its claims were not judged.
+ */
 static void
 line_restart(Line *l, bool end_it)
 {
-	proof_stop(proof_cur, end_it, end_it);
+	proof_stop(proof_cur, end_it, true);
 	proof_cur = NULL;
 	l->nsent = 0;
 	l->since = GetCurrentTimestamp();
@@ -2298,6 +2319,16 @@ line_unjudged(Line *l, const char *why, bool author_wide)
 	}
 }
 
+/* Is a queued claim's turn not spent yet? */
+static bool
+line_unspent(const Line *l)
+{
+	for (int i = 0; i < l->qn; i++)
+		if (!l->q[(l->qh + i) % PROOF_AHEAD].spent)
+			return true;
+	return false;
+}
+
 /* Done with the call's keeper: detached (it ends by itself), or ended now. */
 static void
 keeper_stop(bool end_it)
@@ -2341,13 +2372,20 @@ line_spend(Line *l, bool *stop)
 		 */
 		if (batch == 0 || (ready > 2 && batch < PROOF_AHEAD / 2))
 			return NULL;
+		/* (thirteenth review) not before the session that tries them runs (line_next) */
+		if (proof_cur == NULL && OidIsValid(line_author(l)))
+			return NULL;
 		if (keeper_cur == NULL)
 		{
 			char	   *why = NULL;
 
 			keeper_cur = proof_start(l->owner, l->t->watch, l->owner, &why);
 			if (keeper_cur == NULL)
-				return h->spent ? NULL : why;
+				return h->spent ? NULL :
+					psprintf("not judged: no background worker is free for the session that spends the claims' turns "
+							 "(verify() needs two at a time, that one and one of the proof's author; "
+							 "max_worker_processes is %d): nothing is recorded, and it keeps its turn",
+							 max_worker_processes);
 		}
 		{
 			MemoryContext o = MemoryContextSwitchTo(l->cx);
@@ -2480,7 +2518,30 @@ line_next(Line *l, Done *d)
 		if (keeps)
 		{
 			bool		stop;
-			const char *why = line_spend(l, &stop);
+			const char *why;
+
+			/*
+			 * (thirteenth review) Every session the step needs runs before a turn is spent: the author's, then the
+			 * keeper (line_spend). The keeper started first took the last free slot and spent the turns of the whole
+			 * batch; then no session of the author could start, and each claim of the batch was 'not judged' with its
+			 * turn spent: an author holding a slot on every other call kept chosen claims of another from ever being
+			 * tried. Now a session that cannot start leaves the claims their turns. The author's session gets
+			 * nothing before the head's turn is spent (below): ending it then only starts another.
+			 */
+			if (proof_cur == NULL && OidIsValid(author) && line_unspent(l))
+			{
+				char	   *nowhy = NULL;
+
+				proof_cur = proof_start(l->owner, l->t->watch, author, &nowhy);
+				l->nsent = 0;
+				if (proof_cur == NULL)
+				{
+					line_done(l, d, OUT_NOT_JUDGED, nowhy);
+					return;
+				}
+				l->since = GetCurrentTimestamp();
+			}
+			why = line_spend(l, &stop);
 
 			if (why != NULL)
 			{
@@ -2516,9 +2577,19 @@ line_next(Line *l, Done *d)
 					CHECK_FOR_INTERRUPTS();
 					continue;
 				}
+				/*
+				 * (thirteenth review) A claim whose turn is spent finds no slot only when its author's session was
+				 * started for it and then ended (its proof ended or overran it, a placeholder, its author ended it):
+				 * not tried, and its turn stays spent, as when its author ends the session that has it.
+				 */
 				line_done(l, d, OUT_NOT_JUDGED, h->kind == MSG_RECORD ?
 						  psprintf("%s (%s)", h->rec.err ? h->rec.err : "nothing judged",
-								   "not recorded: no background worker was free to record it") : why);
+								   "not recorded: no background worker was free to record it") :
+						  keeps && h->spent ?
+						  psprintf("not judged: no background worker was free for a new session of its author after "
+								   "the one started for it ended (max_worker_processes is %d): nothing is recorded, its "
+								   "turn is spent, and its verdict stays as it was until its horizon",
+								   max_worker_processes) : why);
 				return;
 			}
 			l->since = GetCurrentTimestamp();
