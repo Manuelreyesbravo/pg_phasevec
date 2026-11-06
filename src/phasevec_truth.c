@@ -235,6 +235,29 @@ typedef struct Target
 	"JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace " \
 	"WHERE %s OPERATOR(pg_catalog.=) $1"
 
+/*
+ * A statement phasevec runs on every call (and the watch trigger on every row) is parsed and planned once per session
+ * and kept; PostgreSQL plans it again when what it reads changes. Prepared at its first use, in the state its every
+ * use runs in.
+ */
+static SPIPlanPtr
+kept_plan(SPIPlanPtr *slot, const char *sql, int nargs, Oid *types)
+{
+	if (*slot == NULL)
+	{
+		SPIPlanPtr	p = SPI_prepare(sql, nargs, types);
+
+		if (p == NULL)
+			elog(ERROR, "phasevec: could not prepare a statement: %s", SPI_result_code_string(SPI_result));
+		if (SPI_keepplan(p) != 0)
+			elog(ERROR, "phasevec: could not keep a statement");
+		*slot = p;
+	}
+	return *slot;
+}
+
+static SPIPlanPtr target_plan[2] = {NULL, NULL};	/* TARGET_SQL by name, by id */
+
 /* The watch and how to read its rows, by name (text) or by id (int4). SPI connected, as the owner. */
 static void
 load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
@@ -246,8 +269,8 @@ load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
 	bool		isnull;
 	MemoryContext o;
 
-	if (SPI_execute_with_args(psprintf(TARGET_SQL, by_id ? "w.id" : "w.name"), 1, at, av, NULL, true, 1)
-		!= SPI_OK_SELECT)
+	if (SPI_execute_plan(kept_plan(&target_plan[by_id ? 1 : 0], psprintf(TARGET_SQL, by_id ? "w.id" : "w.name"), 1, at),
+						 av, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the watch could not be read");
 	if (SPI_processed != 1)
 	{
@@ -1622,6 +1645,8 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	"FROM (SELECT ($2).*) r) x"
 #define OBSERVE_OLD_SQL "SELECT ($1).%s::pg_catalog.text"
 
+static SPIPlanPtr note_set_plan = NULL;
+
 static void
 note_set(int32 watch, const char *key, Datum hash, bool hash_null, const char *body)
 {
@@ -1630,9 +1655,77 @@ note_set(int32 watch, const char *key, Datum hash, bool hash_null, const char *b
 	body ? CStringGetTextDatum(body) : (Datum) 0};
 	char		nulls[5] = {' ', ' ', hash_null ? 'n' : ' ', body ? ' ' : 'n', '\0'};
 
-	if (SPI_execute_with_args("SELECT phasevec._note_set($1, $2, $3, $4)", 4, at, av, nulls, false, 1)
-		!= SPI_OK_SELECT)
+	if (SPI_execute_plan(kept_plan(&note_set_plan, "SELECT phasevec._note_set($1, $2, $3, $4)", 4, at),
+						 av, nulls, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the row was not noted");
+}
+
+/*
+ * The watch trigger's reading of a row, prepared once per watch and row type (a partition has its own) and kept:
+ * prepared inside the guard, as the table's owner in the pinned settings, as it always runs. A watch whose recipe,
+ * key column or table owner changed is prepared again.
+ */
+typedef struct ObserveKey
+{
+	int32		watch;
+	Oid			rowtype;
+} ObserveKey;
+
+typedef struct ObservePlans
+{
+	ObserveKey	key;
+	Oid			relowner;
+	char	   *key_col;
+	char	   *recipe;
+	SPIPlanPtr	plan[2];		/* the old row's key; the new row's keys, text and hash */
+} ObservePlans;
+
+static HTAB *observe_plans = NULL;
+
+static SPIPlanPtr
+observe_plan(const Target *t, Oid rowtype, bool new_row)
+{
+	ObserveKey	k;
+	ObservePlans *e;
+	bool		found;
+	Oid			at[2] = {rowtype, rowtype};
+
+	if (observe_plans == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ObserveKey);
+		ctl.entrysize = sizeof(ObservePlans);
+		observe_plans = hash_create("phasevec watch trigger plans", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	memset(&k, 0, sizeof(k));
+	k.watch = t->watch;
+	k.rowtype = rowtype;
+	e = hash_search(observe_plans, &k, HASH_ENTER, &found);
+	if (!found)
+	{
+		e->key_col = e->recipe = NULL;
+		e->plan[0] = e->plan[1] = NULL;
+	}
+	if (e->key_col == NULL || e->recipe == NULL || e->relowner != t->relowner ||
+		strcmp(e->key_col, t->key_col) != 0 || strcmp(e->recipe, t->recipe) != 0)
+	{
+		for (int i = 0; i < 2; i++)
+			if (e->plan[i] != NULL)
+				SPI_freeplan(e->plan[i]);
+		e->plan[0] = e->plan[1] = NULL;
+		if (e->key_col)
+			pfree(e->key_col);
+		if (e->recipe)
+			pfree(e->recipe);
+		e->key_col = e->recipe = NULL;
+		e->relowner = t->relowner;
+		e->key_col = MemoryContextStrdup(TopMemoryContext, t->key_col);
+		e->recipe = MemoryContextStrdup(TopMemoryContext, t->recipe);
+	}
+	if (new_row)
+		return kept_plan(&e->plan[1], psprintf(OBSERVE_SQL, t->key_col, t->key_col, t->recipe), 2, at);
+	return kept_plan(&e->plan[0], psprintf(OBSERVE_OLD_SQL, t->key_col), 1, at);
 }
 
 Datum
@@ -1694,7 +1787,6 @@ phasevec_observe(PG_FUNCTION_ARGS)
 
 		PG_TRY();
 		{
-			Oid			at[2] = {rowtype, rowtype};
 			Datum		av[2];
 			char		nulls[3] = {oldt ? ' ' : 'n', newt ? ' ' : 'n', '\0'};
 			MemoryContext o;
@@ -1702,14 +1794,8 @@ phasevec_observe(PG_FUNCTION_ARGS)
 			av[0] = oldt ? heap_copy_tuple_as_datum(oldt, desc) : (Datum) 0;
 			av[1] = newt ? heap_copy_tuple_as_datum(newt, desc) : (Datum) 0;
 			guard_enter(&g, t.relowner, GUARD_RENDER, NULL);
-			if (newt)
-			{
-				if (SPI_execute_with_args(psprintf(OBSERVE_SQL, t.key_col, t.key_col, t.recipe), 2, at, av, nulls,
-										  true, 1) != SPI_OK_SELECT || SPI_processed != 1)
-					elog(ERROR, "phasevec: the row could not be read");
-			}
-			else if (SPI_execute_with_args(psprintf(OBSERVE_OLD_SQL, t.key_col), 1, at, av, nulls, true, 1)
-					 != SPI_OK_SELECT || SPI_processed != 1)
+			if (SPI_execute_plan(observe_plan(&t, rowtype, newt != NULL), av, nulls, true, 1)
+				!= SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "phasevec: the row could not be read");
 			o = MemoryContextSwitchTo(keep);
 			{
