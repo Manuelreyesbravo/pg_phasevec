@@ -104,33 +104,13 @@ SELECT * FROM pv_noted($w$d3$w$);
  3   | t
 (3 rows)
 
--- (4) a partition attached with its columns in another order (a row type of its own, read by name)
+-- (4) (eighteenth review) a partitioned table is not watched: until then a partition attached with its columns in
+-- another order was read by name here, as a row of the watch's table
 CREATE TABLE parts (id int, body text, tag text) PARTITION BY RANGE (id);
 CREATE TABLE parts_1 PARTITION OF parts FOR VALUES FROM (0) TO (100);
 ALTER TABLE parts ADD PRIMARY KEY (id);
 SELECT phasevec.watch($w$parts$w$, $w$parts$w$::regclass, $k$id$k$, $r$r.body || ' / ' || r.tag$r$, $n$r1$n$) > 0 AS watch;
- watch 
--------
- t
-(1 row)
-
-INSERT INTO parts VALUES (1, $t$first$t$, $t$a$t$);
-CREATE TABLE parts_2 (tag text, extra int, body text, id int NOT NULL);
-ALTER TABLE parts_2 DROP COLUMN extra;
-ALTER TABLE parts ATTACH PARTITION parts_2 FOR VALUES FROM (100) TO (200);
-INSERT INTO parts VALUES (101, $t$second$t$, $t$b$t$);
-UPDATE parts SET tag = $t$c$t$ WHERE id = 1;
--- and the first partition's columns renamed under the session's plan
-ALTER TABLE parts RENAME COLUMN tag TO tag_old;
-ALTER TABLE parts ADD COLUMN tag text DEFAULT $t$new$t$;
-UPDATE parts SET body = body || $t$!$t$;
-SELECT * FROM pv_noted($w$parts$w$);
- key | noted 
------+-------
- 1   | t
- 101 | t
-(2 rows)
-
+ERROR:  phasevec: public.parts cannot be watched by id: it is a partitioned table
 DROP TABLE docs, d2, d3, parts;
 DROP FUNCTION pv_noted(text);
 DROP EXTENSION pg_phasevec;

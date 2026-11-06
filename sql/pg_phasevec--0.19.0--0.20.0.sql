@@ -2,6 +2,24 @@
 -- judged in one state under one clock, and the only door to it is a function that knows who calls it.
 \echo Use "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" to load this file. \quit
 
+-- (eighteenth review) 0.20.0 lives in a UTF8 database only: CREATE EXTENSION and this update refuse any other. A
+-- claim's identity and a key's hash are the bytes of their text; in a UTF8 database every one of them is the same
+-- UTF-8 on every side (the proof's session, _truth_halted, a reader that hashes what it read). In the seventeenth cut
+-- they were converted to UTF-8 first, and in SQL_ASCII, WIN1252 or LATIN1 a byte with no UTF-8 equivalent raised:
+-- one author's assert() stopped verify() for its whole watch, and a halt was never recorded. The hashing takes the
+-- bytes as they are (it cannot fail), in any database, as a second line.
+DO $enc$
+BEGIN
+    IF pg_catalog.getdatabaseencoding() OPERATOR(pg_catalog.<>) 'UTF8' THEN
+        RAISE EXCEPTION 'phasevec 0.20.0 needs a UTF8 database; % is %', pg_catalog.current_database(),
+                        pg_catalog.getdatabaseencoding()
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Create the database WITH ENCODING ''UTF8'' (pg_dump and restore into it), then install or update '
+                         'pg_phasevec there. README, Supported configurations.';
+    END IF;
+END
+$enc$;
+
 -- (fourteenth review) The extension's tables are taken first, in the order its writers take them: a write to a watched
 -- table reads its watch (phasevec.watches), notes the row's text (sources, and lexstats and lexdocs for a lexical
 -- watch), and an assert() in the same transaction writes phasevec.truth. Below, truth is altered before watches: in
@@ -228,12 +246,28 @@ LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdo
 -- 47. A proof session kept judging, and stamping 'verified', in the name of an author dropped during the call. A
 --    verdict is recorded in its author's name only while the author is a role (locked against DROP ROLE until it
 --    commits).
+-- 48. (eighteenth review) A claim retired by refute() came back: under 0.19.0 refute() kept its proof, and after this
+--    update adopt() asserted it again and verify() served it 'verified'; refute() of a replaced claim did nothing, and
+--    unsupersede() brought it back; a retired claim superseded and unsuperseded read 'unproven' for good; refute() of
+--    a claim with no text recorded read 'unproven'. Retired is a state of its own (truth.retired_at, _claim_state).
+-- 49. A key named two rows: a DEFERRABLE unique index, and an inheritance child the parent's index does not cover,
+--    let a writer limited by row-level security read another's row through _render(). A watch reads a plain table
+--    outside any inheritance tree, by a unique btree index enforced at once; every read checks it again, with ONLY.
+-- 50. One author's byte stopped a watch: the hashes converted to UTF-8, which raises in SQL_ASCII and WIN1252. 0.20.0
+--    lives in a UTF8 database only, and every hash takes a text's bytes.
+-- 51. A proof's session waited for a claim's row holding the watched table: an owner's refute() and then DDL in one
+--    transaction deadlocked with it (src/phasevec_truth.c).
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
                            ADD COLUMN proof_env text[], ADD COLUMN halted boolean NOT NULL DEFAULT false,
                            ADD COLUMN looked_at timestamptz, ADD COLUMN looked_for bytea,
-                           ADD COLUMN interrupted_at timestamptz, ADD COLUMN interrupted_why text;
+                           ADD COLUMN interrupted_at timestamptz, ADD COLUMN interrupted_why text,
+                           ADD COLUMN retired_at timestamptz,
+                           ADD CONSTRAINT truth_retired_check
+                               CHECK (retired_at IS NULL OR (proof IS NULL AND verdict IN ($q$refuted$q$, $q$replaced$q$)));
+COMMENT ON COLUMN phasevec.truth.retired_at IS
+    $q$When refute() retired this claim (0.20.0, eighteenth review): it has no proof, nothing judges it again, and only an assert() makes it a claim again. NULL for a claim that is not retired. phasevec._claim_state() names every state.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by IS
     $q$The name of the role that asserted the proof, when it did (0.20.0). With asserted_by_oid: the proof runs as that role only while the OID still has this name.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by_oid IS
@@ -285,6 +319,36 @@ COMMENT ON COLUMN phasevec.truth.halted IS
 CREATE FUNCTION phasevec._bind(p_text_hash bytea, p_proof text, p_author oid, p_env text[])
 RETURNS bytea AS $q$MODULE_PATHNAME$q$, $q$phasevec_bind$q$ LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
+-- (eighteenth review) The state a claim is in, named; every transition below goes through these names, and nothing
+-- else moves a claim between them:
+--   'judged'   it has a proof, run by verify() when it is due and by verify_one() when asked
+--   'halted'   its proof ended the session that ran it: verify() does not run it again, verify_one() does when asked
+--   'bare'     no proof and not retired (an assert() with no proof, a key only superseded): nothing judges it
+--   'retired'  refute() retired it: no proof (truth_retired_check), and only an assert() makes it a claim again
+-- supersede() hides a claim in any state behind its replacement (verdict 'replaced', not a state) and unsupersede()
+-- shows it again in the state it kept: a retired one reads 'refuted' again, any other 'unproven'.
+--   assert()                   any -> 'judged' ('bare' with no proof); the only way out of 'retired'
+--   refute()                   any -> 'retired', a replaced claim too (it stays behind its replacement, retired)
+--   a proof that ends its session  'judged' -> 'halted'
+--   verify(), verify_one(), adopt(), recording a verdict, a halt, an interruption
+--                              'judged' (verify_one() and adopt() 'halted' too); never a retired claim
+--   the update to 0.20.0       a claim refute() made under 0.19.0 -> 'retired' (below)
+-- In the seventeenth cut "retired" was only "proof IS NULL", kept by refute() alone: a claim refuted under 0.19.0
+-- kept its proof through the update and adopt() brought it back 'verified'; refute() of a replaced claim did nothing
+-- and unsupersede() brought it back 'verified'; a retired claim superseded and unsuperseded read 'unproven' for good.
+-- Of the three columns that decide it (inlined where it is used, so a scan reads them as columns), and of a row.
+CREATE FUNCTION phasevec._claim_state(p_retired_at timestamptz, p_proof text, p_halted boolean) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $f$
+    SELECT CASE WHEN p_retired_at IS NOT NULL THEN 'retired'
+                WHEN p_proof IS NULL THEN 'bare'
+                WHEN p_halted THEN 'halted'
+                ELSE 'judged' END
+$f$;
+CREATE FUNCTION phasevec._claim_state(t phasevec.truth) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $f$
+    SELECT phasevec._claim_state(t.retired_at, t.proof, t.halted)
+$f$;
+
 -- The truth a key has NOW. 'verified' only for the claim it judged, and only while the row's text, as the watch
 -- trigger last saw it, is the asserted one; 'refuted' only while it is the refuted one. (brief() also checks the text
 -- it serves; verify() checks the live row.) Computed when read: a writer never touches a verdict. In the fifth cut a
@@ -301,8 +365,9 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 -- statement (a DO block, a function looping over brief()) is a reader of its own.
                 WHEN t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp() THEN $q$expired$q$
                 -- (eleventh review, 37) a verdict of a proof serves while it is fresh: judged within the watch's
-                -- max_age. Not a halted claim's (its proof ended its session: not run again) nor a refute() with
-                -- no proof (nothing judges it again).
+                -- max_age. Not a halted claim's (its proof ended its session: not run again) nor a retired one's
+                -- (refute(): no proof, truth_retired_check; nothing judges it again). A retired claim reads 'refuted'
+                -- below while its row's text is the one refute() refuted (eighteenth review: asserted_for is that text).
                 WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.proof IS NOT NULL AND NOT t.halted
                  -- (sixteenth review, 45) in UTC: in the reader's TimeZone a '1 day' max_age was the length of
                  -- that zone's day (48 hours under a POSIX rule a reader may set; 23 or 25 across a DST change).
@@ -338,7 +403,7 @@ BEGIN
        SET proof = EXCLUDED.proof, topic = EXCLUDED.topic, support = EXCLUDED.support,
            expires_at = EXCLUDED.expires_at, asserted_by = EXCLUDED.asserted_by,
            asserted_by_oid = EXCLUDED.asserted_by_oid, asserted_for = EXCLUDED.asserted_for,
-           proof_env = EXCLUDED.proof_env, halted = false,
+           proof_env = EXCLUDED.proof_env, halted = false, retired_at = NULL,
            verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$unproven$q$ END,
            verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now(),
            looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
@@ -348,29 +413,50 @@ CREATE OR REPLACE FUNCTION phasevec.assert(p_watch text, p_key text, p_proof tex
                                            p_support jsonb DEFAULT NULL, p_expires_at timestamptz DEFAULT NULL)
 RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_assert$q$ LANGUAGE C VOLATILE;
 
--- refute(): as in 0.14.1, and the refutation is about the text it refuted (the asserted one, or the row's text as
--- the trigger last saw it when nothing was asserted): when that text changes, it is not refuted any more.
--- (seventeenth review) A refutation retires the claim: its proof goes with it (proof NULL), so no verify(),
--- verify_one() or adopt() judges it again, and it reads 'refuted', with no horizon, while its text is the refuted one;
--- an assert() makes it a claim again. Until then the proof stayed: the next verify() past p_every judged it again and
--- served it 'verified', and adopt() asserted every refuted claim again (yggdrasil retires a deleted memory with
--- refute(): after the upgrade every deleted memory was served as current and verified).
+-- refute(): as in 0.14.1, and the refutation is about the text it refuted: the row's text as the watch trigger last
+-- saw it when refute() ran; when that text changes, it is not refuted any more.
+-- (seventeenth review) A refutation retires the claim: its proof goes with it, so no verify(), verify_one() or
+-- adopt() judges it again, and it reads 'refuted', with no horizon, while its text is the refuted one; an assert()
+-- makes it a claim again. Until then the proof stayed: the next verify() past p_every judged it again and served it
+-- 'verified', and adopt() asserted every refuted claim again (yggdrasil retires a deleted memory with refute()).
+-- (eighteenth review) Retired is a state of its own (retired_at, _claim_state), on every path:
+--   * a replaced claim is retired too, behind its replacement: until then refute() of a replaced key did nothing, no
+--     error, and unsupersede() brought it back 'verified';
+--   * the text it is about is recorded on every refute(): only a claim refute() inserted had it, and a claim
+--     asserted before 0.20.0 (no text) or with no proof read 'unproven' after refute(), not 'refuted' (yggdrasil
+--     went on serving every memory deleted after the update).
 CREATE OR REPLACE FUNCTION phasevec.refute(p_watch text, p_key text, p_reason text) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
+        h bytea;
 BEGIN
     IF coalesce(btrim(p_reason), $q$$q$) = $q$$q$ THEN
         RAISE EXCEPTION $q$phasevec: a refutation says why$q$;
     END IF;
-    INSERT INTO phasevec.truth AS t (watch, key, verdict, verified_at, last_error, asserted_for)
-    VALUES (w.id, p_key, $q$refuted$q$, now(), p_reason,
-            (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = w.id AND s.key = p_key))
+    h := (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = w.id AND s.key = p_key);
+    INSERT INTO phasevec.truth AS t (watch, key, verdict, verified_at, last_error, asserted_for, retired_at)
+    VALUES (w.id, p_key, $q$refuted$q$, now(), p_reason, h, now())
     ON CONFLICT (watch, key) DO UPDATE
-       SET verdict = $q$refuted$q$, verified_at = now(), last_error = p_reason, changed_at = now(),
-           proof = NULL, halted = false, looked_at = NULL, looked_for = NULL,
-           interrupted_at = NULL, interrupted_why = NULL,
-           verified_for = phasevec._bind(t.asserted_for, NULL, t.asserted_by_oid, t.proof_env)
-     WHERE t.verdict <> $q$replaced$q$;
+       SET verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$refuted$q$ END,
+           verified_at = now(), last_error = p_reason, changed_at = now(), retired_at = now(),
+           proof = NULL, halted = false, asserted_for = h, verified_for = NULL,
+           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
+END;
+$f$;
+
+-- unsupersede(): (eighteenth review) a claim comes back in the state it kept behind its replacement: a retired one
+-- reads 'refuted' again, as of when it was retired; any other 'unproven', to be judged. Until then every claim came
+-- back 'unproven': a retired one (no proof, so never judged again) was served 'unproven' for good.
+CREATE OR REPLACE FUNCTION phasevec.unsupersede(p_watch text, p_key text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE w phasevec.watches := phasevec._watch(p_watch);
+BEGIN
+    UPDATE phasevec.truth t
+       SET replaced_by = NULL, reason = NULL,
+           verdict = CASE WHEN phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$retired$q$ THEN $q$refuted$q$ ELSE $q$unproven$q$ END,
+           verified_at = CASE WHEN phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$retired$q$ THEN t.retired_at END,
+           changed_at = now()
+     WHERE t.watch = w.id AND t.key = p_key AND t.verdict = $q$replaced$q$;
 END;
 $f$;
 
@@ -411,8 +497,8 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                                   WHERE s.watch = t.watch AND s.key = t.key) AS text_hash) s
      CROSS JOIN LATERAL (SELECT t.verdict IN ($q$verified$q$, $q$refuted$q$)
                                 AND t.asserted_for IS DISTINCT FROM s.text_hash AS stale) x
-     WHERE t.watch = p_watch AND t.proof IS NOT NULL AND t.verdict <> $q$replaced$q$
-       AND t.asserted_by_oid IS NOT NULL AND NOT t.halted
+     WHERE t.watch = p_watch AND phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$judged$q$ AND t.verdict <> $q$replaced$q$
+       AND t.asserted_by_oid IS NOT NULL
        -- a stale claim is due once for each text it reads (verify() records that it looked: looked_at,
        -- looked_for), and again for the same text after p_every; any other, when its verdict is older than p_every
        AND CASE WHEN x.stale
@@ -424,8 +510,8 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
      LIMIT p_n
 $f$;
 
--- One key's claim (verify_one, which runs a halted claim too: it was asked for); no row when it has no proof or was
--- replaced.
+-- One key's claim (verify_one, which runs a halted claim too: it was asked for); no row when it has no proof, is
+-- retired or was replaced.
 CREATE FUNCTION phasevec._truth_of(p_watch int, p_key text)
 RETURNS TABLE (key text, proof text, author oid, author_known boolean, asserted_for bytea, env text[], bind bytea)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
@@ -433,7 +519,8 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
            phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
-     WHERE t.watch = p_watch AND t.key = p_key AND t.proof IS NOT NULL AND t.verdict <> $q$replaced$q$
+     WHERE t.watch = p_watch AND t.key = p_key AND phasevec._claim_state(t.retired_at, t.proof, t.halted) IN ($q$judged$q$, $q$halted$q$)
+       AND t.verdict <> $q$replaced$q$
 $f$;
 
 -- Record what a proof's run found, only for the claim it judged (p_bind: the same text, proof, author and settings).
@@ -457,6 +544,7 @@ BEGIN
            SET looked_at = now(),
                looked_for = (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = t.watch AND s.key = t.key)
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict IN ($q$verified$q$, $q$refuted$q$)
+           AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
            AND phasevec._truth_stale(t);
         p_outcome := CASE WHEN FOUND THEN NULL ELSE $q$unproven$q$ END;
@@ -467,6 +555,7 @@ BEGIN
                verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END,
                looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
+           AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
            AND (t.verified_at IS NULL OR t.verified_at <= coalesce(p_at, now()));
     END IF;
@@ -491,8 +580,9 @@ BEGIN
     SELECT t.key, t.asserted_by_oid, r.oid IS NOT NULL INTO k, a, known
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
-     WHERE t.watch = p_watch AND t.verdict <> $q$replaced$q$
-       AND sha256(convert_to(t.key, $q$UTF8$q$)) = p_key_hash
+     WHERE t.watch = p_watch AND t.verdict <> $q$replaced$q$ AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
+       -- the key's own bytes, as the proof's session hashes them (src/phasevec_truth.c, key_hash)
+       AND sha256(convert_to(t.key, getdatabaseencoding()::name)) = p_key_hash
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
        AND (t.changed_at IS NULL OR t.changed_at <= p_started)
        -- (tenth review) a verdict read after this proof began stands
@@ -507,7 +597,7 @@ BEGIN
        SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
            interrupted_at = NULL, interrupted_why = NULL,
            last_error = $q$the session that ran this proof ended while it ran: not run again until it is asserted again$q$
-     WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$
+     WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$ AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     RETURN CASE WHEN FOUND THEN 1 ELSE 0 END;
 END;
@@ -538,7 +628,8 @@ BEGIN
     ON CONFLICT (watch, key) DO UPDATE SET attempted_at = greatest(a.attempted_at, EXCLUDED.attempted_at), why = p_why;
     IF p_interrupted THEN
         UPDATE phasevec.truth t SET interrupted_at = now(), interrupted_why = p_why
-         WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$;
+         WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
+           AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$;
     END IF;
     SELECT phasevec._verdict_of(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
     RETURN v;
@@ -578,7 +669,26 @@ UPDATE phasevec.truth
  WHERE verdict = $q$verified$q$;
 UPDATE phasevec.truth t SET asserted_for = s.text_hash
   FROM phasevec.sources s
- WHERE s.watch = t.watch AND s.key = t.key AND t.verdict = $q$refuted$q$;
+ WHERE s.watch = t.watch AND s.key = t.key
+   AND (t.verdict = $q$refuted$q$ OR (t.verdict = $q$replaced$q$ AND t.last_error IS NOT NULL));
+-- (eighteenth review) A claim refute() refuted under 0.19.0 is retired, as refute() retires one now: under 0.19.0
+-- refute() left its proof, and after this update adopt() asserted it again and the next verify() served it
+-- 'verified' (yggdrasil: every memory deleted before the update came back current). 0.19.0 recorded 'refuted' in two
+-- places, and their columns tell them apart: refute() always gave a reason (last_error) and stamped verified_at and
+-- changed_at with one now(); verify() recorded a proof's false with no reason, and its error (or NULL) at a
+-- verified_at later than the assert that set changed_at. So a refuted claim with a reason judged in the instant it
+-- last changed is retired, and so is one with no proof (refute() of a key never asserted). The only claims this
+-- retires that refute() did not are those a proof refuted by an error in the transaction that asserted it: the safe
+-- side (an assert() judges them again). A replaced claim whose last verdict had a reason (0.19.0 kept last_error
+-- through supersede(), and supersede() changed changed_at) cannot tell refute() from a proof's error: it is retired
+-- too, and reads 'refuted' if it is ever unsuperseded. What the columns cannot show is a claim refute() refuted and
+-- the next verify() then judged 'verified' under 0.19.0: that is a verified claim now (back to 'unproven' above);
+-- the application that refuted it refutes it again (yggdrasil: T2c of its procedure).
+UPDATE phasevec.truth t
+   SET proof = NULL, halted = false, retired_at = coalesce(t.verified_at, t.changed_at)
+ WHERE (t.verdict = $q$refuted$q$
+        AND (t.proof IS NULL OR (t.last_error IS NOT NULL AND t.verified_at = t.changed_at)))
+    OR (t.verdict = $q$replaced$q$ AND t.last_error IS NOT NULL);
 
 -- ------------------------------------------------------------------------------------------ rendering a row --
 -- 8, 9, 13. One way to read a watched row's text: phasevec._render() (C), the recipe as the table's owner in the
@@ -684,6 +794,13 @@ BEGIN
 END;
 $f$;
 
+-- (eighteenth review) Why a table and a key column are not what a watch reads, or NULL when they are (C: the same
+-- check every read makes, src/phasevec_truth.c, source_shape_problem).
+CREATE FUNCTION phasevec._key_shape(p_source regclass, p_key name) RETURNS text
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_key_shape$q$ LANGUAGE C STABLE STRICT;
+COMMENT ON FUNCTION phasevec._key_shape(regclass, name) IS
+    $q$Why p_source cannot be watched by p_key (a partitioned table, a partition, an inheritance parent or child, a key without a unique btree index of its own enforced at once), or NULL when it can (0.20.0, eighteenth review).$q$;
+
 CREATE OR REPLACE FUNCTION phasevec.watch(p_name text, p_source regclass, p_key name, p_recipe text, p_reader text,
                                           p_min_coverage numeric DEFAULT 0.95, p_doubt_below real DEFAULT NULL::real)
 RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
@@ -691,6 +808,7 @@ DECLARE
     tbl_owner oid;
     rid       int;
     wid       int;
+    why       text;
 BEGIN
     SELECT c.relowner INTO tbl_owner FROM pg_class c WHERE c.oid = p_source AND c.relkind IN ('r', 'p');
     IF NOT FOUND THEN
@@ -708,12 +826,14 @@ BEGIN
         RAISE EXCEPTION 'phasevec: % has no column %', p_source, p_key;
     END IF;
     -- A key names one row (0.20.0): with two rows under one key, a writer who could see and delete only its own
-    -- forgot the other's, with its verdict.
-    IF NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attname = p_key
-                    WHERE i.indrelid = p_source AND i.indisunique AND i.indnkeyatts = 1
-                      AND i.indkey[0] = a.attnum AND i.indpred IS NULL AND i.indexprs IS NULL) THEN
-        RAISE EXCEPTION 'phasevec: % is not a key of %: a watch needs a column with a unique index of its own', p_key, p_source
-            USING HINT = 'A PRIMARY KEY or a UNIQUE constraint on that column alone.';
+    -- forgot the other's, with its verdict. (eighteenth review) Provably, in everything phasevec reads: a plain
+    -- table, in no inheritance tree, by a column with a unique btree index of its own enforced at once (not
+    -- DEFERRABLE). Every read checks it again (src/phasevec_truth.c, source_shape_problem).
+    why := phasevec._key_shape(p_source, p_key);
+    IF why IS NOT NULL THEN
+        RAISE EXCEPTION 'phasevec: % cannot be watched by %: %', p_source, p_key, why
+            USING HINT = 'A plain table, keyed by a PRIMARY KEY or a UNIQUE constraint (not DEFERRABLE) on that column '
+                         'alone (README, Supported configurations).';
     END IF;
     SELECT id INTO rid FROM phasevec.readers WHERE name = p_reader;
     IF NOT FOUND THEN
@@ -853,6 +973,7 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
 -- granted verify() or verify_one(), nothing else; it runs only the proofs whose author it may act as. _render()
 -- stays open: it checks its caller itself.
 REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_stale(phasevec.truth),
+    phasevec._claim_state(phasevec.truth), phasevec._claim_state(timestamptz, text, boolean),
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
     phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea, oid, timestamptz),
@@ -881,6 +1002,31 @@ REVOKE ALL ON FUNCTION phasevec.brief(text, int) FROM PUBLIC;
 COMMENT ON FUNCTION phasevec._brief_keys(text) IS
     $q$Keys, verdicts, usefulness and judged text hash of a watch, for brief() (which runs it as the owner). The owner's only (0.20.0).$q$;
 
+-- A key names one row (0.20.0), provably in everything phasevec reads (eighteenth review): a watch made before
+-- that a read would now refuse (a partitioned table or a partition, an inheritance parent or child, a key without
+-- a unique btree index of its own enforced at once) stops the update, named, with what to do. Until the seventeenth
+-- cut such a watch was only warned about, and kept serving; every read now refuses it.
+DO $d$
+DECLARE
+    w record;
+    bad text := $q$$q$;
+BEGIN
+    FOR w IN SELECT x.name, x.source, x.key_col, phasevec._key_shape(x.source, x.key_col) AS why
+               FROM phasevec.watches x ORDER BY x.id LOOP
+        IF w.why IS NOT NULL THEN
+            bad := bad || format(E'\n  watch %s reads %s by %s: %s', w.name, w.source, w.key_col, w.why);
+        END IF;
+    END LOOP;
+    IF bad <> $q$$q$ THEN
+        RAISE EXCEPTION 'phasevec 0.20.0 does not read these watches:%', bad
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Give each table a PRIMARY KEY or a UNIQUE constraint (not DEFERRABLE) on its key column alone, '
+                         'and take it out of any inheritance tree, or drop the watch (phasevec.watches), then update. '
+                         'README, Supported configurations.';
+    END IF;
+END
+$d$;
+
 -- 9. Every row's text in the pinned settings: what the watch trigger noted before 0.20.0 was rendered in its
 -- writer's settings. A text that now reads otherwise is noted again (its reading turns stale, its verdict unproven).
 DO $d$
@@ -894,25 +1040,6 @@ BEGIN
                   WHERE s.text_hash IS DISTINCT FROM r.text_hash LOOP
             PERFORM phasevec._note_set(w.id, x.key, x.text_hash, x.body);
         END LOOP;
-    END LOOP;
-END
-$d$;
-
--- A key names one row: watch() refuses a key column without a unique index of its own (0.20.0). A watch made before
--- keeps working, but with two rows under one key they share one verdict, and a writer who deletes its own row (one
--- row-level security lets it see) forgets the other's. Each such watch is named here.
-DO $d$
-DECLARE
-    w record;
-BEGIN
-    FOR w IN SELECT x.name, x.source, x.key_col FROM phasevec.watches x
-              WHERE NOT EXISTS (SELECT 1 FROM pg_index i
-                                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attname = x.key_col
-                                 WHERE i.indrelid = x.source AND i.indisunique AND i.indnkeyatts = 1
-                                   AND i.indkey[0] = a.attnum AND i.indpred IS NULL AND i.indexprs IS NULL)
-              ORDER BY x.id LOOP
-        RAISE WARNING 'phasevec: watch % reads % by %, which is not unique there', w.name, w.source, w.key_col
-            USING HINT = 'Add a UNIQUE constraint on that column alone: two rows under one key share one verdict.';
     END LOOP;
 END
 $d$;

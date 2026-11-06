@@ -1,8 +1,8 @@
--- 0.20.0 (sixth review): a partition whose columns stand in another order. The watch trigger read a partition's row
--- in the partition's own row type, and _render() and verify() read the table's: a recipe that uses the whole row
--- (r::text, row_to_json(r)) noted another text for that partition's rows, so their claims never read as asserted
--- (asserted again, still 'unproven') and the rows were indexed with that text. Now the trigger reads a partition's
--- row as a row of the watch's table.
+-- 0.20.0 (eighteenth review): a partitioned table, a partition and an inheritance tree are not watched. A key is
+-- read in one table, under its own unique index; a partitioned table's index covers its partitions only when the key is
+-- its partition key, and a read of an inheritance parent reads its children, which its index does not cover. Until the
+-- seventeenth cut a partitioned table was watched (the sixth review fixed a partition whose columns stand in another
+-- order); now watch() refuses it, and a read refuses a table that became one of these after watch() (truth_review18).
 \set VERBOSITY terse
 CREATE EXTENSION pg_phasevec;
 SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
@@ -15,82 +15,38 @@ CREATE TABLE pn (id int PRIMARY KEY, body text, tag text) PARTITION BY RANGE (id
 CREATE TABLE pn1 PARTITION OF pn FOR VALUES FROM (1) TO (100);
 CREATE TABLE pn2 (tag text, body text, id int NOT NULL);
 ALTER TABLE pn ATTACH PARTITION pn2 FOR VALUES FROM (100) TO (200);
--- and one whose columns were dropped and added
-CREATE TABLE pn3 (junk int, id int NOT NULL, body text, tag text);
-ALTER TABLE pn3 DROP COLUMN junk;
-ALTER TABLE pn ATTACH PARTITION pn3 FOR VALUES FROM (200) TO (300);
-INSERT INTO pn VALUES (1, $t$one$t$, $t$a$t$), (150, $t$one-fifty$t$, $t$b$t$), (250, $t$two-fifty$t$, $t$c$t$);
+INSERT INTO pn VALUES (1, $t$one$t$, $t$a$t$), (150, $t$one-fifty$t$, $t$b$t$);
 SELECT phasevec.watch($w$pn$w$, $w$pn$w$::regclass, $k$id$k$, $r$r::text$r$, $n$r1$n$) > 0 AS watch;
+ERROR:  phasevec: public.pn cannot be watched by id: it is a partitioned table
+SELECT phasevec.watch($w$pn1$w$, $w$pn1$w$::regclass, $k$id$k$, $r$r::text$r$, $n$r1$n$) > 0 AS watch;
+ERROR:  phasevec: public.pn1 cannot be watched by id: it is a partition of another table
+SELECT phasevec.watch($w$pn2$w$, $w$pn2$w$::regclass, $k$id$k$, $r$r::text$r$, $n$r1$n$) > 0 AS watch;
+ERROR:  phasevec: public.pn2 cannot be watched by id: it is a partition of another table
+-- a table that was watched and is attached as a partition afterwards: reads refuse
+CREATE TABLE pn3 (id int PRIMARY KEY, body text, tag text);
+INSERT INTO pn3 VALUES (250, $t$two-fifty$t$, $t$c$t$);
+SELECT phasevec.watch($w$pn3$w$, $w$pn3$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
  watch 
 -------
  t
 (1 row)
 
-SELECT phasevec.assert($w$pn$w$, k, $p$true$p$) FROM unnest(ARRAY[$k$1$k$, $k$150$k$, $k$250$k$]) k;
- assert 
---------
- 
- 
- 
-(3 rows)
+SELECT key, body FROM phasevec._render($w$pn3$w$, NULL);
+ key |   body    
+-----+-----------
+ 250 | two-fifty
+(1 row)
 
-SELECT key, verdict FROM phasevec.verify($w$pn$w$, 100, interval '0') ORDER BY key::int;
- key | verdict  
------+----------
- 1   | verified
- 150 | verified
- 250 | verified
-(3 rows)
+ALTER TABLE pn ATTACH PARTITION pn3 FOR VALUES FROM (200) TO (300);
+SELECT key, body FROM phasevec._render($w$pn3$w$, NULL);
+ERROR:  phasevec: watch pn3 cannot be read: public.pn3: it is a partition of another table
+-- detached, it reads again
+ALTER TABLE pn DETACH PARTITION pn3;
+SELECT key, body FROM phasevec._render($w$pn3$w$, NULL);
+ key |   body    
+-----+-----------
+ 250 | two-fifty
+(1 row)
 
--- writes through the table and straight into a partition, one that changes nothing
-UPDATE pn SET tag = tag;
-INSERT INTO pn VALUES (2, $t$two$t$, $t$c$t$), (151, $t$x$t$, $t$d$t$);
-INSERT INTO pn2 (tag, body, id) VALUES ($t$e$t$, $t$direct$t$, 152);
-UPDATE pn2 SET body = body || $t$!$t$ WHERE id = 152;
-SELECT s.key, s.text_hash = r.text_hash AS same, r.body
-  FROM phasevec.sources s JOIN phasevec._render($w$pn$w$, NULL) r USING (key)
- WHERE s.watch = (SELECT id FROM phasevec.watches WHERE name = $w$pn$w$) ORDER BY s.key::int;
- key | same |       body        
------+------+-------------------
- 1   | t    | (1,one,a)
- 2   | t    | (2,two,c)
- 150 | t    | (150,one-fifty,b)
- 151 | t    | (151,x,d)
- 152 | t    | (152,direct!,e)
- 250 | t    | (250,two-fifty,c)
-(6 rows)
-
-SELECT key, phasevec._verdict(t) FROM phasevec.truth t ORDER BY key::int;
- key | _verdict 
------+----------
- 1   | verified
- 150 | verified
- 250 | verified
-(3 rows)
-
-SELECT key, verdict FROM phasevec.verify($w$pn$w$, 100, interval '0') ORDER BY key::int;
- key | verdict  
------+----------
- 1   | verified
- 150 | verified
- 250 | verified
-(3 rows)
-
--- a row moved to another partition, and one deleted
-UPDATE pn SET id = 160 WHERE id = 2;
-DELETE FROM pn WHERE id = 151;
-SELECT s.key, s.text_hash = r.text_hash AS same
-  FROM phasevec.sources s FULL JOIN phasevec._render($w$pn$w$, NULL) r USING (key)
- WHERE coalesce(s.watch, (SELECT id FROM phasevec.watches WHERE name = $w$pn$w$))
-       = (SELECT id FROM phasevec.watches WHERE name = $w$pn$w$) ORDER BY 1::int;
- key | same 
------+------
- 1   | t
- 150 | t
- 152 | t
- 160 | t
- 250 | t
-(5 rows)
-
-DROP TABLE pn;
+DROP TABLE pn, pn3;
 DROP EXTENSION pg_phasevec;

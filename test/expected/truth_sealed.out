@@ -551,7 +551,7 @@ COMMIT;
 -- security, deleting its own row, forgot the other's key and its verdict.
 CREATE TABLE nu (id int, body text);
 SELECT phasevec.watch($w$nu$w$, $w$nu$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$);
-ERROR:  phasevec: id is not a key of public.nu: a watch needs a column with a unique index of its own
+ERROR:  phasevec: public.nu cannot be watched by id: its key column has no unique btree index of its own enforced at once (not DEFERRABLE, valid, on that column alone, with no predicate and no expression)
 ALTER TABLE nu ADD UNIQUE (id);
 SELECT phasevec.watch($w$nu$w$, $w$nu$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
  watch 

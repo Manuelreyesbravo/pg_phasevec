@@ -199,13 +199,10 @@ DISCARD TEMP;
 SELECT s.key, s.text_hash = sha256(convert_to(t.body, $u$UTF8$u$)) AS the_rows_text
   FROM phasevec.sources s LEFT JOIN tnotes t ON t.id::text = s.key
  WHERE s.watch = :tid ORDER BY s.key;
--- the trigger fires on a partition of a watched partitioned table: that is its watch's table too
+-- (eighteenth review) a partitioned table is not watched: a key is read in one table, under its own unique index
 CREATE TABLE parted (id int PRIMARY KEY, body text) PARTITION BY RANGE (id);
 CREATE TABLE parted_low PARTITION OF parted FOR VALUES FROM (0) TO (100);
-SELECT phasevec.watch($w$parted$w$, $w$parted$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) AS pid \gset
-INSERT INTO parted VALUES (1, $t$in a partition$t$);
-UPDATE parted SET id = 2 WHERE id = 1;
-SELECT key FROM phasevec.sources WHERE watch = :pid;
+SELECT phasevec.watch($w$parted$w$, $w$parted$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$);
 
 -- (6) recall(), disputes(), replacement() and truth_coverage() gave any role with USAGE on the schema the keys,
 -- verdicts, topics and reasons of every watch. A watch is shown only to a role that may SELECT its table; with

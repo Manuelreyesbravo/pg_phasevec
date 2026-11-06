@@ -49,7 +49,11 @@
 #include "access/tupconvert.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/table.h"
 #include "catalog/partition.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
@@ -87,6 +91,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -229,10 +234,12 @@ spi_connect(void)
 typedef struct Target
 {
 	int32		watch;
+	char	   *name;
 	Oid			relid;
 	Oid			relowner;
 	char	   *src;			/* schema-qualified, quoted */
 	char	   *key_col;		/* quoted */
+	AttrNumber	keyatt;			/* the key column's number */
 	char	   *recipe;
 	char	   *read_sql;		/* one row by key: text hash, row version */
 	SPIPlanPtr	read_plan;		/* read_sql prepared (verify), or NULL */
@@ -249,6 +256,15 @@ typedef struct Target
 } Target;
 
 /*
+ * (eighteenth review) What is hashed is a text's own bytes, in the database's encoding (0.20.0 is installed only in a
+ * UTF8 database, so they are its UTF-8): convert_to() into the database's own encoding converts nothing and cannot
+ * fail. In the seventeenth cut every hash converted to UTF-8 first, which raises for bytes a SQL_ASCII database holds
+ * and UTF-8 does not (0xe9) or a WIN1252 byte with no UTF-8 equivalent (0x81): one author's claim stopped verify() for
+ * the whole watch.
+ */
+#define TEXT_BYTES "pg_catalog.getdatabaseencoding()::pg_catalog.name"
+
+/*
  * The text of a watched row exactly as every reader of it reads it (the recipe over the row, as text, NULL as ''),
  * hashed as phasevec.sources hashes it, and the row version (xmin and ctid) it was read from.
  *
@@ -261,25 +277,27 @@ typedef struct Target
  * on its text). The key column's own equality (READ_TYPED) only finds the row through an index.
  */
 #define READ_SQL \
-	"SELECT pg_catalog.sha256(pg_catalog.convert_to(COALESCE((%s)::pg_catalog.text, ''), 'UTF8')), " \
+	"SELECT pg_catalog.sha256(pg_catalog.convert_to(COALESCE((%s)::pg_catalog.text, ''), " TEXT_BYTES ")), " \
 	"r.xmin::pg_catalog.text OPERATOR(pg_catalog.||) '/' OPERATOR(pg_catalog.||) r.ctid::pg_catalog.text " \
-	"FROM %s r WHERE r.%s::pg_catalog.text COLLATE pg_catalog.\"C\" OPERATOR(pg_catalog.=) $1%s LIMIT 1"
+	"FROM ONLY %s r WHERE r.%s::pg_catalog.text COLLATE pg_catalog.\"C\" OPERATOR(pg_catalog.=) $1%s LIMIT 1"
 #define READ_TYPED " AND r.%s OPERATOR(pg_catalog.=) $2"
 
 /* Rows by key (keys NULL: every row): key, text, text hash. */
 #define RENDER_SQL \
-	"SELECT x.k, x.b, pg_catalog.sha256(pg_catalog.convert_to(COALESCE(x.b, ''), 'UTF8')) " \
-	"FROM (SELECT r.%s::pg_catalog.text AS k, (%s)::pg_catalog.text AS b FROM %s r%s) x"
+	"SELECT x.k, x.b, pg_catalog.sha256(pg_catalog.convert_to(COALESCE(x.b, ''), " TEXT_BYTES ")) " \
+	"FROM (SELECT r.%s::pg_catalog.text AS k, (%s)::pg_catalog.text AS b FROM ONLY %s r%s) x"
 #define RENDER_WHERE " WHERE r.%s::pg_catalog.text COLLATE pg_catalog.\"C\" OPERATOR(pg_catalog.=) ANY ($1)%s"
 #define RENDER_TYPED " AND r.%s OPERATOR(pg_catalog.=) ANY ($2)"
 
 /* The keys of the rows a reader sees, among some (keys NULL: all). */
-#define VISIBLE_SQL "SELECT r.%s::pg_catalog.text FROM %s r%s"
+#define VISIBLE_SQL "SELECT r.%s::pg_catalog.text FROM ONLY %s r%s"
 
 #define TARGET_SQL \
 	"SELECT w.id, c.oid, c.relowner, pg_catalog.format('%%I.%%I', n.nspname, c.relname), " \
 	"w.key_col::pg_catalog.text, w.recipe, (SELECT a.atttypid FROM pg_catalog.pg_attribute a " \
-	"WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attname OPERATOR(pg_catalog.=) w.key_col) " \
+	"WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attname OPERATOR(pg_catalog.=) w.key_col), " \
+	"(SELECT a.attnum FROM pg_catalog.pg_attribute a " \
+	"WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attname OPERATOR(pg_catalog.=) w.key_col), w.name " \
 	"FROM phasevec.watches w " \
 	"JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.source " \
 	"JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace " \
@@ -306,14 +324,146 @@ kept_plan(SPIPlanPtr *slot, const char *sql, int nargs, Oid *types)
 	return *slot;
 }
 
+/*
+ * (eighteenth review) Where a key provably names at most one row of everything phasevec reads. A watch reads a plain
+ * table (relkind 'r'), not a partitioned one or a partition, that inherits from no table and that no table inherits
+ * from, by a key column with a unique btree index of its own that is enforced at once: not DEFERRABLE, valid, on that
+ * column alone (INCLUDE columns aside), with no predicate and no expression. The seventeenth cut took any unique
+ * index on the table it was given, and read "FROM table", which reads its inheritance children too:
+ *   - under UNIQUE ... DEFERRABLE a writer limited by row-level security inserted, in its own transaction, a row under
+ *     the key of one it could not see; its own row made the key visible to it, and _render() (as the table's owner,
+ *     by key) showed it both rows, the hidden one's text included;
+ *   - a row an INHERITS child held under a key the parent's index does not cover was rendered the same way, and
+ *     _verdict() and verify() read whichever row came first.
+ * watch() checks all of it (_key_shape); every read checks it again (load_target), for an index made deferrable or
+ * dropped, or a child added, after watch(): a read refuses, it does not serve. What can change by DDL alone is checked
+ * at every read, cheaply (the table's relcache entry, one syscache lookup per index, the inheritance catalog only when
+ * relhassubclass says a child may exist); an inheritance parent added later changes nothing a read sees, and is
+ * checked by watch() only. Every read also says ONLY.
+ *
+ * With `lock`, the table is locked first (as a reader, kept to the end of the transaction): a read in this session
+ * follows (render_rows, visible_keys) and takes that lock anyway, and nothing can change the table between the check
+ * and the read. Without it the catalog is read as of now (pending invalidations taken in) and no lock is taken: a
+ * verifier does not read the table in its own session, and must not wait for it there (a third session's ACCESS
+ * EXCLUSIVE lock; or an owner's ALTER TABLE queued behind it while the proof waits for that owner's claim row: both
+ * seen in the eighteenth cut, which locked here). Its proofs' sessions read the table, with ONLY, and only rows
+ * committed: a row a DEFERRABLE key lets one transaction hold under another's key is never theirs.
+ */
+static const char *
+source_shape_problem(Oid relid, AttrNumber keyatt, bool at_watch, bool lock)
+{
+	HeapTuple	ct;
+	Form_pg_class c;
+	char		relkind;
+	bool		ispartition;
+	bool		hassubclass;
+	Relation	rel;
+	List	   *indexes;
+	ListCell   *lc;
+	bool		keyed = false;
+
+	ct = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(ct))
+		return "the table is gone";
+	c = (Form_pg_class) GETSTRUCT(ct);
+	relkind = c->relkind;
+	ispartition = c->relispartition;
+	hassubclass = c->relhassubclass;
+	ReleaseSysCache(ct);
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+		return "it is a partitioned table";
+	if (relkind != RELKIND_RELATION)
+		return "it is not a table";
+	if (ispartition)
+		return "it is a partition of another table";
+	if (hassubclass && find_inheritance_children(relid, NoLock) != NIL)
+		return "other tables inherit from it, and its key's index does not cover their rows";
+	if (at_watch && has_superclass(relid))
+		return "it inherits from another table";
+	if (keyatt <= 0)
+		return "its key is not a column of it";
+	if (lock)
+		LockRelationOid(relid, AccessShareLock);
+	else
+		AcceptInvalidationMessages();
+	rel = RelationIdGetRelation(relid);
+	if (!RelationIsValid(rel))
+		return "the table is gone";
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Oid			ix = lfirst_oid(lc);
+		HeapTuple	it = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(ix));
+		HeapTuple	rt;
+		Form_pg_index i;
+
+		if (!HeapTupleIsValid(it))
+			continue;
+		i = (Form_pg_index) GETSTRUCT(it);
+		if (i->indisunique && i->indimmediate && i->indisvalid && i->indislive && i->indnkeyatts == 1 &&
+			i->indkey.values[0] == keyatt && heap_attisnull(it, Anum_pg_index_indpred, NULL) &&
+			heap_attisnull(it, Anum_pg_index_indexprs, NULL))
+		{
+			rt = SearchSysCache1(RELOID, ObjectIdGetDatum(ix));
+			if (HeapTupleIsValid(rt))
+			{
+				if (((Form_pg_class) GETSTRUCT(rt))->relam == BTREE_AM_OID)
+					keyed = true;
+				ReleaseSysCache(rt);
+			}
+		}
+		ReleaseSysCache(it);
+		if (keyed)
+			break;
+	}
+	list_free(indexes);
+	RelationClose(rel);
+	if (!keyed)
+		return "its key column has no unique btree index of its own enforced at once (not DEFERRABLE, valid, "
+			"on that column alone, with no predicate and no expression)";
+	return NULL;
+}
+
+/* A watch's table and key are of the supported shape, or the read that is about to happen refuses. */
+static void
+must_be_keyed(const Target *t, bool lock)
+{
+	const char *why = source_shape_problem(t->relid, t->keyatt, false, lock);
+
+	if (why != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("phasevec: watch %s cannot be read: %s: %s", t->name, t->src, why),
+				 errhint("phasevec reads a plain table by a key column with a unique, not deferrable, btree index of "
+						 "its own (README, Supported configurations).")));
+}
+
+/*
+ * phasevec._key_shape(source regclass, key name) RETURNS text: NULL when watch() may read source by key (above),
+ * else why not. watch() and the update to 0.20.0 ask it.
+ */
+PG_FUNCTION_INFO_V1(phasevec_key_shape);
+Datum
+phasevec_key_shape(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Name		key = PG_GETARG_NAME(1);
+	const char *why = source_shape_problem(relid, get_attnum(relid, NameStr(*key)), true, true);
+
+	if (why == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(why));
+}
+
 static SPIPlanPtr target_plan[2] = {NULL, NULL};	/* TARGET_SQL by name, by id */
 
 /*
  * The watch and how to read its rows, by name (text) or by id (int4). SPI connected, as the owner. False when there
- * is no such watch and `missing_ok`.
+ * is no such watch and `missing_ok`. With `reads`, its table and key must be of the supported shape (must_be_keyed):
+ * every caller reads rows by key but the watch trigger, which renders the row it fires for.
  */
 static bool
-load_target_ext(Datum id, bool by_id, Target *t, MemoryContext keep, bool missing_ok)
+load_target_ext(Datum id, bool by_id, Target *t, MemoryContext keep, bool missing_ok, bool reads)
 {
 	Oid			at[1] = {by_id ? INT4OID : TEXTOID};
 	Datum		av[1] = {id};
@@ -345,6 +495,13 @@ load_target_ext(Datum id, bool by_id, Target *t, MemoryContext keep, bool missin
 	t->key_col = pstrdup(quote_identifier(SPI_getvalue(tup, td, 5)));
 	t->recipe = pstrdup(SPI_getvalue(tup, td, 6));
 	t->keytype = DatumGetObjectId(SPI_getbinval(tup, td, 7, &isnull));
+	{
+		bool		n;
+		Datum		a = SPI_getbinval(tup, td, 8, &n);
+
+		t->keyatt = n ? InvalidAttrNumber : DatumGetInt16(a);
+	}
+	t->name = pstrdup(SPI_getvalue(tup, td, 9));
 	/*
 	 * types whose text output reads back as the same value, whatever the session's settings; text and varchar too
 	 * (seventeenth review): a key is matched byte for byte (COLLATE "C", READ_SQL), and their own equality is only
@@ -366,13 +523,15 @@ load_target_ext(Datum id, bool by_id, Target *t, MemoryContext keep, bool missin
 	t->read_sql = psprintf(READ_SQL, t->recipe, t->src, t->key_col,
 						   t->typed ? psprintf(READ_TYPED, t->key_col) : "");
 	MemoryContextSwitchTo(o);
+	if (reads)
+		must_be_keyed(t, false);
 	return true;
 }
 
 static void
 load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
 {
-	(void) load_target_ext(id, by_id, t, keep, false);
+	(void) load_target_ext(id, by_id, t, keep, false, true);
 }
 
 /* A key as a value of the key column's type; false when it is not one (then no row has it). */
@@ -506,6 +665,7 @@ visible_keys(const Target *t, Oid role, GuardMode mode, const GuardEnv *env, Arr
 	int			nargs;
 	char	   *sql = psprintf(VISIBLE_SQL, t->key_col, t->src, keys_where(t, among, at, av, &nargs));
 
+	must_be_keyed(t, true);
 	PG_TRY();
 	{
 		guard_enter(&g, role, mode, env);
@@ -570,6 +730,7 @@ render_rows(const Target *t, ArrayType *keys, Rendered *out, MemoryContext keep)
 	int			nargs;
 	char	   *sql = psprintf(RENDER_SQL, t->key_col, t->recipe, t->src, keys_where(t, keys, at, av, &nargs));
 
+	must_be_keyed(t, true);
 	memset(out, 0, sizeof(Rendered));
 	PG_TRY();
 	{
@@ -712,16 +873,19 @@ prepare_read(Target *t)
 #define HASH_LEN 32
 
 /*
- * (seventeenth review) In UTF-8, as _truth_halted hashes it (sha256(convert_to(key, 'UTF8'))): until then the bytes of
- * the database's encoding, so in a database not in UTF-8 a key with a character outside ASCII never named its claim.
+ * The key's own bytes, as _truth_halted hashes it (sha256(convert_to(key, getdatabaseencoding()))): the same bytes on
+ * both sides, and nothing to convert, so nothing that can fail (eighteenth review). In the seventeenth cut both sides
+ * converted to UTF-8, and in a SQL_ASCII database a key with a byte that is not UTF-8 (0xe9) raised: its halt was
+ * never recorded, and every verify() ran its session-ending proof again. Since then 0.20.0 is installed only in a
+ * UTF8 database, where these bytes are UTF-8 (in the sixteenth cut a LATIN1 database hashed its own bytes here and
+ * UTF-8 in _truth_halted).
  */
 static void
 key_hash(const char *key, uint8 *out)
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
-	const char *u = pg_server_to_any(key, strlen(key), PG_UTF8);
 
-	if (pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, (const uint8 *) u, strlen(u)) < 0 ||
+	if (pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, (const uint8 *) key, strlen(key)) < 0 ||
 		pg_cryptohash_final(ctx, out, HASH_LEN) < 0)
 		elog(ERROR, "phasevec: could not hash a key: %s", pg_cryptohash_error(ctx));
 	pg_cryptohash_free(ctx);
@@ -730,7 +894,7 @@ key_hash(const char *key, uint8 *out)
 /*
  * phasevec._bind(text_hash bytea, proof text, author oid, env text[]) RETURNS bytea: a claim's identity, the sha256 of
  * every part that changes what its proof means, each framed: a length (int4, big-endian; -1 for NULL) before its
- * bytes (the text's hash; the proof and each setting in UTF-8), the author as an int8 (-1: none), the number of
+ * bytes (the text's hash; the proof and each setting as stored, eighteenth review), the author as an int8 (-1: none), the number of
  * settings (-1: NULL) before them. No two claims read alike, so a verdict is recorded only for the claim it judged
  * (_truth_set, _truth_halted) and served only for it (_verdict_of); the sha256 of that encoding is the claim's
  * identity as the sha256 of a row's text is the text's (asserted_for). (seventeenth review) Until then the settings
@@ -756,14 +920,16 @@ bind_bytes(pg_cryptohash_ctx *ctx, const char *data, int len)
 		elog(ERROR, "phasevec: could not hash a claim: %s", pg_cryptohash_error(ctx));
 }
 
+/*
+ * A text's own bytes (eighteenth review): total over anything the database holds. In the seventeenth cut they were
+ * converted to UTF-8 first, and in a SQL_ASCII or WIN1252 database a proof or a setting with a byte UTF-8 lacks
+ * raised in _truth_due: one author's claim stopped verify() for every claim of its watch, and refute() could not
+ * retire it. A UTF8 database (the only one 0.20.0 is installed in) hashes the same bytes as before.
+ */
 static void
 bind_text(pg_cryptohash_ctx *ctx, text *t)
 {
-	char	   *s = VARDATA_ANY(t);
-	int			len = VARSIZE_ANY_EXHDR(t);
-	char	   *u = pg_server_to_any(s, len, PG_UTF8);
-
-	bind_bytes(ctx, u, u == s ? len : (int) strlen(u));
+	bind_bytes(ctx, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
 }
 
 PG_FUNCTION_INFO_V1(phasevec_bind);
@@ -1789,7 +1955,7 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
 	"(pg_catalog.timezone('UTC', pg_catalog.now()) OPERATOR(pg_catalog.-) $3)"
 #define CLAIM_LOCK_SQL \
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
+	"AND t.retired_at IS NULL AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
 	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
 	"AND " DISTINCT("t.asserted_for", "h") " THEN " LOCK_OLD("looked_at") " OR " DISTINCT("t.looked_for", "h") " " \
 	"ELSE " LOCK_OLD("verified_at") " END " \
@@ -1798,7 +1964,7 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
 
 #define CLAIM_TAKE_SQL \
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"FOR NO KEY UPDATE"
+	"AND t.retired_at IS NULL FOR NO KEY UPDATE"
 
 /*
  * (fourteenth review) verify_one() takes its claim without waiting, in the transaction that judges it; when another
@@ -2232,7 +2398,13 @@ phasevec_proof_main(Datum arg)
 				PushActiveSnapshot(GetTransactionSnapshot());
 				MemoryContextSwitchTo(per);
 				pgstat_report_activity(STATE_RUNNING, "phasevec: waiting for a claim another session holds");
-				watched_table_first(&target);
+				/*
+				 * (eighteenth review) Only the claim's row is waited for here, with nothing else held: this
+				 * transaction judges nothing and reads no row of the table. In the seventeenth cut it took the
+				 * watched table first, as the one that judges does, and an owner's transaction that took the
+				 * claim's row (refute(), assert()) and then altered the table (ALTER TABLE, DROP TABLE)
+				 * deadlocked with it: each waited for what the other held.
+				 */
 				gone = !claim_taken(sh->owner, worker_take_plan, &target, &c, NULL);
 				PopActiveSnapshot();
 				CommitTransactionCommand();
@@ -3574,6 +3746,26 @@ phasevec_verify(PG_FUNCTION_ARGS)
  * One key, now or out of turn, as its author, in a session of its own. NULL when the key has no proof or was
  * replaced; an error when the proof has no author, the caller may not act as it, or no session could judge it.
  */
+/* Is (watch, key) still a claim verify_one() runs (phasevec._truth_of)? As the owner, from outside SPI. */
+static bool
+claim_runs_now(Oid owner, const Target *t, const char *key)
+{
+	Oid			at[2] = {INT4OID, TEXTOID};
+	Datum		av[2] = {Int32GetDatum(t->watch), CStringGetTextDatum(key)};
+	bool		runs;
+	Who			was;
+
+	become(owner, &was);
+	spi_connect();
+	/* read-write SPI: a snapshot of now, not of when the call began (verify_one() runs in READ COMMITTED) */
+	if (SPI_execute_with_args("SELECT 1 FROM phasevec._truth_of($1, $2)", 2, at, av, NULL, false, 1) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: the claim could not be read");
+	runs = SPI_processed == 1;
+	SPI_finish();
+	unbecome(&was);
+	return runs;
+}
+
 Datum
 phasevec_verify_one(PG_FUNCTION_ARGS)
 {
@@ -3651,6 +3843,14 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	}
 	PG_END_TRY();
 	proof_stop_all(false);
+	if (!d.recorded && !claim_runs_now(owner, &target, c.key))
+	{
+		/*
+		 * (eighteenth review) Retired (refute()), replaced or gone while it waited for the claim: there is no claim
+		 * verify_one() runs any more, NULL as for one that had none when it was called.
+		 */
+		PG_RETURN_NULL();
+	}
 	if (!d.recorded || d.j.out == OUT_INTERRUPTED || d.j.out == OUT_NO_VERDICT)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3831,7 +4031,9 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 
 		if (SPI_execute_with_args("SELECT x.key, x.proof, x.topic, x.support, x.expires_at, x.asserted_by::pg_catalog.text "
 								  "FROM phasevec.truth x WHERE x.watch OPERATOR(pg_catalog.=) $1 "
-								  "AND x.proof IS NOT NULL AND x.verdict OPERATOR(pg_catalog.<>) 'replaced' "
+								  "AND phasevec._claim_state(x.retired_at, x.proof, x.halted) OPERATOR(pg_catalog.=) "
+								  "ANY ('{judged,halted}'::pg_catalog.text[]) "
+								  "AND x.verdict OPERATOR(pg_catalog.<>) 'replaced' "
 								  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r "
 								  "WHERE r.oid OPERATOR(pg_catalog.=) x.asserted_by_oid "
 								  "AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by) ORDER BY x.key",
@@ -3903,7 +4105,7 @@ phasevec_adopt(PG_FUNCTION_ARGS)
  * forgot the keys of every row of the watch.
  */
 #define OBSERVE_SQL \
-	"SELECT x.ok, x.nk, x.b, pg_catalog.sha256(pg_catalog.convert_to(COALESCE(x.b, ''), 'UTF8')) FROM " \
+	"SELECT x.ok, x.nk, x.b, pg_catalog.sha256(pg_catalog.convert_to(COALESCE(x.b, ''), " TEXT_BYTES ")) FROM " \
 	"(SELECT ($1).%s::pg_catalog.text AS ok, r.%s::pg_catalog.text AS nk, (%s)::pg_catalog.text AS b " \
 	"FROM (SELECT ($2).*) r) x"
 #define OBSERVE_OLD_SQL "SELECT ($1).%s::pg_catalog.text"
@@ -4048,7 +4250,8 @@ phasevec_observe(PG_FUNCTION_ARGS)
 
 	spi_connect();
 	become(owner, &was);
-	load_target(Int32GetDatum(watch), true, &t, keep);
+	/* the row it fires for: a write is never refused for the shape of its table (its readers are) */
+	(void) load_target_ext(Int32GetDatum(watch), true, &t, keep, false, false);
 	unbecome(&was);
 	/* its watch's table, or a partition of it (a trigger on a partitioned table fires on the partition) */
 	if (t.relid != RelationGetRelid(rel) &&
@@ -4457,6 +4660,7 @@ typedef struct VerdictWatch
 	int32		watch;
 	bool		known;			/* there is such a watch */
 	Oid			relid;			/* its table */
+	AttrNumber	keyatt;			/* its key column */
 } VerdictWatch;
 
 typedef struct VerdictCache
@@ -4489,7 +4693,7 @@ verdict_shown(VerdictCache *vc, int32 watch, Datum keyd, Oid caller)
 
 		become(vc->owner, &was);
 		spi_connect();
-		known = load_target_ext(Int32GetDatum(watch), true, &t, cx, true);
+		known = load_target_ext(Int32GetDatum(watch), true, &t, cx, true, false);
 		SPI_finish();
 		unbecome(&was);
 		MemoryContextSwitchTo(o);
@@ -4503,6 +4707,7 @@ verdict_shown(VerdictCache *vc, int32 watch, Datum keyd, Oid caller)
 		vw->watch = watch;
 		vw->known = known;
 		vw->relid = known ? t.relid : InvalidOid;
+		vw->keyatt = known ? t.keyatt : InvalidAttrNumber;
 		MemoryContextDelete(cx);
 	}
 	if (!vw->known)
@@ -4515,6 +4720,13 @@ verdict_shown(VerdictCache *vc, int32 watch, Datum keyd, Oid caller)
 	}
 	if (!shown)
 		return false;
+	/*
+	 * (eighteenth review) A key that may name two rows names no verdict: checked on every call, as who may see, and
+	 * only for a caller that may read the table. Under row-level security the key's row is read as the caller
+	 * (visible_keys), which checks again under the table's lock.
+	 */
+	if (source_shape_problem(vw->relid, vw->keyatt, false, false) != NULL)
+		return false;
 	/* a key is a row too: one row-level security hides from the caller gets nothing */
 	if (check_enable_rls(vw->relid, caller, true) == RLS_ENABLED)
 	{
@@ -4524,7 +4736,7 @@ verdict_shown(VerdictCache *vc, int32 watch, Datum keyd, Oid caller)
 
 		become(vc->owner, &was);
 		spi_connect();
-		shown = load_target_ext(Int32GetDatum(watch), true, &t, cx, true) && t.relid == vw->relid;
+		shown = load_target_ext(Int32GetDatum(watch), true, &t, cx, true, false) && t.relid == vw->relid;
 		SPI_finish();
 		unbecome(&was);
 		if (shown)
