@@ -661,16 +661,17 @@ typedef enum Outcome
 {
 	OUT_VERIFIED,
 	OUT_REFUTED,
-	OUT_UNPROVEN,				/* nothing judged: the author gone, or kept from the row */
+	OUT_UNPROVEN,				/* nothing judged: the author gone, or kept from the row: recorded 'unproven' */
 	OUT_STALE,					/* nothing judged: the row is gone, or does not say what was asserted */
 	OUT_MOVED,					/* the row changed while the proof ran: nothing recorded */
 	OUT_NOT_JUDGED,				/* no session of its own could judge it (no background worker free): nothing
 								 * recorded, it stays due */
 	OUT_HALTED,					/* the proof ended its own session while it ran: refuted, and not run again */
-	OUT_INTERRUPTED,			/* another process ended the proof's session while it ran: nothing judged, due */
-	OUT_UNJUDGED				/* (tenth review) a session of its author could not judge it, for the author's sake:
-								 * nothing judged, due behind the claims judged since; its verdict stands only while
-								 * it is fresh */
+	OUT_INTERRUPTED,			/* another process ended the proof's session while it ran: nothing judged */
+	OUT_NO_VERDICT				/* (eleventh review) nothing judged: an error that is not the proof's answer (a
+								 * lock, a resource of the server, the server itself: not_a_verdict()), or a
+								 * session of its author that could not judge it. The verdict stays as it was,
+								 * and serves only until its horizon (phasevec._verdict) */
 } Outcome;
 
 static const char *const outcome_name[] = {"verified", "refuted", "unproven", "stale", NULL, NULL, NULL, NULL, NULL};
@@ -717,6 +718,50 @@ static bool
 user_request(const ErrorData *e)
 {
 	return e->message_id != NULL && strcmp(e->message_id, "canceling statement due to user request") == 0;
+}
+
+/*
+ * (eleventh review) Only the proof's own logic decides. An error is the proof's answer (refuted) when it comes from
+ * what the proof computes: its data (22), its constraints (23), its SQL and its rights (42), what it raises (P0), a
+ * feature it may not use (0A), a cardinality (21), a program limit it reaches (54: a recursion too deep, a statement
+ * too complex: the same proof reaches it again), and every other class. It is not an answer, and nothing is judged,
+ * when it comes from the server or from other sessions:
+ *
+ *   08  connection exception           53  insufficient resources (out of shared memory: the lock table another
+ *   40  transaction rollback               session filled; out of memory, disk full, too many connections)
+ *       (serialization, deadlock)      55P03  lock not available (a lock another session holds)
+ *   57  operator intervention          58  system error (I/O)
+ *       (shutdown, cancel, crash)      F0  configuration file error
+ *   HV  foreign data wrapper error     XX  internal error (the server's, or phasevec's own)
+ *
+ * Until the eleventh review only a lock wait, a deadlock and a lock_timeout were not answers: a role with no grants
+ * filled the shared lock table with session advisory locks, the proof failed 'out of shared memory', and a true claim
+ * was recorded refuted. One of these classes raised by the proof's own code (a PL/pgSQL RAISE ... USING ERRCODE)
+ * is the proof's answer: refuted. When nothing is judged the verdict stays as it was, and serves only until its
+ * horizon (phasevec._verdict): an error the proof does not decide can keep a claim from being judged, never decide
+ * or keep its verdict past that.
+ */
+static bool
+not_a_verdict(const ErrorData *e)
+{
+	if (e->funcname != NULL && strcmp(e->funcname, "exec_stmt_raise") == 0)
+		return false;
+	if (e->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
+		return true;
+	switch (ERRCODE_TO_CATEGORY(e->sqlerrcode))
+	{
+		case ERRCODE_CONNECTION_EXCEPTION:
+		case ERRCODE_TRANSACTION_ROLLBACK:
+		case ERRCODE_INSUFFICIENT_RESOURCES:
+		case ERRCODE_OPERATOR_INTERVENTION:
+		case ERRCODE_SYSTEM_ERROR:
+		case ERRCODE_CONFIG_FILE_ERROR:
+		case ERRCODE_FDW_ERROR:
+		case ERRCODE_INTERNAL_ERROR:
+			return true;
+		default:
+			return false;
+	}
 }
 
 /*
@@ -860,7 +905,9 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 				Datum		d;
 
 				if (SPI_execute_plan(plan, NULL, NULL, false, 1) != SPI_OK_SELECT || SPI_processed != 1)
-					elog(ERROR, "the proof must return one row");
+					ereport(ERROR,
+							(errcode(ERRCODE_CARDINALITY_VIOLATION),
+							 errmsg("the proof must return one row")));
 				d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
 				out = (!isnull && DatumGetBool(d)) ? OUT_VERIFIED : OUT_REFUTED;
 				if (isnull)
@@ -889,7 +936,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		 */
 		if ((out == OUT_VERIFIED || out == OUT_REFUTED) && timeout_ms > 0 && prove_fired && prove_fired_waiting)
 		{
-			out = OUT_UNPROVEN;
+			out = OUT_NO_VERDICT;
 			err = MemoryContextStrdup(oldcontext, psprintf(LOCK_WAIT_ERR, timeout_ms));
 		}
 		else if ((out == OUT_VERIFIED || out == OUT_REFUTED) && timeout_ms > 0 &&
@@ -934,26 +981,43 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 			ReThrowError(edata);
 		if (ours)
 			QueryCancelPending = false;
-		/* an error reading the row judged nothing; one in the proof refutes it; one reading it again records nothing */
-		out = phase == 0 ? OUT_UNPROVEN : phase == 1 ? OUT_REFUTED : OUT_MOVED;
+		/*
+		 * An error reading the row judged nothing; one in the proof refutes it only when it is the proof's own
+		 * (not_a_verdict); one reading it again records nothing.
+		 */
+		out = phase == 0 ? OUT_NO_VERDICT : phase == 1 ? OUT_REFUTED : OUT_MOVED;
 		if (phase != 0 && (waiting || from_deadlock(edata) ||
 						   (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE && from_interrupts(edata))))
 		{
 			/* (ninth review) a lock another session holds: not the proof's answer, and no verdict */
-			out = OUT_UNPROVEN;
+			out = OUT_NO_VERDICT;
 			err = waiting ? psprintf(LOCK_WAIT_ERR, timeout_ms) :
 				from_deadlock(edata) ? psprintf("not judged: the proof waited for a lock in a deadlock, and gave way (%s)",
 												edata->message) :
 				psprintf("not judged: the proof waited for a lock longer than its session's lock_timeout (%s)",
 						 edata->message);
 		}
-		else if ((ours || late) && phase != 0)
+		else if (ours && phase != 0)
+		{
+			out = OUT_REFUTED;
+			err = psprintf("the proof took longer than %d ms", timeout_ms);
+		}
+		else if (phase == 1 && not_a_verdict(edata))
+		{
+			/* (eleventh review) the server's error, or another session's doing: not the proof's answer */
+			out = OUT_NO_VERDICT;
+			err = psprintf("not judged: the proof failed for a reason that is not its own (SQLSTATE %s: %s)",
+						   unpack_sql_state(edata->sqlerrcode), edata->message);
+		}
+		else if (late && phase != 0)
 		{
 			out = OUT_REFUTED;
 			err = psprintf("the proof took longer than %d ms", timeout_ms);
 		}
 		else if (ours || late)
-			err = psprintf("the row took longer than %d ms to read", timeout_ms);
+			err = psprintf("not judged: the row took longer than %d ms to read", timeout_ms);
+		else if (phase == 0)
+			err = psprintf("not judged: the row could not be read (%s)", edata->message);
 		else
 			err = pstrdup(edata->message);
 		FreeErrorData(edata);
@@ -1021,13 +1085,14 @@ phasevec_prove(PG_FUNCTION_ARGS)
  *   it: the verifier walks the waits (pg_blocking_pids, transitively) and stops with an error. Until the ninth review
  *   it saw only a direct wait: the proof waited for its clock, was recorded refuted, and the ALTER and every reader of
  *   the table waited n times the clock. A proof that waits for a lock of another session past its clock (or past its
- *   author's lock_timeout) is 'unproven', with the reason: a lock wait is not the proof's answer.
+ *   author's lock_timeout) is not judged, with the reason: a lock wait is not the proof's answer (until the eleventh
+ *   review it was recorded 'unproven'; now the verdict stays, until its horizon).
  * - A session that ends while its proof runs is the proof's failure only when the proof ended it. The worker records
  *   who sent it SIGTERM (the kernel's si_pid: a sender cannot choose it). Ended by its own process (a FATAL the proof
  *   raised, its author's transaction_timeout) the claim is refuted and halted (phasevec._truth_halted) as before. Ended
  *   by another process (a role with pg_signal_backend, the author, the verifier from another session, a shutdown) it
- *   was interrupted: nothing is judged, the verdict stays, and the claim stays due, behind those judged since
- *   (phasevec._truth_interrupted). Until the ninth review any ended session halted the claim: a role that may
+ *   was interrupted: nothing is judged, the verdict stays (until its horizon), and the claim stays due, its turn
+ *   spent (phasevec._truth_tried). Until the ninth review any ended session halted the claim: a role that may
  *   terminate a backend made a true claim refuted for good. A signaller can keep a claim from being judged, never
  *   decide its verdict.
  *
@@ -1039,9 +1104,18 @@ phasevec_prove(PG_FUNCTION_ARGS)
  *   claim) is recorded by a worker too, in its own transaction: the current one, or a session of the owner.
  * - No worker free (max_worker_processes): the claim is not judged, nothing is recorded, it stays due, and the row
  *   verify() returns for it says so.
+ *
+ * (eleventh review) Three rules, for whatever stops judgment from moving:
+ * - Safety does not depend on liveness: a verdict serves only while it is fresh, judged within its watch's max_age
+ *   (phasevec._verdict); past it, it reads 'unproven', whatever kept it from being judged again (a row held by an
+ *   open assert(), a lock, the server, no worker free, a verifier that does not run).
+ * - The due queue is a fair rotation: a worker spends a claim's turn as it gets it, in a transaction of its own
+ *   (record_attempt, phasevec.attempts), and verify() takes the oldest turns first (phasevec._truth_due).
+ * - Only the proof's own logic decides its verdict: an error the server or another session causes is not an answer
+ *   (not_a_verdict); nothing is judged, and the verdict stays until its horizon.
  */
 #define PROOF_MAGIC		0x50565046
-#define PROOF_PROTOCOL	2
+#define PROOF_PROTOCOL	3
 #define PROOF_QUEUE		(64 * 1024)
 #define PROOF_GRACE_MS	5000
 #define PROOF_AHEAD		8		/* claims queued ahead of their answers, and no more than PROOF_QUEUE / 2 bytes */
@@ -1334,25 +1408,28 @@ record_halted(Oid owner, Oid verifier, const Target *t, const Claim *c, const Ju
 	return v;
 }
 
-/* A claim whose proof's session another process ended: nothing judged, it stays due (phasevec._truth_interrupted). */
+/*
+ * (eleventh review) What was tried and not judged (an interrupted session, an error that is not the proof's answer, a
+ * session of its author that could not judge it): nothing about the verdict, which stays as it was and serves only
+ * until its horizon; why, in phasevec.attempts (phasevec._truth_tried). Returns the verdict as it reads now.
+ */
 static char *
-record_interrupted(Oid owner, const Target *t, const Claim *c, const Judgment *j)
+record_tried(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 {
 	MemoryContext keep = CurrentMemoryContext;
 	char	   *v = NULL;
 	Who			was;
-	Oid			at[4] = {INT4OID, TEXTOID, BYTEAOID, TEXTOID};
-	Datum		av[4] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), PointerGetDatum(c->bind),
-	j->err ? CStringGetTextDatum(j->err) : (Datum) 0};
+	Oid			at[4] = {INT4OID, TEXTOID, TEXTOID, BOOLOID};
+	Datum		av[4] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key),
+	j->err ? CStringGetTextDatum(j->err) : (Datum) 0, BoolGetDatum(j->out == OUT_INTERRUPTED)};
 	char		nulls[5] = "    ";
 
-	nulls[2] = c->bind ? ' ' : 'n';
-	nulls[3] = j->err ? ' ' : 'n';
+	nulls[2] = j->err ? ' ' : 'n';
 	become(owner, &was);
 	spi_connect();
-	if (SPI_execute_with_args("SELECT phasevec._truth_interrupted($1, $2, $3, $4)", 4, at, av, nulls, false, 1)
+	if (SPI_execute_with_args("SELECT phasevec._truth_tried($1, $2, $3, $4)", 4, at, av, nulls, false, 1)
 		!= SPI_OK_SELECT)
-		elog(ERROR, "phasevec: an interrupted proof could not be recorded");
+		elog(ERROR, "phasevec: what was tried could not be recorded");
 	if (SPI_processed == 1)
 	{
 		char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
@@ -1366,51 +1443,36 @@ record_interrupted(Oid owner, const Target *t, const Claim *c, const Judgment *j
 }
 
 /*
- * (tenth review) A claim a session of its author could not judge, for the author's sake (phasevec._truth_unjudged):
- * nothing judged; it keeps its verdict while that is fresh (`every`, the p_every of the verify() that found it; NULL
- * from verify_one()), and waits behind the claims judged since.
+ * (eleventh review) A claim's turn is spent when a worker gets it: before it is taken, judged or recorded, in a
+ * transaction of its own, committed at once (phasevec.attempts, which only workers write: no other session holds its
+ * rows). verify() takes the claims whose turn is oldest (phasevec._truth_due): whatever becomes of this attempt (judged,
+ * kept from the claim by another transaction, an error that is not the proof's, a session that ends), the claim goes
+ * behind every claim that waits, and no claim holds the head of the queue. SPI not connected; in a transaction.
  */
-static char *
-record_unjudged(Oid owner, const Target *t, const Claim *c, const Judgment *j, const Interval *every)
-{
-	MemoryContext keep = CurrentMemoryContext;
-	char	   *v = NULL;
-	Who			was;
-	Oid			at[5] = {INT4OID, TEXTOID, BYTEAOID, TEXTOID, INTERVALOID};
-	Datum		av[5] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), PointerGetDatum(c->bind),
-	j->err ? CStringGetTextDatum(j->err) : (Datum) 0, PointerGetDatum(every)};
-	char		nulls[6] = "     ";
+#define ATTEMPT_SQL "SELECT phasevec._truth_attempt($1, $2)"
 
-	nulls[2] = c->bind ? ' ' : 'n';
-	nulls[3] = j->err ? ' ' : 'n';
-	nulls[4] = every ? ' ' : 'n';
+static void
+record_attempt(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c)
+{
+	Datum		av[2] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key)};
+	Who			was;
+
 	become(owner, &was);
 	spi_connect();
-	if (SPI_execute_with_args("SELECT phasevec._truth_unjudged($1, $2, $3, $4, $5)", 5, at, av, nulls, false, 1)
-		!= SPI_OK_SELECT)
-		elog(ERROR, "phasevec: a claim that could not be judged could not be recorded");
-	if (SPI_processed == 1)
-	{
-		char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-
-		if (s)
-			v = MemoryContextStrdup(keep, s);
-	}
+	if (SPI_execute_plan(plan, av, NULL, false, 1) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: an attempt could not be recorded");
 	SPI_finish();
 	unbecome(&was);
-	return v;
 }
 
 /* Record what was found: nothing for a claim not judged (the verdict as it reads now is returned). In a worker. */
 static char *
-record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const Judgment *j, const Interval *every)
+record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const Judgment *j)
 {
 	if (j->out == OUT_HALTED)
 		return record_halted(owner, verifier, t, c, j);
-	if (j->out == OUT_INTERRUPTED)
-		return record_interrupted(owner, t, c, j);
-	if (j->out == OUT_UNJUDGED)
-		return record_unjudged(owner, t, c, j, every);
+	if (j->out == OUT_INTERRUPTED || j->out == OUT_NO_VERDICT)
+		return record_tried(owner, t, c, j);
 	return record(owner, t, c, j);
 }
 
@@ -1531,13 +1593,14 @@ proof_sigterm(int signo, siginfo_t *info, void *context)
 
 static SPIPlanPtr worker_lock_plan = NULL;
 static SPIPlanPtr worker_take_plan = NULL;
+static SPIPlanPtr worker_attempt_plan = NULL;
 
 /*
  * (tenth review) The session clocks a worker pins before it connects. A worker is phasevec's session, not its
  * author's: the database's and the role's defaults (ALTER DATABASE/ROLE ... SET, which an ordinary role may run for
  * itself) do not reach these. In the ninth cut an author that set its own transaction_timeout to 1 ms had every worker
  * of its claims end before it judged, and its claims kept their old 'verified'. The proof's clock is its only time
- * limit; a proof that waits for a lock is 'unproven' at its clock, as before. Inside a proof none of these can be set
+ * limit; a proof that waits for a lock is not judged at its clock, as before. Inside a proof none of these can be set
  * (the guard), and a claim's settings never carry them (not_replayed).
  */
 static const char *const worker_clocks[] = {
@@ -1634,6 +1697,7 @@ phasevec_proof_main(Datum arg)
 		(void) kept_plan(&target.record_plan, RECORD_SQL, 6, at);
 		(void) kept_plan(&worker_lock_plan, CLAIM_LOCK_SQL, 3, lt);
 		(void) kept_plan(&worker_take_plan, CLAIM_TAKE_SQL, 2, lt);
+		(void) kept_plan(&worker_attempt_plan, ATTEMPT_SQL, 2, lt);
 	}
 	SPI_finish();
 	unbecome(&was);
@@ -1700,16 +1764,27 @@ phasevec_proof_main(Datum arg)
 			break;
 		}
 
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		/* each statement in a new snapshot, whatever default_transaction_isolation says; it records, so read-write */
-		XactIsoLevel = XACT_READ_COMMITTED;
-		XactReadOnly = RecoveryInProgress();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		MemoryContextSwitchTo(per);
-		pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
 		PG_TRY();
 		{
+			/* (eleventh review) the claim's turn is spent first, in a transaction of its own (record_attempt) */
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			XactIsoLevel = XACT_READ_COMMITTED;
+			XactReadOnly = RecoveryInProgress();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			record_attempt(sh->owner, worker_attempt_plan, &target, &c);
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			MemoryContextSwitchTo(per);
+
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			/* each statement in a new snapshot, whatever default_transaction_isolation says; it records, so read-write */
+			XactIsoLevel = XACT_READ_COMMITTED;
+			XactReadOnly = RecoveryInProgress();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			MemoryContextSwitchTo(per);
+			pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
 			if (!claim_taken(sh->owner, every ? worker_lock_plan : worker_take_plan, &target, &c, every))
 				what = ANSWER_SKIPPED;
 			else
@@ -1723,7 +1798,7 @@ phasevec_proof_main(Datum arg)
 						  c.asserted_for, &j);
 					pg_atomic_write_u32(&sh->judging, 0);
 				}
-				v = record_judgment(sh->owner, verifier, &target, &c, &j, every);
+				v = record_judgment(sh->owner, verifier, &target, &c, &j);
 			}
 		}
 		PG_CATCH();
@@ -2083,10 +2158,11 @@ line_to_record(Line *l, const Judgment *j)
 }
 
 /*
- * (tenth review) The head could not be judged for its author's sake: it is recorded so (OUT_UNJUDGED), by a new
- * worker. `author_wide` (no session of its author could start): so is every claim of that author queued in this call,
- * and every one queued later (verify()), with no session of its author tried again. In the ninth cut nothing was
- * recorded: such a claim kept its verdict for good and, being the oldest, the head of the queue.
+ * (tenth review) The head could not be judged for its author's sake: it is recorded so (OUT_NO_VERDICT: its turn is
+ * spent, its verdict stays as it was until its horizon), by a new worker. `author_wide` (no session of its author
+ * could start): so is every claim of that author queued in this call, and every one queued later (verify()), with no
+ * session of its author tried again. In the ninth cut nothing was recorded: such a claim kept its verdict for good
+ * and, being the oldest, the head of the queue.
  */
 static void
 line_unjudged(Line *l, const char *why, bool author_wide)
@@ -2094,7 +2170,7 @@ line_unjudged(Line *l, const char *why, bool author_wide)
 	Oid			author = l->q[l->qh].c->author;
 	Judgment	j;
 
-	j.out = OUT_UNJUDGED;
+	j.out = OUT_NO_VERDICT;
 	j.at = 0;
 	j.err = (char *) why;
 	line_to_record(l, &j);
@@ -2301,7 +2377,7 @@ line_next(Line *l, Done *d)
 					if (h->kind == MSG_JUDGE && (by == 0 || by == self))
 					{
 						line_unjudged(l, "not judged: a new session of its author ended before it judged (see the server "
-									  "log): it stays due, and keeps its verdict only while that is fresh", true);
+									  "log): its verdict stays as it was, and serves only until its horizon", true);
 						continue;
 					}
 					line_done(l, d, OUT_NOT_JUDGED,
@@ -2663,7 +2739,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 				{
 					/* no session of its author started in this call: recorded so, not tried again */
 					kind = MSG_RECORD;
-					rec.out = OUT_UNJUDGED;
+					rec.out = OUT_NO_VERDICT;
 					rec.at = 0;
 					rec.err = psprintf("%s (an earlier claim of its author, in this call)", l.unjudgeable_why);
 				}
@@ -2792,7 +2868,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 	proof_stop(proof_cur, false, false);
 	proof_cur = NULL;
-	if (!d.recorded || d.j.out == OUT_INTERRUPTED || d.j.out == OUT_UNJUDGED)
+	if (!d.recorded || d.j.out == OUT_INTERRUPTED || d.j.out == OUT_NO_VERDICT)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("phasevec: verify_one() could not judge key %s", c.key),

@@ -12,7 +12,8 @@
 #    verifier's lock): the check saw only a direct wait, the proof waited for its clock and was recorded refuted, and
 #    the ALTER and every reader of the table waited n times the clock. The verifier walks the waits now: an error.
 # 3. A proof that waits for a lock held by a third session that does not wait on the verifier: refuted for its time
-#    then; 'unproven' now (a lock wait is not the proof's answer), and judged once the lock is gone.
+#    then; not judged now (a lock wait is not the proof's answer): verify_one() says so, the verdict stays as it was
+#    (until the eleventh review it was recorded 'unproven'), and it is judged once the lock is gone.
 # 4. A claim larger than the queue, whose worker waits for a lock at its start: the verifier waited inside the send
 #    for as long as the lock was held. Now it waits under its deadlines and says the claim was not judged.
 set -uo pipefail
@@ -158,12 +159,13 @@ for _ in $(seq 1 100); do
     [ "$(q -c "SELECT count(*) FROM pg_locks WHERE relation = 'inv'::regclass AND mode = 'AccessExclusiveLock' AND granted")" -gt 0 ] && break
     sleep 0.05
 done
-during=$(q -c "SELECT phasevec.verify_one('inv', '1', 1000)" 2>&1)
-why=$(q -c "SELECT coalesce(last_error, '') FROM phasevec.truth WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'inv')")
+during=$(q -c "SELECT phasevec.verify_one('inv', '1', 1000)" 2>&1 | grep -c "could not judge")
+why=$(q -c "SELECT phasevec._verdict(t) || ': ' || coalesce(a.why, '') FROM phasevec.truth t JOIN phasevec.attempts a USING (watch, key) WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'inv')")
 wait $x
 after=$(q -c "SELECT phasevec.verify_one('inv', '1', 1000)" 2>&1)
 echo "a lock held by a third session: verify_one said $during ($why), and once it is gone: $after"
-[ "$during|$after" = "unproven|verified" ] && echo "ok - a lock wait past the clock is not a refutation" || { echo "not ok - a lock wait past the clock was judged"; fallas=1; }
+case "$why" in "verified: not judged: the proof was still waiting for a lock"*) ;; *) during="$during, $why" ;; esac
+[ "$during|$after" = "1|verified" ] && echo "ok - a lock wait past the clock is not a refutation" || { echo "not ok - a lock wait past the clock was judged"; fallas=1; }
 
 # 4. A third session holds the watched table; the 70 kB claim's worker waits for it as it starts.
 q -c "BEGIN" -c "LOCK TABLE notes IN ACCESS EXCLUSIVE MODE" -c "SELECT pg_sleep(20)" -c "COMMIT" >/dev/null 2>&1 &

@@ -8,11 +8,11 @@
 #    timeouts before it connects, over the database's and the role's defaults; the proof's clock is its only time
 #    limit (a proof waiting for a lock is 'unproven' at its clock, as before, not at the author's lock_timeout).
 # 2. A claim that still cannot be judged for its author's sake (here the author's local_preload_libraries names a
-#    library that does not exist: a new session of the author fails as it starts) is recorded as such
-#    (truth.unjudged_at, unjudged_why). It keeps its verdict while that is fresh (p_every of the verify() that found it),
-#    then reads 'unproven', in brief() too. And it waits behind the claims judged since (truth.tried_at): with p_n, an
-#    author's claims that cannot be judged held the head of the queue, and another author's false claims were never
-#    refuted.
+#    library that does not exist: a new session of the author fails as it starts): why is recorded with its turn
+#    (phasevec.attempts.why). Its verdict serves while it is fresh (eleventh review: judged within the watch's
+#    max_age, 4 s here; in the tenth cut a mark, unjudged_until, kept it one p_every more), then reads 'unproven', in
+#    brief() too. And its turn is spent: with p_n, an author's claims that cannot be judged held the head of the
+#    queue, and another author's false claims were never refuted.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -83,6 +83,7 @@ q -c "ALTER ROLE pv_u_a RESET ALL" >/dev/null
 
 # 2. Nine claims of pv_u_a, judged first (the oldest verdicts), then ten of pv_u_b; all true, then all false.
 q -c "UPDATE inv SET overdue = false" >/dev/null
+q -c "UPDATE phasevec.watches SET max_age = interval '4 seconds' WHERE name = 'inv'" >/dev/null
 q -c "SET ROLE pv_u_a" -c "SELECT count(phasevec.assert('inv', k::text, 'NOT EXISTS (SELECT 1 FROM public.inv WHERE overdue)')) FROM generate_series(3, 11) k" >/dev/null
 v -c "SELECT count(*) FROM phasevec.verify('inv', 100, interval '0', interval '30 seconds', 5000)" >/dev/null
 sleep 0.1
@@ -95,9 +96,9 @@ q -c "UPDATE inv SET overdue = true" >/dev/null
 sleep 2.2
 # p_every 2 s: due (verified more than 2 s ago); not judged now, it keeps its verdict while that is fresh
 first=$(v -c "SELECT count(*) FILTER (WHERE verdict = 'verified' AND error LIKE 'not judged%') || ' of ' || count(*) || ' still verified, not judged' FROM phasevec.verify('inv', 9, interval '2 seconds', interval '30 seconds', 5000)" 2>&1)
-fresh=$(q -c "SELECT phasevec._verdict(t) || ' ' || (unjudged_at IS NOT NULL) FROM phasevec.truth t WHERE key = '3'")
+fresh=$(q -c "SELECT phasevec._verdict(t) || ' ' || (a.why IS NOT NULL) FROM phasevec.truth t JOIN phasevec.attempts a USING (watch, key) WHERE key = '3'")
 echo "an author whose sessions cannot start: verify() said: $first; key 3 reads: $fresh"
-sleep 2.2
+sleep 2.2   # judged more than 4 s ago now: past the watch's horizon
 stale=$(q -c "SELECT phasevec._verdict(t) FROM phasevec.truth t WHERE key = '3'")
 served=$(v -c "SELECT count(*) FROM phasevec.brief('inv') WHERE key = '3' AND verdict = 'verified'")
 echo "once that is older than p_every: key 3 reads: $stale; brief() serves it as verified: $served"
@@ -107,17 +108,17 @@ one=$(v -c "SELECT phasevec.verify_one('inv', '4', 5000)" 2>&1)
 case "$one" in *"could not judge"*) echo "ok - verify_one() says it could not judge it" ;; *) echo "not ok - verify_one() said: $one"; fallas=1 ;; esac
 # ten verify(p_n => 5): pv_u_b's false claims are refuted all the same
 for _ in $(seq 1 10); do v -c "SELECT count(*) FROM phasevec.verify('inv', 5, interval '0', interval '30 seconds', 5000)" >/dev/null; done
-b=$(q -c "SELECT count(*) FROM phasevec.truth t WHERE key::int BETWEEN 12 AND 21 AND phasevec._verdict(t) = 'refuted'")
+b=$(q -c "SELECT count(*) FROM phasevec.truth t WHERE key::int BETWEEN 12 AND 21 AND t.verdict = 'refuted'")
 a=$(q -c "SELECT count(*) FROM phasevec.truth t WHERE key::int BETWEEN 3 AND 11 AND phasevec._verdict(t) = 'verified'")
 echo "after ten verify(p_n => 5): $b of pv_u_b's 10 false claims refuted; $a of pv_u_a's still read verified"
 [ "$b|$a" = "10|0" ] && echo "ok - claims that cannot be judged do not hold the head of the queue" \
     || { echo "not ok - claims that cannot be judged held the head of the queue"; fallas=1; }
-why=$(q -c "SELECT unjudged_why FROM phasevec.truth WHERE key = '5'")
+why=$(q -c "SELECT why FROM phasevec.attempts WHERE key = '5'")
 echo "why: $why"
 # its author fixed: judged again, and the mark is gone
 q -c "ALTER ROLE pv_u_a RESET ALL" >/dev/null
 v -c "SELECT count(*) FROM phasevec.verify('inv', 100, interval '0', interval '30 seconds', 5000)" >/dev/null
-after=$(q -c "SELECT count(*) FILTER (WHERE phasevec._verdict(t) = 'refuted') || ' refuted, ' || count(unjudged_at) || ' marked' FROM phasevec.truth t WHERE key::int BETWEEN 3 AND 11")
+after=$(q -c "SELECT count(*) FILTER (WHERE phasevec._verdict(t) = 'refuted') || ' refuted, ' || count(a.why) || ' marked' FROM phasevec.truth t JOIN phasevec.attempts a USING (watch, key) WHERE key::int BETWEEN 3 AND 11")
 echo "its author fixed: $after"
 [ "$after" = "9 refuted, 0 marked" ] && echo "ok - judged again once its sessions start" || { echo "not ok - not judged again ($after)"; fallas=1; }
 left=$(q -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof'")
