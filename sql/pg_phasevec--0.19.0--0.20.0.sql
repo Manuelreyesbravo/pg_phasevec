@@ -129,11 +129,30 @@
 --    its author's session had (truth.proof_env, "app.tenant=" for one with no value), and is judged only in a
 --    session whose placeholders are those (src/phasevec_guard.c, guard_env_misfit). A claim recorded before names
 --    only the placeholders that had a value then: it reads as if its author's session had no other.
+--
+-- Then an eighth review moved each proof into a session of its own (a background worker connected as its author,
+-- src/phasevec_truth.c), and a ninth ran attacks against that cut (2f42e62, never released):
+--
+-- 30. A worker terminated by another process (a role with pg_signal_backend, the verifier from another session) was
+--    taken for a proof that ended its own session: a true claim was recorded refuted and halted for good, and left
+--    brief(). The worker notes who sent it SIGTERM: a session another process ends leaves its claim due, its verdict
+--    as it was (_truth_interrupted, truth.interrupted_at); only one the proof ended itself is halted.
+-- 31. A claim over 64 kB blocked its verifier inside a send, with no deadline: behind a proof that catches
+--    query_canceled, or a worker waiting for a lock, neither the proof's clock nor p_budget ended the call. Sends do
+--    not wait now: the verifier keeps every deadline while it sends, a large claim in pieces.
+-- 32. A proof that waited for its verifier through a third session (an ALTER TABLE queued behind the verifier's read)
+--    waited out its clock and was recorded refuted, and the ALTER and every reader of the table waited n times the
+--    clock. The verifier walks the waits and stops with an error; a proof still waiting for another session's lock
+--    when its clock ends is 'unproven', not refuted.
+-- 33. A verifier with an uncommitted write that refuted a claim committed, together with that write, a 'verified' its
+--    proof reached on the state before it. A transaction that has written may not verify, and the worker takes,
+--    judges and records each claim in a transaction of its own, committing each verdict as it is reached.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
                            ADD COLUMN proof_env text[], ADD COLUMN halted boolean NOT NULL DEFAULT false,
-                           ADD COLUMN looked_at timestamptz, ADD COLUMN looked_for bytea;
+                           ADD COLUMN looked_at timestamptz, ADD COLUMN looked_for bytea,
+                           ADD COLUMN interrupted_at timestamptz, ADD COLUMN interrupted_why text;
 COMMENT ON COLUMN phasevec.truth.asserted_by IS
     $q$The name of the role that asserted the proof, when it did (0.20.0). With asserted_by_oid: the proof runs as that role only while the OID still has this name.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by_oid IS
@@ -148,6 +167,10 @@ COMMENT ON COLUMN phasevec.truth.looked_for IS
     $q$The row's text hash (phasevec.sources) when verify() found it stale (looked_at); NULL when the row was gone (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.proof_env IS
     $q$What the author's session had changed when it asserted, over the configuration every new session of the author starts from ("name=value": DateStyle, TimeZone, search_path, application_name, ...; "app.tenant=" for a custom placeholder it made, with no value): the proof runs in a new session of its author, with these on top (0.20.0).$q$;
+COMMENT ON COLUMN phasevec.truth.interrupted_at IS
+    $q$When the session that ran this proof was last ended by another process while it ran (0.20.0, ninth review): nothing was judged, the claim stays due, and it waits behind the claims judged since. Cleared by a verdict or an assert.$q$;
+COMMENT ON COLUMN phasevec.truth.interrupted_why IS
+    $q$Who ended the session that ran this proof (interrupted_at): the process that terminated it.$q$;
 COMMENT ON COLUMN phasevec.truth.halted IS
     $q$The session that ran this proof ended while it ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
 
@@ -201,7 +224,7 @@ BEGIN
            proof_env = EXCLUDED.proof_env, halted = false,
            verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$unproven$q$ END,
            verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now(),
-           looked_at = NULL, looked_for = NULL;
+           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
 END;
 $f$;
 CREATE OR REPLACE FUNCTION phasevec.assert(p_watch text, p_key text, p_proof text DEFAULT NULL, p_topic text DEFAULT NULL,
@@ -261,7 +284,8 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 THEN t.looked_at IS NULL OR t.looked_at < now() - p_every OR t.looked_for IS DISTINCT FROM s.text_hash
                 ELSE t.verified_at IS NULL OR t.verified_at < now() - p_every END
        AND (r.oid IS NULL OR pg_catalog.pg_has_role(p_verifier, r.oid, $q$USAGE$q$))
-     ORDER BY CASE WHEN x.stale THEN NULL ELSE t.verified_at END NULLS FIRST, t.key
+     -- a claim whose proof's session another process ended (interrupted_at) stays due, behind those judged since
+     ORDER BY CASE WHEN x.stale THEN NULL ELSE greatest(t.verified_at, t.interrupted_at) END NULLS FIRST, t.key
      LIMIT p_n
 $f$;
 
@@ -303,7 +327,7 @@ BEGIN
         UPDATE phasevec.truth t
            SET verdict = p_outcome, verified_at = coalesce(p_at, now()), last_error = p_error, halted = false,
                verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END,
-               looked_at = NULL, looked_for = NULL
+               looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     END IF;
@@ -340,10 +364,29 @@ BEGIN
     END IF;
     UPDATE phasevec.truth t
        SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
+           interrupted_at = NULL, interrupted_why = NULL,
            last_error = $q$the session that ran this proof ended while it ran: not run again until it is asserted again$q$
      WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     RETURN CASE WHEN FOUND THEN 1 ELSE 0 END;
+END;
+$f$;
+
+-- (ninth review) A claim whose proof's session was ended by another process while it ran (a role with
+-- pg_signal_backend, the author, the verifier from another session, a shutdown): nothing was judged, and nothing about
+-- the proof is recorded: the verdict stays as it was and the claim stays due, behind the claims judged since
+-- (_truth_due). Until the ninth review it was recorded refuted and halted, as if the proof had ended its session.
+-- Returns the verdict as it reads now.
+CREATE FUNCTION phasevec._truth_interrupted(p_watch int, p_key text, p_bind bytea, p_why text)
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE v text;
+BEGIN
+    UPDATE phasevec.truth t
+       SET interrupted_at = now(), interrupted_why = p_why
+     WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
+       AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
+    SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
+    RETURN v;
 END;
 $f$;
 
@@ -658,6 +701,7 @@ REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
     phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea, oid, timestamptz),
+    phasevec._truth_interrupted(int, text, bytea, text),
     phasevec._note_set(int, text, bytea, text), phasevec.adopt(text, regrole, text[], text[]),
     phasevec._door_recall(text, text, int, boolean, text[]), phasevec._door_disputes(text, text[]),
     phasevec._door_replacement(text, text, text[]), phasevec._door_truth_coverage(text, text[])

@@ -6,11 +6,13 @@
 #    Under READ COMMITTED the proof judged Y; the first cut recorded 'verified' for X.
 # 2. Another author asserts the same proof while it runs as the first one: the first cut kept the verdict reached
 #    with the first author's rights on the second author's claim.
-# 3. The session a proof runs in ends while it runs (here it is terminated; a proof that set transaction_timeout did
-#    it with a FATAL in the second cut): in the second cut that session was the verifier's, nothing of that verify()
-#    was written, and the same claim came first again and ended every later verify() too. Since the eighth review a
-#    proof runs in a session of its own (a background worker): that one ends, the verifier records the claim refuted
-#    and halted (not run again until asserted again), and judges the rest in the same call.
+# 3. The session a proof runs in ends while it runs (here by its author's transaction_timeout, while the proof waits
+#    at a gate; a proof that set transaction_timeout did it with a FATAL in the second cut): in the second cut that
+#    session was the verifier's, nothing of that verify() was written, and the same claim came first again and ended
+#    every later verify() too. Since the eighth review a proof runs in a session of its own (a background worker): that
+#    one ends, the claim is recorded refuted and halted (not run again until asserted again), and the rest are judged
+#    in the same call. (Until the ninth review these sessions were terminated from outside, and that halted the claim
+#    too; a session another process ends is interrupted now, not halted: test/truth_worker.sh.)
 # 4. (third cut) Only that claim: not every claim of the watch with the same text, proof and author.
 # 5. Each verify_one() halts the claim whose session ended; one that finds no background worker free records
 #    nothing, and its claim stays due (the third cut dropped a mark past the eighth ended session).
@@ -34,6 +36,7 @@ trap '"$PG/pg_ctl" -D "$DATA" -w stop >/dev/null' EXIT
 DROP ROLE IF EXISTS pv_race_admin;
 DROP ROLE IF EXISTS pv_race_low;
 DROP ROLE IF EXISTS pv_race_mal;
+DROP ROLE IF EXISTS pv_race_end;
 CREATE EXTENSION pg_phasevec;
 SELECT phasevec.reader_register('r1', repeat('a', 64), 4);
 CREATE TABLE notes (id int PRIMARY KEY, body text);
@@ -66,26 +69,43 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 SET ROLE pv_race_admin;
 SELECT phasevec.assert('notes', '1', 'public.gate(81) AND (SELECT v FROM pv_private.secret) = ''hunter2''');
 RESET ROLE;
+-- an author every session of which ends a transaction after 1.5 s: its proof that waits at a gate ends its session
+CREATE ROLE pv_race_end;
+ALTER ROLE pv_race_end SET transaction_timeout = '1500ms';
+GRANT USAGE ON SCHEMA phasevec TO pv_race_end;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_race_end;
 CREATE TABLE jobs (id int PRIMARY KEY, body text);
 INSERT INTO jobs VALUES (1, 'waits at the gate'), (2, 'plain'), (3, 'plain too');
 SELECT phasevec.watch('jobs', 'jobs'::regclass, 'id', 'r.body', 'r1');
+GRANT SELECT ON jobs TO pv_race_end;
+SET ROLE pv_race_end;
 SELECT phasevec.assert('jobs', '1', 'public.gate(91)');
 SELECT phasevec.assert('jobs', '2', 'true');
 SELECT phasevec.assert('jobs', '3', 'true');
+RESET ROLE;
 -- three claims that read alike (same text, proof and author), and ten claims behind one gate
 CREATE TABLE twins (id int PRIMARY KEY, body text);
 INSERT INTO twins VALUES (1, 'status: approved'), (2, 'status: approved'), (3, 'status: approved');
 SELECT phasevec.watch('twins', 'twins'::regclass, 'id', 'r.body', 'r1');
+GRANT SELECT ON twins TO pv_race_end;
+SET ROLE pv_race_end;
 SELECT phasevec.assert('twins', k::text, 'public.gate(95)') FROM generate_series(1, 3) k;
+RESET ROLE;
 CREATE TABLE pool (id int PRIMARY KEY, body text);
 INSERT INTO pool SELECT g, 'job ' || g FROM generate_series(1, 10) g;
 SELECT phasevec.watch('pool', 'pool'::regclass, 'id', 'r.body', 'r1');
+GRANT SELECT ON pool TO pv_race_end;
+SET ROLE pv_race_end;
 SELECT phasevec.assert('pool', k::text, 'public.gate(96)') FROM generate_series(1, 10) k;
+RESET ROLE;
 CREATE TABLE halts (id int PRIMARY KEY, body text);
 INSERT INTO halts VALUES (1, 'waits at the gate'), (2, 'plain');
 SELECT phasevec.watch('halts', 'halts'::regclass, 'id', 'r.body', 'r1');
+GRANT SELECT ON halts TO pv_race_end;
+SET ROLE pv_race_end;
 SELECT phasevec.assert('halts', '1', 'public.gate(97)');
 SELECT phasevec.assert('halts', '2', 'true');
+RESET ROLE;
 CREATE ROLE pv_race_mal LOGIN;
 GRANT USAGE ON SCHEMA phasevec TO pv_race_mal;
 GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, float8),
@@ -100,6 +120,22 @@ waits_on() {  # until some session waits on advisory lock $1
     echo "not ok - nobody waited on lock $1"; return 1
 }
 fallas=0
+# hold gate $1 until a proof has waited at it and its session has ended (by its author's transaction_timeout)
+hold_until_ended() {
+    cat <<SQL
+SELECT pg_advisory_lock($1);
+DO \$\$ BEGIN
+    WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND NOT granted) LOOP
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+    WHILE EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND NOT granted) LOOP
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+    PERFORM pg_sleep(0.2);
+END \$\$;
+SELECT pg_advisory_unlock($1);
+SQL
+}
 
 # 1. ABA. Session B holds the gates; session A verifies.
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL' &
@@ -166,18 +202,8 @@ own=$("$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('notes', '1', 10000)")
 echo "author race: verified as its new author: $own"
 [ "$own" = "refuted" ] || { echo "not ok - the claim of the low author was not judged with its own rights"; fallas=1; }
 
-# 3. Session B holds the gate; session A verifies, and the session its proof runs in is terminated inside it.
-"$PG/psql" "${P[@]}" >/dev/null <<'SQL' &
-SELECT pg_advisory_lock(91);
-DO $$ BEGIN
-    WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND NOT granted) LOOP
-        PERFORM pg_sleep(0.05);
-    END LOOP;
-    PERFORM pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND NOT granted;
-    PERFORM pg_sleep(0.2);
-END $$;
-SELECT pg_advisory_unlock(91);
-SQL
+# 3. Session B holds the gate; session A verifies, and the session its proof runs in ends inside it.
+hold_until_ended 91 | "$PG/psql" "${P[@]}" >/dev/null &
 b=$!
 for _ in $(seq 1 100); do
     [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND granted")" -gt 0 ] && break
@@ -197,24 +223,14 @@ case "$next|$halted" in
 esac
 again=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
 [ "$again" = "0" ] && echo "ok - it is not run again until asserted again" || { echo "not ok - a halted claim runs again"; fallas=1; }
-"$PG/psql" "${P[@]}" -c "SELECT phasevec.assert('jobs', '1', 'public.gate(91)')" >/dev/null
+"$PG/psql" "${P[@]}" -c "SET ROLE pv_race_end" -c "SELECT phasevec.assert('jobs', '1', 'public.gate(91)')" >/dev/null
 back=$("$PG/psql" "${P[@]}" -c "SELECT verdict FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
 [ "$back" = "verified" ] && echo "ok - asserted again, it runs" || { echo "not ok - asserted again, it does not run ($back)"; fallas=1; }
 
 # 4. Three claims read alike (same text, proof and author); the session verifying the first one ends inside it.
 # In the third cut the mark named the claim and not its key, and all three were halted.
 "$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('twins', 10, interval '0', interval '30 seconds', 20000)" >/dev/null
-"$PG/psql" "${P[@]}" >/dev/null <<'SQL' &
-SELECT pg_advisory_lock(95);
-DO $$ BEGIN
-    WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 95 AND NOT granted) LOOP
-        PERFORM pg_sleep(0.05);
-    END LOOP;
-    PERFORM pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND objid = 95 AND NOT granted;
-    PERFORM pg_sleep(0.2);
-END $$;
-SELECT pg_advisory_unlock(95);
-SQL
+hold_until_ended 95 | "$PG/psql" "${P[@]}" >/dev/null &
 b=$!
 for _ in $(seq 1 100); do
     [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 95 AND granted")" -gt 0 ] && break
@@ -228,9 +244,10 @@ echo "claims alike: $twins"
 [ "$twins" = "1 refuted halted, 2 verified, 3 verified" ] && echo "ok - only the claim whose proof's session ended is halted" || { echo "not ok - a session that ended halted claims it never ran"; fallas=1; }
 
 # 5. Ten verify_one() calls of ten claims, each in a session of its own: as many as there are background workers
-# free wait at the gate, and the rest are told that none is free (nothing recorded: their claims stay due). Then the
-# waiting ones are ended inside their proofs: each of those claims is halted, by the verify_one() that ran it, which
-# goes on. In the third cut a mark of a verifier's ended session was dropped past the eighth, and its claim ran again.
+# free wait at the gate, and the rest are told that none is free (nothing recorded: their claims stay due). The
+# waiting ones end inside their proofs (their author's transaction_timeout): each of those claims is halted, by the
+# verify_one() that ran it, which goes on. In the third cut a mark of a verifier's ended session was dropped past the
+# eighth, and its claim ran again.
 W5=$(mktemp -d "${TMPDIR:-/tmp}/pv-race.XXXXXX")
 pids=()
 "$PG/psql" "${P[@]}" -c "SELECT pg_advisory_lock(96), pg_sleep(30)" >/dev/null 2>&1 &
@@ -243,16 +260,11 @@ for k in $(seq 1 10); do
     "$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('pool', '$k', 30000)" >"$W5/$k" 2>&1 &
     pids+=($!)
 done
-# settled: every call either waits at the gate or has ended
-for _ in $(seq 1 200); do
-    waiting=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND NOT granted")
-    nofree=$(grep -l "no background worker is free" "$W5"/* 2>/dev/null | wc -l)
-    [ $((waiting + nofree)) -ge 10 ] && break
-    sleep 0.05
-done
-echo "ten verify_one(): $waiting wait in their own sessions, $nofree found no background worker free"
-"$PG/psql" "${P[@]}" -c "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND NOT granted" >/dev/null
 for p in "${pids[@]}"; do wait "$p"; done
+waiting=$(grep -lx "refuted" "$W5"/* 2>/dev/null | wc -l)
+nofree=$(grep -l "no background worker is free" "$W5"/* 2>/dev/null | wc -l)
+echo "ten verify_one(): $waiting ended in their own sessions, $nofree found no background worker free"
+[ $((waiting + nofree)) -eq 10 ] || { echo "not ok - $((10 - waiting - nofree)) verify_one() calls said something else: $(cat "$W5"/* | sort | uniq -c | tr '\n' ' ')"; fallas=1; }
 "$PG/psql" "${P[@]}" -c "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND granted" >/dev/null
 wait $holder
 pool=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FILTER (WHERE halted) || ' halted, ' || count(*) FILTER (WHERE NOT halted AND verdict = 'unproven') || ' due' FROM phasevec.truth WHERE watch = (SELECT id FROM phasevec.watches WHERE name = 'pool')")
@@ -268,18 +280,8 @@ rm -rf "$W5"
 # 6. The session of claim 1 of 'halts' is terminated inside its proof (its verifier records it halted); then a role
 # that may not act as its author calls verify_one() in a transaction it rolls back, and is refused it for that key,
 # and runs verify(): the halt stays.
-end_in_gate() {  # $1 gate, $2 the verify that waits at it (terminated there)
-    "$PG/psql" "${P[@]}" >/dev/null <<SQL &
-SELECT pg_advisory_lock($1);
-DO \$\$ BEGIN
-    WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND NOT granted) LOOP
-        PERFORM pg_sleep(0.05);
-    END LOOP;
-    PERFORM pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND NOT granted;
-    PERFORM pg_sleep(0.2);
-END \$\$;
-SELECT pg_advisory_unlock($1);
-SQL
+end_in_gate() {  # $1 gate, $2 the verify that waits at it (its session ends there)
+    hold_until_ended "$1" | "$PG/psql" "${P[@]}" >/dev/null &
     local g=$!
     for _ in $(seq 1 100); do
         [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND granted")" -gt 0 ] && break
@@ -298,7 +300,7 @@ h1=$("$PG/psql" "${P[@]}" -c "SELECT verdict || ' | ' || halted FROM phasevec.tr
 echo "halt after a rollback and a refusal: key 1 is: $h1"
 [ "$h1" = "refuted | true" ] && echo "ok - a halt outlives a rollback and a verifier that may not act as its author" || { echo "not ok - a halt was erased, and its claim ran again"; fallas=1; }
 # the author asserts it again: a new mark, and that role's open transaction while the author asserts again
-"$PG/psql" "${P[@]}" -c "SELECT phasevec.assert('halts', '1', 'public.gate(97)')" >/dev/null
+"$PG/psql" "${P[@]}" -c "SET ROLE pv_race_end" -c "SELECT phasevec.assert('halts', '1', 'public.gate(97)')" >/dev/null
 end_in_gate 97 "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000)"
 "$PG/psql" "${M[@]}" -c "BEGIN" -c "SELECT phasevec.verify_one('halts', 'nokey')" -c "SELECT pg_sleep(4)" -c "COMMIT" >/dev/null 2>&1 &
 mal=$!
@@ -357,6 +359,8 @@ DROP ROLE pv_race_admin;
 DROP ROLE pv_race_low;
 DROP OWNED BY pv_race_mal;
 DROP ROLE pv_race_mal;
+DROP OWNED BY pv_race_end;
+DROP ROLE pv_race_end;
 SQL
 "$PG/dropdb" -h "$SOCK" -p "$PORT" pv_race
 exit $fallas

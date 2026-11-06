@@ -52,7 +52,7 @@ SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval '0') O
 SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
 SELECT count(*) AS judged FROM phasevec.truth WHERE verdict <> $v$unproven$v$;
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
--- in a transaction that made one and dropped it, the same
+-- in a transaction that made one and dropped it: refused, it has written (ninth review)
 BEGIN;
 CREATE TEMP TABLE pv_tl_scratch (x int);
 SELECT count(*) FROM phasevec.verify($w$notes$w$, p_every => interval '0');

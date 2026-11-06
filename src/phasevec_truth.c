@@ -26,10 +26,12 @@
  *   row version). The text must be the one asserted, and the version must not move while the proof runs.
  * - The clock bounds the verdict. A proof cannot run another proof. A query_canceled that a proof raises itself is
  *   that proof's error; a real cancel is thrown again.
- * - A proof that ends the session it runs in (a FATAL, a terminated backend) is that claim's failure, not the
- *   watch's: its verifier records the claim refuted and halted, does not run it again until it is asserted again,
- *   and goes on with the next claim. (Until the eighth review that session was the verifier's: the claim was marked
- *   in shared memory, and the next verify() recorded it.)
+ * - A proof that ends the session it runs in (a FATAL) is that claim's failure, not the watch's: the claim is recorded
+ *   refuted and halted, is not run again until it is asserted again, and the call goes on with the next claim. (Until
+ *   the eighth review that session was the verifier's: the claim was marked in shared memory, and the next verify()
+ *   recorded it.) A session another process ends (ninth review) was interrupted: nothing is judged, the claim stays due.
+ * - (ninth review) A verdict is committed by the session that judged it, before its answer: the verifier writes
+ *   nothing, and a transaction that has written may not verify. The verifier never waits without its deadlines.
  * - The watch trigger is C: it renders the row it fires for, so no caller can note a text that is not the row's.
  * - Every surface that shows verdicts (recall, disputes, replacement, truth_coverage, brief) is a C door that knows
  *   its caller: it shows a watch only to a role that may SELECT its table, and with row-level security it computes
@@ -40,11 +42,13 @@
 #include "postgres.h"
 
 #include <dlfcn.h>
+#include <signal.h>
 #include <string.h>
 
 #include "access/htup_details.h"
 #include "access/tupconvert.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/partition.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
@@ -105,12 +109,14 @@ PG_FUNCTION_INFO_V1(phasevec_adopt);
 
 static TimeoutId prove_timeout = MAX_TIMEOUTS;
 static volatile sig_atomic_t prove_fired = false;
+static volatile sig_atomic_t prove_fired_waiting = false;	/* our timer fired while the proof waited for a lock */
 static bool prove_in_progress = false;
 
 static void
 prove_timeout_handler(void)
 {
 	prove_fired = true;
+	prove_fired_waiting = MyProc != NULL && MyProc->waitLock != NULL;
 	InterruptPending = true;
 	QueryCancelPending = true;
 	SetLatch(MyLatch);
@@ -660,10 +666,11 @@ typedef enum Outcome
 	OUT_MOVED,					/* the row changed while the proof ran: nothing recorded */
 	OUT_NOT_JUDGED,				/* no session of its own could judge it (no background worker free): nothing
 								 * recorded, it stays due */
-	OUT_HALTED					/* the proof's own session ended while it ran: refuted, and not run again */
+	OUT_HALTED,					/* the proof ended its own session while it ran: refuted, and not run again */
+	OUT_INTERRUPTED				/* another process ended the proof's session while it ran: nothing judged, due */
 } Outcome;
 
-static const char *const outcome_name[] = {"verified", "refuted", "unproven", "stale", NULL, NULL, NULL};
+static const char *const outcome_name[] = {"verified", "refuted", "unproven", "stale", NULL, NULL, NULL, NULL};
 
 typedef struct Judgment
 {
@@ -724,6 +731,13 @@ require_clock(int timeout_ms)
 }
 
 /*
+ * (ninth review) A proof that waits for a lock another session holds, when its clock ends: until then refuted for its
+ * time, so a session that held a table the proof reads (or a DDL queued before it) refuted true claims.
+ */
+#define LOCK_WAIT_ERR \
+	"not judged: the proof was still waiting for a lock another session holds when its clock of %d ms ended"
+
+/*
  * Judge one proof, in a subtransaction always rolled back, under its own clock and cost cap. The proof runs in the
  * guard as as_role (its author; for the SQL of 0.14.2 to 0.19.0, the caller) with the author's settings. With a
  * target, the row is read before and after the proof, in the guard as the table's owner: its text must be the one
@@ -755,6 +769,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 	appendStringInfo(&sql, "SELECT (%s)::boolean", proof);
 
 	prove_fired = false;
+	prove_fired_waiting = false;
 	prove_in_progress = true;
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcontext);
@@ -856,7 +871,12 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		 * The clock bounds the verdict: past it (a proof that swallowed our cancel, or one that ended as the timer
 		 * fired) the answer does not count.
 		 */
-		if ((out == OUT_VERIFIED || out == OUT_REFUTED) && timeout_ms > 0 &&
+		if ((out == OUT_VERIFIED || out == OUT_REFUTED) && timeout_ms > 0 && prove_fired && prove_fired_waiting)
+		{
+			out = OUT_UNPROVEN;
+			err = MemoryContextStrdup(oldcontext, psprintf(LOCK_WAIT_ERR, timeout_ms));
+		}
+		else if ((out == OUT_VERIFIED || out == OUT_REFUTED) && timeout_ms > 0 &&
 			(prove_fired || TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms)))
 		{
 			out = OUT_REFUTED;
@@ -877,6 +897,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 	{
 		ErrorData  *edata;
 		bool		ours = prove_fired;
+		bool		waiting = prove_fired && prove_fired_waiting;
 		bool		late = timeout_ms > 0 && started != 0 &&
 			TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms);
 
@@ -899,7 +920,16 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 			QueryCancelPending = false;
 		/* an error reading the row judged nothing; one in the proof refutes it; one reading it again records nothing */
 		out = phase == 0 ? OUT_UNPROVEN : phase == 1 ? OUT_REFUTED : OUT_MOVED;
-		if ((ours || late) && phase != 0)
+		if (phase != 0 && (waiting ||
+						   (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE && from_interrupts(edata))))
+		{
+			/* (ninth review) a lock another session holds: not the proof's answer, and no verdict */
+			out = OUT_UNPROVEN;
+			err = waiting ? psprintf(LOCK_WAIT_ERR, timeout_ms) :
+				psprintf("not judged: the proof waited for a lock longer than its author's lock_timeout (%s)",
+						 edata->message);
+		}
+		else if ((ours || late) && phase != 0)
 		{
 			out = OUT_REFUTED;
 			err = psprintf("the proof took longer than %d ms", timeout_ms);
@@ -953,49 +983,84 @@ phasevec_prove(PG_FUNCTION_ARGS)
  * give every new session of the author, its session_preload_libraries), with what its author's session had changed
  * on top (the claim's recorded settings, GUARD_AUTHOR). It reads only what is committed, each claim in a transaction
  * of its own at READ COMMITTED; it has no temporary object, no cursor, no prepared statement, nothing of the caller's.
- * The verifier only chooses the claims, takes them, sends each one to the worker (shm_mq) and records what comes back.
+ *
+ * (ninth review) A verdict is a statement about a committed state that does not depend on its verifier's transaction:
+ *
+ * - The worker takes the claim's row, judges it and records the verdict in its own transaction, and commits it before
+ *   it answers. Until the ninth review the verifier took and recorded the claims in its own transaction, and a verifier
+ *   with an uncommitted write that refuted a claim committed, together with that write, a 'verified' the proof had
+ *   reached on the state before it: no committed state ever made it true. The verifier writes nothing now (its
+ *   transaction gets no transaction id from verify()), a ROLLBACK of it keeps the verdicts its proofs reached, and a
+ *   transaction that has written (or holds DDL, or LOCK TABLE ... ACCESS EXCLUSIVE: they assign a transaction id) may
+ *   not verify (require_no_writes): what it wrote would be judged as if absent.
+ * - The verifier never blocks without its deadlines. A claim is sent without waiting (shm_mq_send nowait), in the
+ *   loop that keeps the proof's clock and 5 s more, the start of a worker, p_budget and the lock checks; a claim larger
+ *   than the queue goes in pieces, in the same loop. Until the ninth review a claim over 64 kB blocked the verifier
+ *   inside shm_mq_send: behind a proof that catches query_canceled, or a worker waiting for a lock the verifier held,
+ *   nothing ended it.
+ * - A lock: a proof that waits for one the verifier holds, directly or through other sessions (an ALTER TABLE queued
+ *   behind the verifier's read, which the proof queues behind in turn), would wait as long as the verifier waits for
+ *   it: the verifier walks the waits (pg_blocking_pids, transitively) and stops with an error. Until the ninth review
+ *   it saw only a direct wait: the proof waited for its clock, was recorded refuted, and the ALTER and every reader of
+ *   the table waited n times the clock. A proof that waits for a lock of another session past its clock (or past its
+ *   author's lock_timeout) is 'unproven', with the reason: a lock wait is not the proof's answer.
+ * - A session that ends while its proof runs is the proof's failure only when the proof ended it. The worker records
+ *   who sent it SIGTERM (the kernel's si_pid: a sender cannot choose it). Ended by its own process (a FATAL the proof
+ *   raised, its author's transaction_timeout) the claim is refuted and halted (phasevec._truth_halted) as before. Ended
+ *   by another process (a role with pg_signal_backend, the author, the verifier from another session, a shutdown) it
+ *   was interrupted: nothing is judged, the verdict stays, and the claim stays due, behind those judged since
+ *   (phasevec._truth_interrupted). Until the ninth review any ended session halted the claim: a role that may
+ *   terminate a backend made a true claim refuted for good. A signaller can keep a claim from being judged, never
+ *   decide its verdict.
  *
  * - One worker for a verify() call and an author, for as many of its claims as it may judge: a placeholder made in it
  *   stays (a proof's set_config, a recorded state that names one, a recipe that sets one), and a claim whose author
  *   did not have it is not judged there: that worker ends and the claim goes to a new one (guard_env_spent). The
  *   claims of one author are sent in the order that needs the fewest: those that name fewer placeholders first.
- * - A proof that ends its session (a FATAL, a backend terminated) ends the worker, not the verifier: the claim is
- *   recorded refuted and halted (phasevec._truth_halted) by the verifier, which goes on with the next claim.
- * - The clock: the worker runs each proof under its own timer, as before; the verifier waits for the answer no
- *   longer than that and PROOF_GRACE_MS more, then ends the worker and records the claim refuted for its time. A
- *   proof that waits for a lock the verifier's own transaction holds would wait forever: the verifier sees it
- *   (pg_blocking_pids) and stops with an error. A verifier that is canceled or ends ends its worker.
+ * - What a verifier records without a proof (an author gone, or kept from the table; a halted, interrupted or late
+ *   claim) is recorded by a worker too, in its own transaction: the current one, or a session of the owner.
  * - No worker free (max_worker_processes): the claim is not judged, nothing is recorded, it stays due, and the row
  *   verify() returns for it says so.
  */
 #define PROOF_MAGIC		0x50565046
-#define PROOF_PROTOCOL	1
+#define PROOF_PROTOCOL	2
 #define PROOF_QUEUE		(64 * 1024)
 #define PROOF_GRACE_MS	5000
-#define PROOF_AHEAD		8		/* claims sent ahead of their answers, and no more than PROOF_QUEUE / 2 bytes */
+#define PROOF_AHEAD		8		/* claims queued ahead of their answers, and no more than PROOF_QUEUE / 2 bytes */
 #define PROOF_ERR_MAX	4000	/* an answer's error text: PROOF_AHEAD of them fit in PROOF_QUEUE */
+#define PROOF_LOOK_MS	200		/* how often the verifier walks the lock waits */
+#define PROOF_WAITS_MAX 64		/* sessions it walks through at most */
 
 typedef struct ProofShared
 {
 	uint32		magic;
 	uint32		protocol;
 	Oid			db;
-	Oid			author;
-	Oid			owner;			/* the extension's owner: reads phasevec's own tables */
+	Oid			author;			/* the role this session is of */
+	Oid			owner;			/* the extension's owner: reads and writes phasevec's own tables */
 	int32		watch;
 	pg_atomic_uint32 judging;	/* 1 while the worker judges a claim */
 	TimestampTz started;		/* when it began to (written before judging is set) */
+	volatile int32 pid;			/* the worker's process */
+	volatile int32 signaller;	/* the process that sent it SIGTERM first: 0 none, -1 unknown */
 } ProofShared;
 
 #define PROOF_REQ_OFF	MAXALIGN(sizeof(ProofShared))
 #define PROOF_ANS_OFF	(PROOF_REQ_OFF + PROOF_QUEUE)
 #define PROOF_SIZE		(PROOF_ANS_OFF + PROOF_QUEUE)
 
+typedef enum ProofKind
+{
+	MSG_JUDGE = 1,				/* take the claim (verify()), judge it, record the verdict */
+	MSG_RECORD = 2				/* take the claim (verify()), record what the verifier found (no proof runs) */
+} ProofKind;
+
 typedef enum ProofAnswer
 {
-	ANSWER_JUDGED,
+	ANSWER_DONE,				/* judged and recorded, or recorded */
+	ANSWER_SKIPPED,				/* not taken: another verify() holds it, or it is not due any more */
 	ANSWER_SPENT,				/* this session may not judge it: a new one will */
-	ANSWER_FAILED				/* an error outside the proof: nothing judged */
+	ANSWER_FAILED				/* an error outside the proof: nothing judged, nothing recorded */
 } ProofAnswer;
 
 typedef struct ProofSession
@@ -1007,15 +1072,6 @@ typedef struct ProofSession
 	shm_mq_handle *req;
 	shm_mq_handle *ans;
 } ProofSession;
-
-typedef enum ProofStatus
-{
-	PS_JUDGED,					/* *j is the judgment */
-	PS_SPENT,					/* to a new session */
-	PS_ENDED,					/* the proof ended its session: halted */
-	PS_LATE,					/* no answer in time: the session was ended, refuted for its time */
-	PS_FAILED					/* nothing judged: j->err says why */
-} ProofStatus;
 
 typedef struct Msg
 {
@@ -1074,8 +1130,275 @@ get_bytes(Msg *m, int64 *len)
 	return s;
 }
 
+static bytea *
+get_bytea(Msg *m)
+{
+	int64		n;
+	char	   *s = get_bytes(m, &n);
+	bytea	   *v;
+
+	if (s == NULL)
+		return NULL;
+	v = palloc(VARHDRSZ + n);
+	SET_VARSIZE(v, VARHDRSZ + n);
+	memcpy(VARDATA(v), s, n);
+	return v;
+}
+
+/* ------------------------------------------------------------------------------------------- the claims -- */
+
+#define CLAIM_COLUMNS "key, proof, author, author_known, asserted_for, env, bind"
+
 static void
-answer(shm_mq_handle *ans, ProofAnswer what, const Judgment *j, const char *err)
+claim_from(HeapTuple tup, TupleDesc td, Claim *c, MemoryContext keep)
+{
+	bool		isnull;
+	Datum		d;
+	MemoryContext o = MemoryContextSwitchTo(keep);
+
+	memset(c, 0, sizeof(Claim));
+	c->key = TextDatumGetCString(SPI_getbinval(tup, td, 1, &isnull));
+	d = SPI_getbinval(tup, td, 2, &isnull);
+	c->proof = isnull ? NULL : TextDatumGetCString(d);
+	d = SPI_getbinval(tup, td, 3, &isnull);
+	c->author = isnull ? InvalidOid : DatumGetObjectId(d);
+	d = SPI_getbinval(tup, td, 4, &isnull);
+	c->author_known = !isnull && DatumGetBool(d);
+	d = SPI_getbinval(tup, td, 5, &isnull);
+	c->asserted_for = isnull ? NULL : DatumGetByteaPCopy(d);
+	d = SPI_getbinval(tup, td, 6, &isnull);
+	c->env = guard_env_from(isnull ? NULL : DatumGetArrayTypeP(d));
+	d = SPI_getbinval(tup, td, 7, &isnull);
+	c->bind = isnull ? NULL : DatumGetByteaPCopy(d);
+	MemoryContextSwitchTo(o);
+}
+
+/*
+ * A claim as the worker gets it: what to do with it, how, and (MSG_RECORD) what to record. `every` (verify()): the
+ * claim is taken by the rule of phasevec._truth_due; NULL (verify_one()): it is not taken.
+ */
+static void
+claim_message(StringInfo b, ProofKind kind, const Claim *c, const Interval *every, Oid verifier, bool rls,
+			  int timeout_ms, double max_cost, const Judgment *rec)
+{
+	int64		bits;
+
+	initStringInfo(b);
+	put_int(b, kind);
+	put_bytes(b, (const char *) every, sizeof(Interval));
+	put_int(b, verifier);
+	put_int(b, timeout_ms);
+	memcpy(&bits, &max_cost, sizeof(bits));
+	put_int(b, bits);
+	put_int(b, rls ? 1 : 0);
+	put_str(b, c->key);
+	put_str(b, c->proof);
+	put_bytes(b, c->asserted_for ? VARDATA_ANY(c->asserted_for) : NULL,
+			  c->asserted_for ? VARSIZE_ANY_EXHDR(c->asserted_for) : 0);
+	put_bytes(b, c->bind ? VARDATA_ANY(c->bind) : NULL, c->bind ? VARSIZE_ANY_EXHDR(c->bind) : 0);
+	put_int(b, c->env ? c->env->n : 0);
+	for (int i = 0; c->env && i < c->env->n; i++)
+	{
+		put_str(b, c->env->name[i]);
+		put_str(b, c->env->value[i]);
+	}
+	put_int(b, rec ? rec->out : OUT_NOT_JUDGED);
+	put_int(b, rec ? rec->at : 0);
+	put_str(b, rec ? rec->err : NULL);
+}
+
+#define RECORD_SQL "SELECT phasevec._truth_set($1, $2, $3, $4, $5, $6)"
+
+/* Record a judgment through phasevec._truth_set, as the owner; the verdict as it reads now. */
+static char *
+record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
+{
+	Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
+	Datum		av[6];
+	char		nulls[7] = "      ";
+	const char *name = outcome_name[j->out];
+	MemoryContext keep = CurrentMemoryContext;
+	char	   *v = NULL;
+	Who			was;
+
+	av[0] = Int32GetDatum(t->watch);
+	av[1] = CStringGetTextDatum(c->key);
+	av[2] = name ? CStringGetTextDatum(name) : (Datum) 0;
+	nulls[2] = name ? ' ' : 'n';
+	av[3] = j->err ? CStringGetTextDatum(j->err) : (Datum) 0;
+	nulls[3] = j->err ? ' ' : 'n';
+	av[4] = c->bind ? PointerGetDatum(c->bind) : (Datum) 0;
+	nulls[4] = c->bind ? ' ' : 'n';
+	av[5] = TimestampTzGetDatum(j->at);
+	nulls[5] = j->at != 0 ? ' ' : 'n';
+
+	become(owner, &was);
+	spi_connect();
+	if ((t->record_plan ? SPI_execute_plan(t->record_plan, av, nulls, false, 1)
+		 : SPI_execute_with_args(RECORD_SQL, 6, at, av, nulls, false, 1)) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: the verdict was not recorded");
+	if (SPI_processed == 1)
+	{
+		char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+		if (s)
+			v = MemoryContextStrdup(keep, s);
+	}
+	SPI_finish();
+	unbecome(&was);
+	return v;
+}
+
+/* A claim whose proof ended the session that ran it: refuted and halted (phasevec._truth_halted), as the owner. */
+static bytea *
+bytes32(const uint8 *b)
+{
+	bytea	   *v = (bytea *) palloc(VARHDRSZ + HASH_LEN);
+
+	SET_VARSIZE(v, VARHDRSZ + HASH_LEN);
+	memcpy(VARDATA(v), b, HASH_LEN);
+	return v;
+}
+
+#define VERDICT_SQL \
+	"SELECT phasevec._verdict(t) FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 " \
+	"AND t.key OPERATOR(pg_catalog.=) $2"
+
+/* The verdict of a key as it reads now (after this transaction's own writes). SPI connected, as the owner. */
+static char *
+verdict_now(const Target *t, const char *key, MemoryContext keep)
+{
+	Oid			at[2] = {INT4OID, TEXTOID};
+	Datum		av[2] = {Int32GetDatum(t->watch), CStringGetTextDatum(key)};
+
+	if (SPI_execute_with_args(VERDICT_SQL, 2, at, av, NULL, false, 1) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: the verdict could not be read");
+	if (SPI_processed == 1)
+	{
+		char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+		if (s)
+			return MemoryContextStrdup(keep, s);
+	}
+	return NULL;
+}
+
+static char *
+record_halted(Oid owner, Oid verifier, const Target *t, const Claim *c, const Judgment *j)
+{
+	MemoryContext keep = CurrentMemoryContext;
+	uint8		kh[HASH_LEN];
+	char	   *v = NULL;
+	Who			was;
+
+	if (c->bind == NULL || VARSIZE_ANY_EXHDR(c->bind) != HASH_LEN)
+	{
+		Judgment	r = *j;
+
+		r.out = OUT_REFUTED;
+		return record(owner, t, c, &r);
+	}
+	key_hash(c->key, kh);
+	become(owner, &was);
+	spi_connect();
+	{
+		Oid			at[5] = {INT4OID, BYTEAOID, BYTEAOID, OIDOID, TIMESTAMPTZOID};
+		Datum		av[5] = {Int32GetDatum(t->watch), PointerGetDatum(bytes32(kh)), PointerGetDatum(c->bind),
+		ObjectIdGetDatum(verifier), TimestampTzGetDatum(j->at)};
+
+		if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3, $4, $5)", 5, at, av, NULL, false, 1)
+			!= SPI_OK_SELECT)
+			elog(ERROR, "phasevec: a halted proof could not be recorded");
+	}
+	v = verdict_now(t, c->key, keep);
+	SPI_finish();
+	unbecome(&was);
+	return v;
+}
+
+/* A claim whose proof's session another process ended: nothing judged, it stays due (phasevec._truth_interrupted). */
+static char *
+record_interrupted(Oid owner, const Target *t, const Claim *c, const Judgment *j)
+{
+	MemoryContext keep = CurrentMemoryContext;
+	char	   *v = NULL;
+	Who			was;
+	Oid			at[4] = {INT4OID, TEXTOID, BYTEAOID, TEXTOID};
+	Datum		av[4] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), PointerGetDatum(c->bind),
+	j->err ? CStringGetTextDatum(j->err) : (Datum) 0};
+	char		nulls[5] = "    ";
+
+	nulls[2] = c->bind ? ' ' : 'n';
+	nulls[3] = j->err ? ' ' : 'n';
+	become(owner, &was);
+	spi_connect();
+	if (SPI_execute_with_args("SELECT phasevec._truth_interrupted($1, $2, $3, $4)", 4, at, av, nulls, false, 1)
+		!= SPI_OK_SELECT)
+		elog(ERROR, "phasevec: an interrupted proof could not be recorded");
+	if (SPI_processed == 1)
+	{
+		char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+		if (s)
+			v = MemoryContextStrdup(keep, s);
+	}
+	SPI_finish();
+	unbecome(&was);
+	return v;
+}
+
+/* Record what was found: nothing for a claim not judged (the verdict as it reads now is returned). In a worker. */
+static char *
+record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const Judgment *j)
+{
+	if (j->out == OUT_HALTED)
+		return record_halted(owner, verifier, t, c, j);
+	if (j->out == OUT_INTERRUPTED)
+		return record_interrupted(owner, t, c, j);
+	return record(owner, t, c, j);
+}
+
+/*
+ * Take the claim's row before judging it, or leave it: another verify() (or an assert()) holds it. It must still be
+ * due, by the rule of phasevec._truth_due (a stale claim once for each text it reads; one whose verdict and last
+ * look are both older than p_every is due either way, and the row's text is not read for it). Without this, two
+ * verify() calls of one watch locked the rows of their due lists in different orders when the table took writes
+ * (in the fifth cut the watch trigger wrote verdict rows too) and deadlocked: 54-70% of the calls failed, and an
+ * aborted call lost every verdict it had reached. With it no verify() waits on a verdict row, so none deadlocks on
+ * one, and none judges a claim another is judging, or judged since its due list was read (it is no longer due).
+ * Since the ninth review the worker takes it, in the transaction that judges and records it.
+ */
+#define LOCK_OLD(c) "t." c " IS NULL OR t." c " OPERATOR(pg_catalog.<) (pg_catalog.now() OPERATOR(pg_catalog.-) $3)"
+#define CLAIM_LOCK_SQL \
+	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
+	"AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
+	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
+	"AND t.asserted_for IS DISTINCT FROM h THEN " LOCK_OLD("looked_at") " OR t.looked_for IS DISTINCT FROM h " \
+	"ELSE " LOCK_OLD("verified_at") " END " \
+	"FROM (SELECT (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch OPERATOR(pg_catalog.=) t.watch " \
+	"AND s.key OPERATOR(pg_catalog.=) t.key) AS h) s)) FOR NO KEY UPDATE SKIP LOCKED"
+
+static bool
+claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every)
+{
+	Datum		av[3] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), IntervalPGetDatum(every)};
+	bool		taken;
+	Who			was;
+
+	become(owner, &was);
+	spi_connect();
+	if (SPI_execute_plan(plan, av, NULL, false, 1) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: a claim could not be taken");
+	taken = SPI_processed == 1;
+	SPI_finish();
+	unbecome(&was);
+	return taken;
+}
+
+/* ----------------------------------------------------------------------------------------- the worker -- */
+
+static void
+answer(shm_mq_handle *ans, ProofAnswer what, const Judgment *j, const char *err, const char *verdict)
 {
 	StringInfoData b;
 
@@ -1089,16 +1412,65 @@ answer(shm_mq_handle *ans, ProofAnswer what, const Judgment *j, const char *err)
 		/* an answer stays small: several may wait in the queue for a verifier that is sending */
 		put_bytes(&b, e, e ? pg_mbcliplen(e, strlen(e), PROOF_ERR_MAX) : 0);
 	}
+	put_str(&b, verdict);
 	(void) shm_mq_send(ans, b.len, b.data, false, true);
 	pfree(b.data);
 }
 
 PGDLLEXPORT void phasevec_proof_main(Datum arg);
 
+static ProofShared *volatile proof_self = NULL;
+
 /*
- * The proof's own session: a background worker, a new session of the claim's author. Claims come in one at a time;
- * each is judged in a transaction of its own and its judgment goes back. It ends when its verifier detaches, when a
- * claim is not one it may judge (a placeholder its author did not have), or on an error outside a proof.
+ * SIGTERM in a proof's session: who sent it is kept, then PostgreSQL's own handler (die) runs. The kernel fills
+ * si_pid: a process that terminates the worker cannot pass for the worker itself.
+ */
+/* The segment goes away as the worker exits: a SIGTERM that comes then has nowhere to note its sender. */
+static void
+proof_forget(dsm_segment *seg, Datum arg)
+{
+	proof_self = NULL;
+}
+
+static void
+proof_signaller(int32 pid)
+{
+	ProofShared *sh = proof_self;
+
+	if (sh != NULL && sh->signaller == 0)
+		sh->signaller = pid > 0 ? pid : -1;
+}
+
+#if PG_VERSION_NUM >= 190000
+/* PostgreSQL 19 passes the sender to every handler (pg_signal_info) */
+static void
+proof_sigterm(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	proof_signaller(pg_siginfo != NULL ? (int32) pg_siginfo->pid : 0);
+	errno = save_errno;
+	die(postgres_signal_arg, pg_siginfo);
+}
+#else
+static void
+proof_sigterm(int signo, siginfo_t *info, void *context)
+{
+	int			save_errno = errno;
+
+	proof_signaller(info != NULL ? (int32) info->si_pid : 0);
+	errno = save_errno;
+	die(signo);
+}
+#endif
+
+static SPIPlanPtr worker_lock_plan = NULL;
+
+/*
+ * The proof's own session: a background worker, a new session of the claim's author (or of the owner, to record
+ * what needs no proof). Claims come in one at a time; each is taken, judged and recorded in a transaction of its own,
+ * committed before its answer goes back. It ends when its verifier detaches, when a claim is not one it may judge (a
+ * placeholder its author did not have), or on an error outside a proof.
  */
 void
 phasevec_proof_main(Datum arg)
@@ -1114,8 +1486,19 @@ phasevec_proof_main(Datum arg)
 	MemoryContext per;
 	Who			was;
 
-	pqsignal(SIGTERM, die);
-	BackgroundWorkerUnblockSignals();
+#if PG_VERSION_NUM >= 190000
+	pqsignal(SIGTERM, proof_sigterm);
+#else
+	{
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_sigaction = proof_sigterm;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = SA_SIGINFO | SA_RESTART;
+		sigaction(SIGTERM, &sa, NULL);
+	}
+#endif
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_phasevec proof");
 	seg = dsm_attach(DatumGetUInt32(arg));
 	if (seg == NULL)
@@ -1127,6 +1510,11 @@ phasevec_proof_main(Datum arg)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("phasevec: a proof's session was started by another build of pg_phasevec")));
+	sh->pid = MyProcPid;
+	pg_write_barrier();
+	on_dsm_detach(seg, proof_forget, (Datum) 0);
+	proof_self = sh;
+	BackgroundWorkerUnblockSignals();
 	mq = (shm_mq *) ((char *) sh + PROOF_REQ_OFF);
 	shm_mq_set_receiver(mq, MyProc);
 	req = shm_mq_attach(mq, seg, NULL);
@@ -1138,6 +1526,11 @@ phasevec_proof_main(Datum arg)
 	BackgroundWorkerInitializeConnectionByOid(sh->db, sh->author, BGWORKER_BYPASS_ROLELOGINCHECK);
 	process_session_preload_libraries();
 	guard_proof_session();
+	/*
+	 * A verdict is committed by this session, one claim at a time: without waiting for its WAL to reach disk (a
+	 * verdict lost to a crash leaves its claim due, and the next verify() judges it again).
+	 */
+	SetConfigOption("synchronous_commit", "off", PGC_SUSET, PGC_S_OVERRIDE);
 	/* the placeholders every new session of the author has: from its configuration */
 	base = guard_placeholders(&nbase);
 
@@ -1148,6 +1541,13 @@ phasevec_proof_main(Datum arg)
 	spi_connect();
 	load_target(Int32GetDatum(sh->watch), true, &target, TopMemoryContext);
 	prepare_read(&target);
+	{
+		Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
+		Oid			lt[3] = {INT4OID, TEXTOID, INTERVALOID};
+
+		(void) kept_plan(&target.record_plan, RECORD_SQL, 6, at);
+		(void) kept_plan(&worker_lock_plan, CLAIM_LOCK_SQL, 3, lt);
+	}
 	SPI_finish();
 	unbecome(&was);
 	PopActiveSnapshot();
@@ -1160,18 +1560,18 @@ phasevec_proof_main(Datum arg)
 		Size		n;
 		void	   *data;
 		Msg			m;
+		ProofKind	kind;
+		Interval   *every;
+		Oid			verifier;
 		int			timeout_ms;
 		double		max_cost;
 		int64		bits;
 		bool		rls;
-		char	   *key;
-		char	   *proof;
-		bytea	   *asserted_for = NULL;
-		char	   *af;
-		int64		aflen;
-		GuardEnv   *env;
+		Claim		c;
 		const char *spent;
 		Judgment	j;
+		ProofAnswer what = ANSWER_DONE;
+		char	   *v = NULL;
 
 		MemoryContextReset(per);
 		MemoryContextSwitchTo(per);
@@ -1179,80 +1579,94 @@ phasevec_proof_main(Datum arg)
 			break;				/* the verifier is done, or gone */
 		m.p = data;
 		m.end = (const char *) data + n;
+		memset(&c, 0, sizeof(c));
+		kind = (ProofKind) get_int(&m);
+		every = (Interval *) get_bytes(&m, NULL);
+		verifier = (Oid) get_int(&m);
 		timeout_ms = (int) get_int(&m);
 		bits = get_int(&m);
 		memcpy(&max_cost, &bits, sizeof(max_cost));
 		rls = get_int(&m) != 0;
-		key = get_bytes(&m, NULL);
-		proof = get_bytes(&m, NULL);
-		af = get_bytes(&m, &aflen);
-		if (af)
+		c.key = get_bytes(&m, NULL);
+		c.proof = get_bytes(&m, NULL);
+		c.asserted_for = get_bytea(&m);
+		c.bind = get_bytea(&m);
+		c.env = palloc0(sizeof(GuardEnv));
+		c.env->n = (int) get_int(&m);
+		c.env->name = palloc(sizeof(char *) * Max(c.env->n, 1));
+		c.env->value = palloc(sizeof(char *) * Max(c.env->n, 1));
+		for (int i = 0; i < c.env->n; i++)
 		{
-			asserted_for = palloc(VARHDRSZ + aflen);
-			SET_VARSIZE(asserted_for, VARHDRSZ + aflen);
-			memcpy(VARDATA(asserted_for), af, aflen);
+			c.env->name[i] = get_bytes(&m, NULL);
+			c.env->value[i] = get_bytes(&m, NULL);
 		}
-		env = palloc0(sizeof(GuardEnv));
-		env->n = (int) get_int(&m);
-		env->name = palloc(sizeof(char *) * Max(env->n, 1));
-		env->value = palloc(sizeof(char *) * Max(env->n, 1));
-		for (int i = 0; i < env->n; i++)
-		{
-			env->name[i] = get_bytes(&m, NULL);
-			env->value[i] = get_bytes(&m, NULL);
-		}
-		if (key == NULL || proof == NULL)
+		j.out = (Outcome) get_int(&m);
+		j.at = (TimestampTz) get_int(&m);
+		j.err = get_bytes(&m, NULL);
+		if (c.key == NULL || (kind == MSG_JUDGE && c.proof == NULL) || (kind != MSG_JUDGE && kind != MSG_RECORD))
 			elog(ERROR, "phasevec: a malformed message between a verifier and a proof's session");
 
 		/* a placeholder this session made for an earlier claim, which this claim's author did not have */
-		spent = guard_env_spent(base, nbase, env);
-		if (spent != NULL)
+		if (kind == MSG_JUDGE && (spent = guard_env_spent(base, nbase, c.env)) != NULL)
 		{
-			answer(ans, ANSWER_SPENT, NULL, spent);
+			answer(ans, ANSWER_SPENT, NULL, spent, NULL);
 			break;
 		}
 
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
-		/* each statement of the proof in a new snapshot, whatever default_transaction_isolation says */
+		/* each statement in a new snapshot, whatever default_transaction_isolation says; it records, so read-write */
 		XactIsoLevel = XACT_READ_COMMITTED;
+		XactReadOnly = RecoveryInProgress();
 		PushActiveSnapshot(GetTransactionSnapshot());
 		MemoryContextSwitchTo(per);
 		pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
-		sh->started = GetCurrentTimestamp();
-		pg_write_barrier();
-		pg_atomic_write_u32(&sh->judging, 1);
 		PG_TRY();
 		{
-			judge(proof, timeout_ms, max_cost, sh->author, GUARD_AUTHOR, env, &target, rls, key, asserted_for, &j);
+			if (every != NULL && !claim_taken(sh->owner, worker_lock_plan, &target, &c, every))
+				what = ANSWER_SKIPPED;
+			else
+			{
+				if (kind == MSG_JUDGE)
+				{
+					sh->started = GetCurrentTimestamp();
+					pg_write_barrier();
+					pg_atomic_write_u32(&sh->judging, 1);
+					judge(c.proof, timeout_ms, max_cost, sh->author, GUARD_AUTHOR, c.env, &target, rls, c.key,
+						  c.asserted_for, &j);
+					pg_atomic_write_u32(&sh->judging, 0);
+				}
+				v = record_judgment(sh->owner, verifier, &target, &c, &j);
+			}
 		}
 		PG_CATCH();
 		{
 			ErrorData  *e;
 
+			pg_atomic_write_u32(&sh->judging, 0);
 			MemoryContextSwitchTo(per);
 			e = CopyErrorData();
 			FlushErrorState();
 			AbortCurrentTransaction();
-			pg_atomic_write_u32(&sh->judging, 0);
 			MemoryContextSwitchTo(per);
-			answer(ans, ANSWER_FAILED, NULL, e->message);
+			answer(ans, ANSWER_FAILED, NULL, e->message, NULL);
 			proc_exit(0);
 		}
 		PG_END_TRY();
-		pg_atomic_write_u32(&sh->judging, 0);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		pgstat_report_activity(STATE_IDLE, NULL);
 		MemoryContextSwitchTo(per);
-		answer(ans, ANSWER_JUDGED, &j, NULL);
+		answer(ans, what, &j, NULL, v);
 	}
 	proc_exit(0);
 }
 
+/* ------------------------------------------------------------------------------------- the verifier's side -- */
+
 /*
- * The verifier's side: the worker of the verify() call running now (one at a time), in TopMemoryContext. One whose
- * verifier ends (an error, a cancel, the session's end) is ended with it.
+ * The worker of the verify() call running now (one at a time), in TopMemoryContext. One whose verifier ends (an
+ * error, a cancel, the session's end) is ended with it.
  */
 static ProofSession *proof_cur = NULL;
 
@@ -1347,14 +1761,31 @@ proof_start(Oid owner, int32 watch, Oid author, char **why)
 	return ps;
 }
 
-/* Done with a worker: detached (it ends by itself), or ended now (it may be inside a proof). */
+/*
+ * Done with a worker: detached (it ends by itself), or ended now (it may be inside a proof, or gone already). An
+ * ended one is waited for (`wait`: not on the way out of an error), up to PROOF_GRACE_MS, so that the claim's row it
+ * took and its slot of max_worker_processes are free again for the session that records it.
+ */
 static void
-proof_stop(ProofSession *ps, bool end_it)
+proof_stop(ProofSession *ps, bool end_it, bool wait)
 {
 	if (ps == NULL)
 		return;
 	if (end_it)
 		TerminateBackgroundWorker(ps->handle);
+	if (end_it && wait)
+	{
+		TimestampTz t0 = GetCurrentTimestamp();
+		pid_t		pid;
+
+		while (GetBackgroundWorkerPid(ps->handle, &pid) != BGWH_STOPPED &&
+			   !TimestampDifferenceExceeds(t0, GetCurrentTimestamp(), PROOF_GRACE_MS))
+		{
+			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
 	shm_mq_detach(ps->req);
 	shm_mq_detach(ps->ans);
 	dsm_detach(ps->seg);
@@ -1362,291 +1793,427 @@ proof_stop(ProofSession *ps, bool end_it)
 	pfree(ps);
 }
 
-/* Does the worker wait for a lock this transaction holds? It would wait for as long as this waits for it. */
-static bool
+/*
+ * Does the worker wait for a lock this session holds, directly or through the sessions it waits for (an ALTER TABLE
+ * queued behind this transaction's read, which the proof queues behind)? It would wait as long as this waits for it.
+ * Returns the first session on the way (MyProcPid when the worker waits for this one itself), or 0.
+ */
+static int
 waits_for_us(ProofSession *ps)
 {
 	pid_t		pid;
-	ArrayType  *a;
-	Datum	   *d;
-	bool	   *nulls;
-	int			n;
-	bool		ours = false;
+	int			seen[PROOF_WAITS_MAX];
+	int			via[PROOF_WAITS_MAX];
+	int			n = 0;
 
 	if (GetBackgroundWorkerPid(ps->handle, &pid) != BGWH_STARTED)
+		return 0;
+	seen[n] = (int) pid;
+	via[n++] = 0;
+	for (int i = 0; i < n; i++)
+	{
+		ArrayType  *a = DatumGetArrayTypeP(DirectFunctionCall1(pg_blocking_pids, Int32GetDatum(seen[i])));
+		Datum	   *d;
+		bool	   *nulls;
+		int			nb;
+
+		deconstruct_array_builtin(a, INT4OID, &d, &nulls, &nb);
+		for (int k = 0; k < nb; k++)
+		{
+			int			b;
+			bool		known = false;
+
+			if (nulls[k])
+				continue;
+			b = DatumGetInt32(d[k]);
+			if (b == MyProcPid)
+				return i == 0 ? MyProcPid : via[i];
+			for (int s = 0; s < n && !known; s++)
+				known = seen[s] == b;
+			if (!known && n < PROOF_WAITS_MAX)
+			{
+				seen[n] = b;
+				via[n++] = i == 0 ? b : via[i];
+			}
+		}
+	}
+	return 0;
+}
+
+/* A claim queued for the worker, and not yet answered. */
+typedef struct Sent
+{
+	const Claim *c;
+	ProofKind	kind;
+	bool		rls;
+	Judgment	rec;			/* MSG_RECORD: what to record */
+	int			tries;
+	StringInfoData msg;
+} Sent;
+
+/* The claims of a call on their way to its worker (proof_cur), in the order they are answered. */
+typedef struct Line
+{
+	Oid			owner;
+	Oid			caller;
+	const Target *t;
+	const Interval *every;		/* verify(): claims are taken by this rule; verify_one(): NULL */
+	int			timeout_ms;
+	double		max_cost;
+	Sent		q[PROOF_AHEAD];
+	int			qh;
+	int			qn;
+	int			nsent;			/* of q, from its head: sent whole to proof_cur */
+	Size		queued;			/* the bytes of q */
+	TimestampTz since;			/* the head waits for an answer since */
+	TimestampTz looked;			/* the lock waits were last walked */
+	MemoryContext cx;
+} Line;
+
+/* What became of a claim. */
+typedef struct Done
+{
+	const Claim *c;
+	ProofKind	kind;
+	Judgment	j;
+	char	   *verdict;		/* as it reads now: the worker's, after it recorded */
+	bool		recorded;		/* a worker took it and recorded what it found */
+	bool		skipped;		/* not taken: another verify() holds it, or it is not due any more */
+	bool		stuck;			/* no session took it in time: the call stops */
+} Done;
+
+static void
+line_message(Line *l, Sent *s)
+{
+	MemoryContext o = MemoryContextSwitchTo(l->cx);
+
+	if (s->msg.data != NULL)
+		pfree(s->msg.data);
+	claim_message(&s->msg, s->kind, s->c, l->every, l->caller, s->rls, l->timeout_ms, l->max_cost,
+				  s->kind == MSG_RECORD ? &s->rec : NULL);
+	MemoryContextSwitchTo(o);
+}
+
+/*
+ * Queue a claim, unless it would make the queued bytes more than half the queue (a claim larger than that goes alone,
+ * in pieces). False: not queued, try again once the queue has drained.
+ */
+static bool
+line_push(Line *l, const Claim *c, ProofKind kind, bool rls, const Judgment *rec)
+{
+	Sent	   *s = &l->q[(l->qh + l->qn) % PROOF_AHEAD];
+
+	Assert(l->qn < PROOF_AHEAD);
+	memset(s, 0, sizeof(Sent));
+	s->c = c;
+	s->kind = kind;
+	s->rls = rls;
+	if (rec)
+		s->rec = *rec;
+	if (s->rec.err)
+		s->rec.err = MemoryContextStrdup(l->cx, s->rec.err);
+	line_message(l, s);
+	if (l->qn > 0 && l->queued + s->msg.len > PROOF_QUEUE / 2)
+	{
+		pfree(s->msg.data);
 		return false;
-	a = DatumGetArrayTypeP(DirectFunctionCall1(pg_blocking_pids, Int32GetDatum((int32) pid)));
-	deconstruct_array_builtin(a, INT4OID, &d, &nulls, &n);
-	for (int i = 0; i < n && !ours; i++)
-		ours = !nulls[i] && DatumGetInt32(d[i]) == MyProcPid;
-	return ours;
-}
-
-/* The worker is gone (it detached): inside a proof it ended there; before one, nothing was judged. */
-static ProofStatus
-proof_gone(ProofSession *ps, Judgment *j)
-{
-	pg_read_barrier();
-	if (pg_atomic_read_u32(&ps->sh->judging) != 0)
-	{
-		j->out = OUT_HALTED;
-		j->at = ps->sh->started;
-		j->err = "the session that ran this proof ended while it ran: not run again until it is asserted again";
-		return PS_ENDED;
 	}
-	j->out = OUT_NOT_JUDGED;
-	j->err = "not judged: the proof's own session ended before it began (see the server log): nothing is "
-		"recorded, and it stays due";
-	return PS_FAILED;
+	if (l->qn == 0)
+		l->since = GetCurrentTimestamp();
+	l->queued += s->msg.len;
+	l->qn++;
+	return true;
 }
 
-/* A claim, as sent to the worker: its size counts against what may be sent ahead (PROOF_AHEAD). */
-static Size
-proof_send(ProofSession *ps, const Claim *c, bool rls, int timeout_ms, double max_cost)
+static void
+line_pop(Line *l)
 {
-	StringInfoData b;
-	int64		bits;
-	Size		size;
+	Sent	   *s = &l->q[l->qh];
 
-	initStringInfo(&b);
-	put_int(&b, timeout_ms);
-	memcpy(&bits, &max_cost, sizeof(bits));
-	put_int(&b, bits);
-	put_int(&b, rls ? 1 : 0);
-	put_str(&b, c->key);
-	put_str(&b, c->proof);
-	put_bytes(&b, c->asserted_for ? VARDATA_ANY(c->asserted_for) : NULL,
-			  c->asserted_for ? VARSIZE_ANY_EXHDR(c->asserted_for) : 0);
-	put_int(&b, c->env ? c->env->n : 0);
-	for (int i = 0; c->env && i < c->env->n; i++)
-	{
-		put_str(&b, c->env->name[i]);
-		put_str(&b, c->env->value[i]);
-	}
-	/* a worker gone before it reads it: proof_answer() finds it detached */
-	(void) shm_mq_send(ps->req, b.len, b.data, false, true);
-	size = b.len;
-	pfree(b.data);
-	return size;
+	l->queued -= s->msg.len;
+	pfree(s->msg.data);
+	s->msg.data = NULL;
+	l->qh = (l->qh + 1) % PROOF_AHEAD;
+	l->qn--;
+	if (l->nsent > 0)
+		l->nsent--;
+	l->since = GetCurrentTimestamp();
 }
 
-/* The answer for the oldest claim sent and not answered (the worker judges them in the order sent). */
-static ProofStatus
-proof_answer(ProofSession *ps, const Claim *c, int timeout_ms, Judgment *j)
+/* The author whose proofs are queued (one at a time), or InvalidOid when only records are. */
+static Oid
+line_author(const Line *l)
+{
+	for (int i = 0; i < l->qn; i++)
+	{
+		const Sent *s = &l->q[(l->qh + i) % PROOF_AHEAD];
+
+		if (s->kind == MSG_JUDGE)
+			return s->c->author;
+	}
+	return InvalidOid;
+}
+
+/* May a claim of `author` join the queue now? One worker at a time: another author's claims wait until it drains. */
+static bool
+line_takes(const Line *l, Oid author)
+{
+	Oid			now = proof_cur ? proof_cur->author : line_author(l);
+
+	return l->qn == 0 || !OidIsValid(now) || now == author;
+}
+
+/* The worker is done: the claims it had not answered go to the next one. */
+static void
+line_restart(Line *l, bool end_it)
+{
+	proof_stop(proof_cur, end_it, end_it);
+	proof_cur = NULL;
+	l->nsent = 0;
+	l->since = GetCurrentTimestamp();
+}
+
+/* The head becomes a record of what the verifier found (a halted, interrupted or late claim), for a new worker. */
+static void
+line_to_record(Line *l, const Judgment *j)
+{
+	Sent	   *s = &l->q[l->qh];
+
+	s->kind = MSG_RECORD;
+	s->rec = *j;
+	s->rec.err = j->err ? MemoryContextStrdup(l->cx, j->err) : NULL;
+	s->tries = 0;
+	l->queued -= s->msg.len;
+	line_message(l, s);
+	l->queued += s->msg.len;
+}
+
+static void
+line_done(Line *l, Done *d, Outcome out, const char *err)
+{
+	d->c = l->q[l->qh].c;
+	d->kind = l->q[l->qh].kind;
+	d->j.out = out;
+	d->j.err = err ? pstrdup(err) : NULL;
+	d->j.at = 0;
+	d->verdict = NULL;
+	d->recorded = false;
+	d->skipped = false;
+	d->stuck = false;
+	line_pop(l);
+}
+
+/*
+ * Drive the queue until its head is done with: send what fits without waiting, read answers, and keep every deadline
+ * (the proof's clock and PROOF_GRACE_MS more; as long again for a worker to take a claim it was sent) and the lock
+ * check. Workers are started, replaced and ended here. The queue is not empty.
+ */
+static void
+line_next(Line *l, Done *d)
 {
 	static uint32 wait_event = 0;
-	Size		n;
-	void	   *data;
-	Msg			m;
-	ProofAnswer what;
-	TimestampTz waiting;
-	TimestampTz looked;
 
 	if (wait_event == 0)
 		wait_event = WaitEventExtensionNew("PhasevecProof");
-	waiting = looked = GetCurrentTimestamp();
+	memset(d, 0, sizeof(Done));
 	for (;;)
 	{
-		shm_mq_result r = shm_mq_receive(ps->ans, &n, &data, true);
+		Sent	   *h = &l->q[l->qh];
+		Oid			author = line_author(l);
+		shm_mq_result r;
+		Size		n;
+		void	   *data;
 		TimestampTz now;
 
+		/* a worker for what is queued: the author of its proofs, or (records only) any, or a session of the owner */
+		if (proof_cur != NULL && OidIsValid(author) && proof_cur->author != author)
+		{
+			if (l->nsent > 0)
+				elog(ERROR, "phasevec: claims of two authors were sent to one session");
+			line_restart(l, false);
+		}
+		if (proof_cur == NULL)
+		{
+			char	   *why = NULL;
+
+			proof_cur = proof_start(l->owner, l->t->watch, OidIsValid(author) ? author : l->owner, &why);
+			l->nsent = 0;
+			if (proof_cur == NULL)
+			{
+				/*
+				 * A record (a halt, an interruption) waits a while for a slot: the worker that ended is leaving one,
+				 * and other verifiers may take it first. A proof does not: it stays due.
+				 */
+				if (h->kind == MSG_RECORD && !TimestampDifferenceExceeds(l->since, GetCurrentTimestamp(), PROOF_GRACE_MS))
+				{
+					(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20, wait_event);
+					ResetLatch(MyLatch);
+					CHECK_FOR_INTERRUPTS();
+					continue;
+				}
+				line_done(l, d, OUT_NOT_JUDGED, h->kind == MSG_RECORD ?
+						  psprintf("%s (%s)", h->rec.err ? h->rec.err : "nothing judged",
+								   "not recorded: no background worker was free to record it") : why);
+				return;
+			}
+			l->since = GetCurrentTimestamp();
+		}
+
+		/* send what fits, without waiting; a message cut by a full queue goes on from where it was */
+		while (l->nsent < l->qn)
+		{
+			Sent	   *s = &l->q[(l->qh + l->nsent) % PROOF_AHEAD];
+
+			r = shm_mq_send(proof_cur->req, s->msg.len, s->msg.data, true, true);
+			if (r != SHM_MQ_SUCCESS)
+				break;			/* WOULD_BLOCK: later; DETACHED: seen on the answers' queue */
+			l->nsent++;
+		}
+
+		r = shm_mq_receive(proof_cur->ans, &n, &data, true);
 		if (r == SHM_MQ_SUCCESS)
-			break;
+		{
+			Msg			m;
+			ProofAnswer what;
+			Judgment	j;
+			char	   *v;
+
+			m.p = data;
+			m.end = (const char *) data + n;
+			what = (ProofAnswer) get_int(&m);
+			j.out = (Outcome) get_int(&m);
+			j.at = (TimestampTz) get_int(&m);
+			j.err = get_bytes(&m, NULL);
+			v = get_bytes(&m, NULL);
+			if (what == ANSWER_DONE || what == ANSWER_SKIPPED)
+			{
+				d->c = h->c;
+				d->kind = h->kind;
+				d->j = j;
+				d->verdict = v;
+				d->recorded = what == ANSWER_DONE;
+				d->skipped = what == ANSWER_SKIPPED;
+				line_pop(l);
+				return;
+			}
+			h->tries++;
+			if (what == ANSWER_SPENT)
+			{
+				/* a spent worker ends by itself; a new one starts with no placeholder but its configuration's */
+				line_restart(l, true);
+				if (h->tries > 2)
+				{
+					line_done(l, d, OUT_NOT_JUDGED,
+							  "not judged: a new session of its author has a custom setting its author's session did not");
+					return;
+				}
+				continue;
+			}
+			/* failed: an error outside the proof, nothing recorded; once more in a new worker */
+			line_restart(l, true);
+			if (h->tries > 1)
+			{
+				line_done(l, d, OUT_NOT_JUDGED, psprintf("not judged: %s", j.err ? j.err : "its session failed"));
+				return;
+			}
+			continue;
+		}
 		if (r == SHM_MQ_DETACHED)
-			return proof_gone(ps, j);
+		{
+			ProofShared *sh = proof_cur->sh;
+
+			pg_read_barrier();
+			if (l->nsent > 0 && h->kind == MSG_JUDGE && pg_atomic_read_u32(&sh->judging) != 0)
+			{
+				Judgment	j;
+				int32		by = sh->signaller;
+
+				j.at = sh->started;
+				if (by == 0 || by == sh->pid)
+				{
+					/* the proof ended the session it ran in: its own FATAL, its author's transaction_timeout */
+					j.out = OUT_HALTED;
+					j.err = "the proof ended the session that ran it: refuted, and not run again until it is asserted again";
+				}
+				else
+				{
+					j.out = OUT_INTERRUPTED;
+					j.err = by > 0 ?
+						psprintf("interrupted: the session that ran its proof was terminated by another process (pid %d) "
+								 "while it ran: nothing is judged, and it stays due", by) :
+						"interrupted: the session that ran its proof was terminated (by a sender not known) while it "
+						"ran: nothing is judged, and it stays due";
+				}
+				line_restart(l, true);
+				line_to_record(l, &j);
+				continue;
+			}
+			/* gone before it began, or between claims: nothing judged; once more in a new worker */
+			h->tries++;
+			line_restart(l, true);
+			if (h->tries > 1)
+			{
+				line_done(l, d, OUT_NOT_JUDGED,
+						  "not judged: the proof's own session ended before it began (see the server log): nothing is "
+						  "recorded, and it stays due");
+				return;
+			}
+			continue;
+		}
+
 		now = GetCurrentTimestamp();
-		if (pg_atomic_read_u32(&ps->sh->judging) != 0)
+		if (l->nsent > 0 && h->kind == MSG_JUDGE && pg_atomic_read_u32(&proof_cur->sh->judging) != 0)
 		{
 			pg_read_barrier();
-			if (TimestampDifferenceExceeds(ps->sh->started, now, timeout_ms + PROOF_GRACE_MS))
+			if (TimestampDifferenceExceeds(proof_cur->sh->started, now, l->timeout_ms + PROOF_GRACE_MS))
 			{
-				j->out = OUT_REFUTED;
-				j->at = ps->sh->started;
-				j->err = psprintf("the proof took longer than %d ms (its session did not answer, and was ended)",
-								  timeout_ms);
-				return PS_LATE;
+				Judgment	j;
+
+				j.out = OUT_REFUTED;
+				j.at = proof_cur->sh->started;
+				j.err = psprintf("the proof took longer than %d ms (its session did not answer, and was ended)",
+								 l->timeout_ms);
+				line_restart(l, true);
+				line_to_record(l, &j);
+				continue;
 			}
 		}
-		else if (TimestampDifferenceExceeds(waiting, now, timeout_ms + PROOF_GRACE_MS))
+		else if (TimestampDifferenceExceeds(l->since, now, l->timeout_ms + PROOF_GRACE_MS))
 		{
-			j->out = OUT_NOT_JUDGED;
-			j->err = psprintf("not judged: the proof's own session did not take it within %d ms: nothing is "
-							  "recorded, and it stays due", timeout_ms + PROOF_GRACE_MS);
-			return PS_FAILED;
+			/* a session that does not take what it is sent (it waits for a lock as it starts, or to record) */
+			line_restart(l, true);
+			line_done(l, d, OUT_NOT_JUDGED,
+					  psprintf("not judged: the proof's own session did not take it within %d ms: nothing is "
+							   "recorded, and it stays due", l->timeout_ms + PROOF_GRACE_MS));
+			d->stuck = true;
+			return;
 		}
-		if (TimestampDifferenceExceeds(looked, now, 200))
+		if (TimestampDifferenceExceeds(l->looked, now, PROOF_LOOK_MS))
 		{
-			looked = now;
-			if (waits_for_us(ps))
+			int			via;
+
+			l->looked = now;
+			if ((via = waits_for_us(proof_cur)) != 0)
 			{
-				TerminateBackgroundWorker(ps->handle);
+				const char *key = h->c->key;
+
+				line_restart(l, true);
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("phasevec: the proof of key %s waits for a lock this transaction holds", c->key),
+						 errmsg("phasevec: the proof of key %s waits for a lock this transaction holds", key),
+						 via == MyProcPid ?
 						 errdetail("A proof runs in a session of its own, which reads what is committed; this "
-								   "transaction locked something it reads (LOCK TABLE, or DDL not yet committed)."),
-						 errhint("Verify outside this transaction, or after it commits.")));
+								   "transaction locked something it reads (an advisory lock, LOCK TABLE).") :
+						 errdetail("It waits for process %d, which waits for this transaction: a proof runs in a "
+								   "session of its own, and this transaction holds a lock (a read of a table, an "
+								   "advisory lock) that a session queued before the proof waits for.", via),
+						 errhint("Verify in a transaction of its own, that has read and locked nothing.")));
 			}
 		}
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100, wait_event);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
-	m.p = data;
-	m.end = (const char *) data + n;
-	what = (ProofAnswer) get_int(&m);
-	j->out = (Outcome) get_int(&m);
-	j->at = (TimestampTz) get_int(&m);
-	j->err = get_bytes(&m, NULL);
-	if (what == ANSWER_SPENT)
-		return PS_SPENT;
-	if (what == ANSWER_FAILED)
-	{
-		j->out = OUT_NOT_JUDGED;
-		j->err = psprintf("not judged: %s", j->err ? j->err : "its session failed");
-		return PS_FAILED;
-	}
-	return PS_JUDGED;
-}
-
-/* ------------------------------------------------------------------------------------------- the claims -- */
-
-#define CLAIM_COLUMNS "key, proof, author, author_known, asserted_for, env, bind"
-
-static void
-claim_from(HeapTuple tup, TupleDesc td, Claim *c, MemoryContext keep)
-{
-	bool		isnull;
-	Datum		d;
-	MemoryContext o = MemoryContextSwitchTo(keep);
-
-	memset(c, 0, sizeof(Claim));
-	c->key = TextDatumGetCString(SPI_getbinval(tup, td, 1, &isnull));
-	d = SPI_getbinval(tup, td, 2, &isnull);
-	c->proof = isnull ? NULL : TextDatumGetCString(d);
-	d = SPI_getbinval(tup, td, 3, &isnull);
-	c->author = isnull ? InvalidOid : DatumGetObjectId(d);
-	d = SPI_getbinval(tup, td, 4, &isnull);
-	c->author_known = !isnull && DatumGetBool(d);
-	d = SPI_getbinval(tup, td, 5, &isnull);
-	c->asserted_for = isnull ? NULL : DatumGetByteaPCopy(d);
-	d = SPI_getbinval(tup, td, 6, &isnull);
-	c->env = guard_env_from(isnull ? NULL : DatumGetArrayTypeP(d));
-	d = SPI_getbinval(tup, td, 7, &isnull);
-	c->bind = isnull ? NULL : DatumGetByteaPCopy(d);
-	MemoryContextSwitchTo(o);
-}
-
-#define RECORD_SQL "SELECT phasevec._truth_set($1, $2, $3, $4, $5, $6)"
-
-/* Record a judgment through phasevec._truth_set, as the owner; the verdict as it reads now. */
-static char *
-record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
-{
-	Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
-	Datum		av[6];
-	char		nulls[7] = "      ";
-	const char *name = outcome_name[j->out];
-	MemoryContext keep = CurrentMemoryContext;
-	char	   *v = NULL;
-	Who			was;
-
-	av[0] = Int32GetDatum(t->watch);
-	av[1] = CStringGetTextDatum(c->key);
-	av[2] = name ? CStringGetTextDatum(name) : (Datum) 0;
-	nulls[2] = name ? ' ' : 'n';
-	av[3] = j->err ? CStringGetTextDatum(j->err) : (Datum) 0;
-	nulls[3] = j->err ? ' ' : 'n';
-	av[4] = c->bind ? PointerGetDatum(c->bind) : (Datum) 0;
-	nulls[4] = c->bind ? ' ' : 'n';
-	av[5] = TimestampTzGetDatum(j->at);
-	nulls[5] = j->at != 0 ? ' ' : 'n';
-
-	become(owner, &was);
-	spi_connect();
-	if ((t->record_plan ? SPI_execute_plan(t->record_plan, av, nulls, false, 1)
-		 : SPI_execute_with_args(RECORD_SQL, 6, at, av, nulls, false, 1)) != SPI_OK_SELECT)
-		elog(ERROR, "phasevec: the verdict was not recorded");
-	if (SPI_processed == 1)
-	{
-		char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-
-		if (s)
-			v = MemoryContextStrdup(keep, s);
-	}
-	SPI_finish();
-	unbecome(&was);
-	return v;
-}
-
-/* A claim whose proof ended the session that ran it: refuted and halted (phasevec._truth_halted), as the owner. */
-static bytea *
-bytes32(const uint8 *b)
-{
-	bytea	   *v = (bytea *) palloc(VARHDRSZ + HASH_LEN);
-
-	SET_VARSIZE(v, VARHDRSZ + HASH_LEN);
-	memcpy(VARDATA(v), b, HASH_LEN);
-	return v;
-}
-
-#define VERDICT_SQL \
-	"SELECT phasevec._verdict(t) FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 " \
-	"AND t.key OPERATOR(pg_catalog.=) $2"
-
-static char *
-record_halted(Oid owner, Oid verifier, const Target *t, const Claim *c, const Judgment *j)
-{
-	MemoryContext keep = CurrentMemoryContext;
-	uint8		kh[HASH_LEN];
-	char	   *v = NULL;
-	Who			was;
-
-	if (c->bind == NULL || VARSIZE_ANY_EXHDR(c->bind) != HASH_LEN)
-	{
-		Judgment	r = *j;
-
-		r.out = OUT_REFUTED;
-		return record(owner, t, c, &r);
-	}
-	key_hash(c->key, kh);
-	become(owner, &was);
-	spi_connect();
-	{
-		Oid			at[5] = {INT4OID, BYTEAOID, BYTEAOID, OIDOID, TIMESTAMPTZOID};
-		Datum		av[5] = {Int32GetDatum(t->watch), PointerGetDatum(bytes32(kh)), PointerGetDatum(c->bind),
-		ObjectIdGetDatum(verifier), TimestampTzGetDatum(j->at)};
-
-		if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3, $4, $5)", 5, at, av, NULL, false, 1)
-			!= SPI_OK_SELECT)
-			elog(ERROR, "phasevec: a halted proof could not be recorded");
-	}
-	{
-		Oid			at[2] = {INT4OID, TEXTOID};
-		Datum		av[2] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key)};
-
-		if (SPI_execute_with_args(VERDICT_SQL, 2, at, av, NULL, false, 1) != SPI_OK_SELECT)
-			elog(ERROR, "phasevec: the verdict could not be read");
-		if (SPI_processed == 1)
-		{
-			char	   *s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-
-			if (s)
-				v = MemoryContextStrdup(keep, s);
-		}
-	}
-	SPI_finish();
-	unbecome(&was);
-	return v;
-}
-
-/* Record what judge_claim() found: nothing for a claim not judged (the verdict as it reads now is returned). */
-static char *
-record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const Judgment *j)
-{
-	if (j->out == OUT_HALTED)
-		return record_halted(owner, verifier, t, c, j);
-	return record(owner, t, c, j);
 }
 
 typedef struct Readers
@@ -1683,104 +2250,29 @@ author_reads(Readers *r, const Target *t, Oid author, bool *rls)
 }
 
 /*
- * Judge one claim in a session of its own (proof_cur: the worker of this call, started or replaced as needed), and
- * wait for it: verify_one(). A claim whose author is gone, or may no longer read the table, is set unproven here,
- * with no worker (verify() asks this for those too; it sends the others ahead itself).
+ * How a claim goes to a worker: a proof to judge, or (an author gone, or kept from the table) 'unproven' to record,
+ * with no proof run.
  */
-static void
-judge_claim(const Claim *c, int timeout_ms, double max_cost, const Target *t, Readers *readers, Oid owner,
-			Judgment *j)
+static ProofKind
+claim_kind(const Claim *c, const Target *t, Readers *readers, bool *rls, Judgment *rec)
 {
-	ProofSession **ps = &proof_cur;
-	bool		rls = false;
-
-	j->err = NULL;
-	j->at = 0;
+	*rls = false;
+	memset(rec, 0, sizeof(Judgment));
 	if (!c->author_known)
 	{
-		j->out = OUT_UNPROVEN;
-		j->err = pstrdup("the author of this proof is gone (dropped, or its name is another role's now): "
-						 "assert it again, or adopt it naming its author (phasevec.adopt)");
-		return;
+		rec->out = OUT_UNPROVEN;
+		rec->err = "the author of this proof is gone (dropped, or its name is another role's now): "
+			"assert it again, or adopt it naming its author (phasevec.adopt)";
+		return MSG_RECORD;
 	}
-	if (!author_reads(readers, t, c->author, &rls))
+	if (!author_reads(readers, t, c->author, rls))
 	{
-		j->out = OUT_UNPROVEN;
-		j->err = psprintf("its author \"%s\" may no longer read %s: nothing is judged",
-						  GetUserNameFromId(c->author, false), t->src);
-		return;
+		rec->out = OUT_UNPROVEN;
+		rec->err = psprintf("its author \"%s\" may no longer read %s: nothing is judged",
+							GetUserNameFromId(c->author, false), t->src);
+		return MSG_RECORD;
 	}
-	for (int attempt = 0;; attempt++)
-	{
-		ProofStatus st;
-		char	   *why = NULL;
-
-		if (*ps != NULL && (*ps)->author != c->author)
-		{
-			proof_stop(*ps, false);
-			*ps = NULL;
-		}
-		if (*ps == NULL && (*ps = proof_start(owner, t->watch, c->author, &why)) == NULL)
-		{
-			j->out = OUT_NOT_JUDGED;
-			j->err = why;
-			return;
-		}
-		(void) proof_send(*ps, c, rls, timeout_ms, max_cost);
-		st = proof_answer(*ps, c, timeout_ms, j);
-		if (st == PS_JUDGED)
-			return;
-		/* a worker that is spent ends by itself; one that failed, ended or was late, now */
-		proof_stop(*ps, st != PS_SPENT);
-		*ps = NULL;
-		if (st == PS_ENDED || st == PS_LATE)
-			return;
-		/* a new worker starts with no placeholder but its configuration's: it is not spent */
-		if ((st == PS_SPENT && attempt < 2) || (st == PS_FAILED && attempt < 1))
-			continue;
-		if (st == PS_SPENT)
-		{
-			j->out = OUT_NOT_JUDGED;
-			j->err = "not judged: a new session of its author has a custom setting its author's session did not";
-		}
-		return;
-	}
-}
-
-/*
- * Take the claim's row before judging it, or leave it: another verify() (or an assert()) holds it. It must still be
- * due, by the rule of phasevec._truth_due (a stale claim once for each text it reads; one whose verdict and last
- * look are both older than p_every is due either way, and the row's text is not read for it). Without this, two
- * verify() calls of one watch locked the rows of their due lists in different orders when the table took writes
- * (in the fifth cut the watch trigger wrote verdict rows too) and deadlocked: 54-70% of the calls failed, and an
- * aborted call lost every verdict it had reached. With it no verify() waits on a verdict row, so none deadlocks on
- * one, and none judges a claim another is judging, or judged since its due list was read (it is no longer due).
- */
-#define LOCK_OLD(c) "t." c " IS NULL OR t." c " OPERATOR(pg_catalog.<) (pg_catalog.now() OPERATOR(pg_catalog.-) $3)"
-#define CLAIM_LOCK_SQL \
-	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
-	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
-	"AND t.asserted_for IS DISTINCT FROM h THEN " LOCK_OLD("looked_at") " OR t.looked_for IS DISTINCT FROM h " \
-	"ELSE " LOCK_OLD("verified_at") " END " \
-	"FROM (SELECT (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch OPERATOR(pg_catalog.=) t.watch " \
-	"AND s.key OPERATOR(pg_catalog.=) t.key) AS h) s)) FOR NO KEY UPDATE SKIP LOCKED"
-
-static bool
-claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, Datum every)
-{
-	Datum		av[3] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), every};
-	bool		taken;
-	Who			was;
-
-	become(owner, &was);
-	spi_connect();
-	if (SPI_execute_plan(plan, av, NULL, false, 1) != SPI_OK_SELECT)
-		elog(ERROR, "phasevec: a claim could not be taken");
-	taken = SPI_processed == 1;
-	SPI_finish();
-	unbecome(&was);
-	return taken;
+	return MSG_JUDGE;
 }
 
 static int64
@@ -1799,6 +2291,25 @@ refuse_inside_proof(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("phasevec: a proof cannot run another proof")));
+}
+
+/*
+ * (ninth review) A verdict is about a committed state that does not depend on its verifier's transaction. The proofs
+ * read what is committed; a transaction that has written (it has a transaction id: a write, DDL, LOCK TABLE ... ACCESS
+ * EXCLUSIVE) would have them judge a state it is about to replace, as if its writes were not there. Until the ninth
+ * review such a verifier committed, together with its write, a 'verified' its write refutes. verify() itself writes
+ * nothing in the caller's transaction: it may verify again in it.
+ */
+static void
+require_no_writes(void)
+{
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("phasevec: proofs judge what is committed, and this transaction has written"),
+				 errdetail("A proof runs in a session of its own and does not see this transaction's writes or DDL: "
+						   "it would judge the state they replace, and its verdict would stand beside them."),
+				 errhint("Verify in a transaction of its own, or before this transaction writes.")));
 }
 
 /*
@@ -1861,28 +2372,43 @@ turns(const Claim *claims, int n)
 	return t;
 }
 
-/* A claim sent to the worker and not yet answered. */
-typedef struct Sent
+/* The verdict of a key as it reads now, read by the verifier (it writes nothing). */
+static char *
+verdict_as_owner(Oid owner, const Target *t, const char *key)
 {
-	const Claim *c;
-	bool		rls;
-	int			tries;
-	Size		size;
-} Sent;
+	MemoryContext keep = CurrentMemoryContext;
+	char	   *v;
+	Who			was;
 
-/* Record a judgment and return its row: key, the verdict as it reads now, the error. */
+	become(owner, &was);
+	spi_connect();
+	v = verdict_now(t, key, keep);
+	SPI_finish();
+	unbecome(&was);
+	return v;
+}
+
+/* The row verify() returns for a claim done with: key, the verdict as it reads now, the error. None when skipped. */
 static void
-emit(ReturnSetInfo *rsinfo, Oid owner, Oid caller, const Target *t, const Claim *c, const Judgment *j)
+emit(ReturnSetInfo *rsinfo, Oid owner, const Target *t, const Done *d)
 {
-	char	   *v = record_judgment(owner, caller, t, c, j);
 	Datum		values[3];
 	bool		nulls[3] = {false, false, false};
+	char	   *v = d->verdict;
+	const char *err = d->j.err;
 
-	values[0] = CStringGetTextDatum(c->key);
+	if (d->skipped && d->kind == MSG_JUDGE)
+		return;
+	if (d->skipped)
+		err = psprintf("%s (not recorded: another verify() holds the claim, or judged it since)",
+					   err ? err : "nothing judged");
+	if (!d->recorded)
+		v = verdict_as_owner(owner, t, d->c->key);
+	values[0] = CStringGetTextDatum(d->c->key);
 	values[1] = v ? CStringGetTextDatum(v) : (Datum) 0;
 	nulls[1] = v == NULL;
-	values[2] = j->err ? CStringGetTextDatum(j->err) : (Datum) 0;
-	nulls[2] = j->err == NULL;
+	values[2] = err ? CStringGetTextDatum(err) : (Datum) 0;
+	nulls[2] = err == NULL;
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
@@ -1891,7 +2417,7 @@ emit(ReturnSetInfo *rsinfo, Oid owner, Oid caller, const Target *t, const Claim 
  *   RETURNS TABLE (key text, verdict text, error text)
  * The due proofs whose author the caller may act as (a gone author's claim is set unproven by anyone), oldest
  * first, while the budget lasts. Each proof runs in a session of its own, a new session of its author with its
- * author's settings; the verdicts are recorded in the caller's transaction.
+ * author's settings, which takes the claim, judges it and commits the verdict.
  */
 Datum
 phasevec_verify(PG_FUNCTION_ARGS)
@@ -1904,23 +2430,22 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	Target		target;
 	Claim	   *claims = NULL;
 	uint64		nclaims = 0;
-	int			timeout_ms;
-	double		max_cost;
 	int64		budget_us;
 	TimestampTz t0;
 	Who			was;
 	Readers		readers = {0};
-	SPIPlanPtr	lock_plan = NULL;
 	Turn	   *order;
-	MemoryContext take;
+	Line		l;
 
 	for (int i = 0; i < 6; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("phasevec: verify() takes no NULL argument")));
-	timeout_ms = PG_GETARG_INT32(4);
-	max_cost = PG_GETARG_FLOAT8(5);
-	require_clock(timeout_ms);
+	memset(&l, 0, sizeof(l));
+	l.timeout_ms = PG_GETARG_INT32(4);
+	l.max_cost = PG_GETARG_FLOAT8(5);
+	require_clock(l.timeout_ms);
 	require_fresh_snapshots();
+	require_no_writes();
 	refuse_inside_proof();
 	budget_us = interval_usec(PG_GETARG_INTERVAL_P(3));
 	InitMaterializedSRF(fcinfo, 0);
@@ -1945,53 +2470,30 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	unbecome(&was);
 
 	per = AllocSetContextCreate(CurrentMemoryContext, "phasevec verify", ALLOCSET_DEFAULT_SIZES);
+	l.cx = AllocSetContextCreate(CurrentMemoryContext, "phasevec verify queue", ALLOCSET_DEFAULT_SIZES);
+	l.owner = owner;
+	l.caller = caller;
+	l.t = &target;
+	l.every = PG_GETARG_INTERVAL_P(2);
 	t0 = GetCurrentTimestamp();
-	if (nclaims > 0)
-	{
-		Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
-		Oid			lt[3] = {INT4OID, TEXTOID, INTERVALOID};
-
-		spi_connect();
-		become(owner, &was);
-		target.record_plan = SPI_prepare(RECORD_SQL, 6, at);
-		if (target.record_plan == NULL)
-			elog(ERROR, "phasevec: verdicts cannot be recorded: %s", SPI_result_code_string(SPI_result));
-		SPI_keepplan(target.record_plan);
-		lock_plan = SPI_prepare(CLAIM_LOCK_SQL, 3, lt);
-		if (lock_plan == NULL)
-			elog(ERROR, "phasevec: claims cannot be taken: %s", SPI_result_code_string(SPI_result));
-		SPI_keepplan(lock_plan);
-		unbecome(&was);
-		SPI_finish();
-	}
 	order = turns(claims, (int) nclaims);
-	take = AllocSetContextCreate(CurrentMemoryContext, "phasevec take", ALLOCSET_DEFAULT_SIZES);
 	PG_TRY();
 	{
-		/*
-		 * Up to PROOF_AHEAD claims are taken and sent ahead of their answers: the worker judges the next one while
-		 * this records the last. Answers come in the order sent; a worker that ends (spent, failed, ended by its
-		 * proof, late) takes with it the claims sent after the one it was on, which go to the next one.
-		 */
-		Sent		q[PROOF_AHEAD];
-		int			qh = 0;
-		int			qn = 0;
-		Size		qbytes = 0;
 		uint64		k = 0;
 		bool		over = false;
+		bool		stuck = false;
 
 		for (;;)
 		{
-			Judgment	j;
-			Sent	   *f;
-			ProofStatus st;
+			Done		d;
 
-			while (qn < PROOF_AHEAD && k < (uint64) nclaims && !over)
+			/* queue the next claims while the budget lasts (a claim queued is judged, or said not to be) */
+			while (l.qn < PROOF_AHEAD && k < (uint64) nclaims && !over && !stuck)
 			{
 				const Claim *c = &claims[order[k].at];
-				bool		rls = false;
-				bool		taken;
-				MemoryContext o;
+				bool		rls;
+				Judgment	rec;
+				ProofKind	kind;
 
 				if (GetCurrentTimestamp() - t0 >= budget_us)
 				{
@@ -2004,139 +2506,44 @@ phasevec_verify(PG_FUNCTION_ARGS)
 					k++;
 					continue;
 				}
-				/* one worker at a time: another author's claims wait for this one's answers */
-				if (qn > 0 && c->author_known && proof_cur != NULL && proof_cur->author != c->author)
+				kind = claim_kind(c, &target, &readers, &rls, &rec);
+				if (kind == MSG_JUDGE && !line_takes(&l, c->author))
 					break;
-				/* and so many bytes at most (the worker answers only as fast as this reads) */
-				if (qn > 0 && qbytes >= PROOF_QUEUE / 2)
+				if (!line_push(&l, c, kind, rls, &rec))
 					break;
-				o = MemoryContextSwitchTo(take);
-				taken = claim_taken(owner, lock_plan, &target, c, PG_GETARG_DATUM(2));
-				MemoryContextSwitchTo(o);
-				MemoryContextReset(take);
 				k++;
-				if (!taken)
-					continue;
-				o = MemoryContextSwitchTo(per);
-				if (!c->author_known || !author_reads(&readers, &target, c->author, &rls))
-				{
-					/* no worker: set unproven here */
-					judge_claim(c, timeout_ms, max_cost, &target, &readers, owner, &j);
-					emit(rsinfo, owner, caller, &target, c, &j);
-				}
-				else
-				{
-					if (proof_cur != NULL && proof_cur->author != c->author)
-					{
-						proof_stop(proof_cur, false);
-						proof_cur = NULL;
-					}
-					if (proof_cur == NULL)
-					{
-						char	   *why = NULL;
-
-						proof_cur = proof_start(owner, target.watch, c->author, &why);
-						if (proof_cur == NULL)
-						{
-							j.out = OUT_NOT_JUDGED;
-							j.err = why;
-							j.at = 0;
-							emit(rsinfo, owner, caller, &target, c, &j);
-						}
-					}
-					if (proof_cur != NULL)
-					{
-						Sent	   *n = &q[(qh + qn) % PROOF_AHEAD];
-
-						n->c = c;
-						n->rls = rls;
-						n->tries = 0;
-						n->size = proof_send(proof_cur, c, rls, timeout_ms, max_cost);
-						qbytes += n->size;
-						qn++;
-					}
-				}
-				MemoryContextSwitchTo(o);
-				MemoryContextReset(per);
 			}
-			if (qn == 0)
+			if (l.qn == 0)
 				break;
-
-			/* the answer for the oldest */
-			f = &q[qh];
 			{
 				MemoryContext o = MemoryContextSwitchTo(per);
 
-				st = proof_answer(proof_cur, f->c, timeout_ms, &j);
-				if (st == PS_JUDGED || st == PS_ENDED || st == PS_LATE ||
-					(st == PS_FAILED && f->tries >= 1) || (st == PS_SPENT && f->tries >= 2))
+				if (stuck)
 				{
-					if (st == PS_SPENT)
-					{
-						j.out = OUT_NOT_JUDGED;
-						j.err = "not judged: a new session of its author has a custom setting its author's session "
-							"did not";
-					}
-					emit(rsinfo, owner, caller, &target, f->c, &j);
-					qbytes -= f->size;
-					qh = (qh + 1) % PROOF_AHEAD;
-					qn--;
+					/* a session did not take a claim in time: the rest are not sent to another */
+					line_done(&l, &d, OUT_NOT_JUDGED,
+							  "not judged: a proof's own session did not take an earlier claim of this call in time: "
+							  "nothing is recorded, and it stays due");
 				}
 				else
-					f->tries++;
+					line_next(&l, &d);
+				stuck = stuck || d.stuck;
+				emit(rsinfo, owner, &target, &d);
 				MemoryContextSwitchTo(o);
 				MemoryContextReset(per);
-			}
-			if (st == PS_JUDGED)
-				continue;
-			/* the worker is done: what it had not answered goes to a new one */
-			proof_stop(proof_cur, st != PS_SPENT);
-			proof_cur = NULL;
-			if (qn > 0)
-			{
-				char	   *why = NULL;
-
-				proof_cur = proof_start(owner, target.watch, q[qh].c->author, &why);
-				for (int i = 0; i < qn; i++)
-				{
-					Sent	   *r = &q[(qh + i) % PROOF_AHEAD];
-
-					if (proof_cur != NULL)
-						(void) proof_send(proof_cur, r->c, r->rls, timeout_ms, max_cost);
-					else
-					{
-						MemoryContext o = MemoryContextSwitchTo(per);
-
-						j.out = OUT_NOT_JUDGED;
-						j.err = why;
-						j.at = 0;
-						emit(rsinfo, owner, caller, &target, r->c, &j);
-						MemoryContextSwitchTo(o);
-						MemoryContextReset(per);
-					}
-				}
-				if (proof_cur == NULL)
-				{
-					qn = 0;
-					qbytes = 0;
-				}
 			}
 		}
 	}
 	PG_CATCH();
 	{
-		proof_stop(proof_cur, true);
+		proof_stop(proof_cur, true, false);
 		proof_cur = NULL;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	proof_stop(proof_cur, false);
+	proof_stop(proof_cur, false, false);
 	proof_cur = NULL;
-	if (target.record_plan)
-		SPI_freeplan(target.record_plan);
-	if (lock_plan)
-		SPI_freeplan(lock_plan);
-	MemoryContextDelete(take);
+	MemoryContextDelete(l.cx);
 	MemoryContextDelete(per);
 	return (Datum) 0;
 }
@@ -2154,18 +2561,23 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	MemoryContext keep = CurrentMemoryContext;
 	Target		target;
 	Claim		c;
-	Judgment	j;
-	char	   *v;
-	int			timeout_ms;
+	Done		d;
 	Who			was;
 	Readers		readers = {0};
+	Line		l;
+	bool		rls;
+	Judgment	rec;
+	ProofKind	kind;
 
 	for (int i = 0; i < 4; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("phasevec: verify_one() takes no NULL argument")));
-	timeout_ms = PG_GETARG_INT32(2);
-	require_clock(timeout_ms);
+	memset(&l, 0, sizeof(l));
+	l.timeout_ms = PG_GETARG_INT32(2);
+	l.max_cost = PG_GETARG_FLOAT8(3);
+	require_clock(l.timeout_ms);
 	require_fresh_snapshots();
+	require_no_writes();
 	refuse_inside_proof();
 
 	become(owner, &was);
@@ -2200,28 +2612,34 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 				 errmsg("phasevec: role \"%s\" cannot run a proof as its author \"%s\"",
 						GetUserNameFromId(caller, false), GetUserNameFromId(c.author, false)),
 				 errhint("Proofs run with their author's rights: verify as the author or as a role that has its privileges.")));
+	l.cx = AllocSetContextCreate(CurrentMemoryContext, "phasevec verify queue", ALLOCSET_DEFAULT_SIZES);
+	l.owner = owner;
+	l.caller = caller;
+	l.t = &target;
+	l.every = NULL;
+	kind = claim_kind(&c, &target, &readers, &rls, &rec);
+	(void) line_push(&l, &c, kind, rls, &rec);
 	PG_TRY();
 	{
-		judge_claim(&c, timeout_ms, PG_GETARG_FLOAT8(3), &target, &readers, owner, &j);
+		line_next(&l, &d);
 	}
 	PG_CATCH();
 	{
-		proof_stop(proof_cur, true);
+		proof_stop(proof_cur, true, false);
 		proof_cur = NULL;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	proof_stop(proof_cur, false);
+	proof_stop(proof_cur, false, false);
 	proof_cur = NULL;
-	if (j.out == OUT_NOT_JUDGED)
+	if (!d.recorded || d.j.out == OUT_INTERRUPTED)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("phasevec: verify_one() could not judge key %s", c.key),
-				 errdetail("%s.", j.err)));
-	v = record_judgment(owner, caller, &target, &c, &j);
-	if (v == NULL)
+				 errdetail("%s.", d.j.err ? d.j.err : "nothing judged")));
+	if (d.verdict == NULL)
 		PG_RETURN_NULL();
-	PG_RETURN_TEXT_P(cstring_to_text(v));
+	PG_RETURN_TEXT_P(cstring_to_text(d.verdict));
 }
 
 /* -------------------------------------------------------------------------------------- asserting a claim -- */

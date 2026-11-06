@@ -80,30 +80,31 @@ SELECT phasevec.assert($w$h1$w$, $k$3$k$, $p$NOT EXISTS (SELECT 1 FROM public.in
  
 (1 row)
 
+SELECT phasevec.assert($w$h1$w$, $k$4$k$, $p$(SELECT true FROM pg_advisory_xact_lock_shared(4242))$p$);
+ assert 
+--------
+ 
+(1 row)
+
 RESET ROLE;
 -- 1. The verifier deletes the overdue invoice, verifies, and puts it back before COMMIT: the proof judges what is
--- committed (one overdue invoice), not the state no other session ever saw.
+-- committed (one overdue invoice), not the state no other session ever saw. (Ninth review: a transaction that has
+-- written may not verify at all; the proofs could not see its writes, and judged the state they replace.)
 BEGIN;
 DELETE FROM invoices WHERE overdue;
 SELECT key, verdict, error FROM phasevec.verify($w$h1$w$, p_every => interval '0') WHERE key = '1';
- key | verdict | error 
------+---------+-------
- 1   | refuted | 
-(1 row)
-
+ERROR:  phasevec: proofs judge what is committed, and this transaction has written
 INSERT INTO invoices VALUES (1, $t$acme$t$, true);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
 COMMIT;
 -- DDL not committed: the function the proof calls, replaced and put back in the verifier's transaction
 BEGIN;
 CREATE OR REPLACE FUNCTION public.overdue_count() RETURNS bigint LANGUAGE sql STABLE AS $f$SELECT 0::bigint$f$;
 SELECT phasevec.verify_one($w$h1$w$, $k$2$k$);
- verify_one 
-------------
- refuted
-(1 row)
-
+ERROR:  phasevec: proofs judge what is committed, and this transaction has written
 CREATE OR REPLACE FUNCTION public.overdue_count() RETURNS bigint LANGUAGE sql STABLE
     AS $f$SELECT count(*) FROM public.invoices WHERE overdue$f$;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
 COMMIT;
 -- what was committed: one overdue invoice, and both claims refuted
 SELECT count(*) FILTER (WHERE overdue) AS overdue FROM invoices;
@@ -111,6 +112,13 @@ SELECT count(*) FILTER (WHERE overdue) AS overdue FROM invoices;
 ---------
        1
 (1 row)
+
+SELECT key, verdict FROM phasevec.verify($w$h1$w$, p_every => interval '0') WHERE key IN ('1', '2') ORDER BY key;
+ key | verdict 
+-----+---------
+ 1   | refuted
+ 2   | refuted
+(2 rows)
 
 SELECT t.key, phasevec._verdict(t) AS verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
  WHERE w.name = $w$h1$w$ AND t.key IN ($k$1$k$, $k$2$k$) ORDER BY t.key;
@@ -121,17 +129,39 @@ SELECT t.key, phasevec._verdict(t) AS verdict FROM phasevec.truth t JOIN phaseve
 (2 rows)
 
 -- a lock this transaction holds on what the proof reads (row-level security switched on, no policy: the author would
--- see nothing): the proof would wait for it as long as verify_one() waits for the proof
+-- see nothing): the proof would wait for it as long as verify_one() waits for the proof. DDL gives the transaction an
+-- id: refused before any proof runs (ninth review).
 BEGIN;
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 SELECT phasevec.verify_one($w$h1$w$, $k$3$k$);
-ERROR:  phasevec: the proof of key 3 waits for a lock this transaction holds
+ERROR:  phasevec: proofs judge what is committed, and this transaction has written
 ROLLBACK;
 SELECT t.key, phasevec._verdict(t) AS verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
  WHERE w.name = $w$h1$w$ AND t.key = $k$3$k$;
  key | verdict 
 -----+---------
  3   | refuted
+(1 row)
+
+-- a lock with no transaction id (a session's advisory lock) that the proof waits for: an error, not a wait
+SELECT pg_advisory_lock(4242);
+ pg_advisory_lock 
+------------------
+ 
+(1 row)
+
+SELECT phasevec.verify_one($w$h1$w$, $k$4$k$);
+ERROR:  phasevec: the proof of key 4 waits for a lock this transaction holds
+SELECT pg_advisory_unlock(4242);
+ pg_advisory_unlock 
+--------------------
+ t
+(1 row)
+
+SELECT phasevec.verify_one($w$h1$w$, $k$4$k$);
+ verify_one 
+------------
+ verified
 (1 row)
 
 -- 2. session_user and application_name are the author's session's, not the verifier's.

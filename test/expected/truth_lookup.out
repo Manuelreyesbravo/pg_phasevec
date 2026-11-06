@@ -173,15 +173,11 @@ SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified
  13  | verified
 (1 row)
 
--- in a transaction that made one and dropped it, the same
+-- in a transaction that made one and dropped it: refused, it has written (ninth review)
 BEGIN;
 CREATE TEMP TABLE pv_tl_scratch (x int);
 SELECT count(*) FROM phasevec.verify($w$notes$w$, p_every => interval '0');
- count 
--------
-    13
-(1 row)
-
+ERROR:  phasevec: proofs judge what is committed, and this transaction has written
 ROLLBACK;
 -- emptied, the same
 DISCARD TEMP;

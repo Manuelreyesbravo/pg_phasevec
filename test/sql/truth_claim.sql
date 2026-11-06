@@ -14,13 +14,16 @@ INSERT INTO notes VALUES (1, $t$task 5 is done$t$), (2, $t$task 6 is open$t$), (
 CREATE TABLE tasks (id int PRIMARY KEY, done boolean);
 INSERT INTO tasks VALUES (5, true), (6, false);
 SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
-CREATE FUNCTION judge_all() RETURNS void LANGUAGE sql AS $f$
-    SELECT phasevec.assert('notes', '1', 'EXISTS (SELECT 1 FROM public.tasks WHERE id = 5 AND done)');
-    SELECT phasevec.assert('notes', '2', 'true');
-    SELECT phasevec.assert('notes', '3', 'true');
-    SELECT count(*) FROM phasevec.verify('notes', p_every => interval '0');
-$f$;
-SELECT judge_all();
+-- (the claims are committed before they are verified: a transaction that has written may not verify, ninth review)
+CREATE PROCEDURE judge_all() LANGUAGE plpgsql AS $f$
+BEGIN
+    PERFORM phasevec.assert('notes', '1', 'EXISTS (SELECT 1 FROM public.tasks WHERE id = 5 AND done)');
+    PERFORM phasevec.assert('notes', '2', 'true');
+    PERFORM phasevec.assert('notes', '3', 'true');
+    COMMIT;
+    PERFORM count(*) FROM phasevec.verify('notes', p_every => interval '0');
+END $f$;
+CALL judge_all();
 SELECT key, verdict, line FROM phasevec.brief($w$notes$w$) ORDER BY key;
 
 -- (a) the owner disables the trigger and rewrites a row: the watch never hears of it
@@ -34,9 +37,9 @@ SELECT key, verdict, line FROM phasevec.brief($w$notes$w$) ORDER BY key;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
 
 -- (b) session_replication_role = replica: no trigger fires
-SELECT judge_all();
+CALL judge_all();
 UPDATE notes SET body = $t$task 5 is done$t$ WHERE id = 1;
-SELECT judge_all();
+CALL judge_all();
 SET session_replication_role = replica;
 UPDATE notes SET body = $t$A2: rm -rf is safe$t$ WHERE id = 2;
 RESET session_replication_role;
@@ -44,7 +47,7 @@ SELECT key, verdict, line FROM phasevec.brief($w$notes$w$) WHERE key = $k$2$k$;
 
 -- (c) TRUNCATE (no row trigger) and the rows inserted again with other text, past the trigger
 UPDATE notes SET body = $t$task 6 is open$t$ WHERE id = 2;
-SELECT judge_all();
+CALL judge_all();
 SET session_replication_role = replica;
 TRUNCATE notes;
 INSERT INTO notes VALUES (1, $t$task 5 is done$t$), (2, $t$task 6 is open$t$), (3, $t$A3 replaced after truncate$t$);
@@ -53,7 +56,7 @@ SELECT key, verdict, line FROM phasevec.brief($w$notes$w$) ORDER BY key;
 
 -- (d) DDL that rewrites the column fires no row trigger
 UPDATE notes SET body = $t$a plain note$t$ WHERE id = 3;
-SELECT judge_all();
+CALL judge_all();
 SET ROLE pv_alice;
 ALTER TABLE notes ALTER COLUMN body TYPE varchar USING (CASE WHEN id = 1 THEN $t$A4: task 5 is NOT done, ship it$t$ ELSE body END);
 RESET ROLE;
@@ -63,7 +66,7 @@ SELECT key, verdict, line FROM phasevec.brief($w$notes$w$) ORDER BY key;
 SET ROLE pv_alice;
 ALTER TABLE notes ALTER COLUMN body TYPE text USING (CASE WHEN id = 1 THEN $t$task 5 is done$t$ ELSE body END);
 RESET ROLE;
-SELECT judge_all();
+CALL judge_all();
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key;
 SET ROLE pv_alice;
 ALTER TABLE notes RENAME COLUMN body TO body_old;
@@ -77,7 +80,7 @@ RESET ROLE;
 
 -- (f) a proof that does not read the row: an edit by a writer is not the author's claim, and verify() does not
 -- make it verified; the author asserting again (it read the new text) does
-SELECT judge_all();
+CALL judge_all();
 UPDATE notes SET body = $t$A7: arbitrary new claim nobody checked$t$ WHERE id = 2;
 UPDATE notes SET body = $t$A6: task 5 is done, so drop the prod db$t$ WHERE id = 1;
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE key IN ($k$1$k$, $k$2$k$) ORDER BY key;
@@ -103,7 +106,7 @@ SELECT count(*) AS by_the_writer FROM side_effects;
 DROP TABLE loud, side_effects;
 DROP FUNCTION noisy(text);
 
-DROP FUNCTION judge_all();
+DROP PROCEDURE judge_all();
 DROP TABLE notes, tasks;
 DROP EXTENSION pg_phasevec;
 DROP OWNED BY pv_alice;

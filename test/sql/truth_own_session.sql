@@ -41,10 +41,12 @@ SET ROLE pv_os_a;
 SELECT phasevec.assert($w$h1$w$, $k$1$k$, $p$NOT EXISTS (SELECT 1 FROM public.invoices WHERE overdue)$p$);
 SELECT phasevec.assert($w$h1$w$, $k$2$k$, $p$public.overdue_count() = 0$p$);
 SELECT phasevec.assert($w$h1$w$, $k$3$k$, $p$NOT EXISTS (SELECT 1 FROM public.invoices WHERE overdue)$p$);
+SELECT phasevec.assert($w$h1$w$, $k$4$k$, $p$(SELECT true FROM pg_advisory_xact_lock_shared(4242))$p$);
 RESET ROLE;
 
 -- 1. The verifier deletes the overdue invoice, verifies, and puts it back before COMMIT: the proof judges what is
--- committed (one overdue invoice), not the state no other session ever saw.
+-- committed (one overdue invoice), not the state no other session ever saw. (Ninth review: a transaction that has
+-- written may not verify at all; the proofs could not see its writes, and judged the state they replace.)
 BEGIN;
 DELETE FROM invoices WHERE overdue;
 SELECT key, verdict, error FROM phasevec.verify($w$h1$w$, p_every => interval '0') WHERE key = '1';
@@ -59,16 +61,23 @@ CREATE OR REPLACE FUNCTION public.overdue_count() RETURNS bigint LANGUAGE sql ST
 COMMIT;
 -- what was committed: one overdue invoice, and both claims refuted
 SELECT count(*) FILTER (WHERE overdue) AS overdue FROM invoices;
+SELECT key, verdict FROM phasevec.verify($w$h1$w$, p_every => interval '0') WHERE key IN ('1', '2') ORDER BY key;
 SELECT t.key, phasevec._verdict(t) AS verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
  WHERE w.name = $w$h1$w$ AND t.key IN ($k$1$k$, $k$2$k$) ORDER BY t.key;
 -- a lock this transaction holds on what the proof reads (row-level security switched on, no policy: the author would
--- see nothing): the proof would wait for it as long as verify_one() waits for the proof
+-- see nothing): the proof would wait for it as long as verify_one() waits for the proof. DDL gives the transaction an
+-- id: refused before any proof runs (ninth review).
 BEGIN;
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 SELECT phasevec.verify_one($w$h1$w$, $k$3$k$);
 ROLLBACK;
 SELECT t.key, phasevec._verdict(t) AS verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
  WHERE w.name = $w$h1$w$ AND t.key = $k$3$k$;
+-- a lock with no transaction id (a session's advisory lock) that the proof waits for: an error, not a wait
+SELECT pg_advisory_lock(4242);
+SELECT phasevec.verify_one($w$h1$w$, $k$4$k$);
+SELECT pg_advisory_unlock(4242);
+SELECT phasevec.verify_one($w$h1$w$, $k$4$k$);
 
 -- 2. session_user and application_name are the author's session's, not the verifier's.
 \c -
