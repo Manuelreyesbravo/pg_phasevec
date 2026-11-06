@@ -29,9 +29,11 @@
  *   backend, and every volatile system function no one reviewed are refused, as are pg_cursor and
  *   pg_prepared_statement, which read the session's own statements, EXPLAIN EXECUTE, which shows one, and
  *   txid_current and pg_current_xact_id, which give the session's transaction an id no rollback takes back.
- *   The session's temporary objects: pg_temp is searched last, and a temporary table or function is refused
- *   however it is reached (named, found through search_path, inherited from, inlined). Until the fourth review a
- *   verifier's temporary table named like the author's took its place in the proof.
+ *   The session's temporary objects: pg_temp is searched last, and every temporary object a query uses is refused,
+ *   by what the query depends on, however it is reached (named, found through search_path, inherited from, inside a
+ *   SQL function, in a plan cached before the guard ran: guard_analyze, guard_plan). Until the fourth review a
+ *   verifier's temporary table named like the author's took its place in the proof; until the fifth its temporary
+ *   view, type, domain or operator did.
  * - Nothing it keeps outlives what it was kept for: a guard and a pin (the settings and cursors a call reads once)
  *   end with their subtransaction and with their transaction, however they end (guard_subxact, guard_xact).
  */
@@ -39,10 +41,16 @@
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaddress.h"
 #include "catalog/objectaccess.h"
 #include "access/htup_details.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_language.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -50,7 +58,10 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "tcop/cmdtag.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -60,6 +71,7 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/plancache.h"
 #include "utils/portal.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
@@ -389,6 +401,7 @@ static uint64 xact_count = 0;
 
 static List *nondefault_names(void);
 static List *visible_portals(void);
+static void reset_plans_if_dirty(void);
 
 static void
 pop_pin(void)
@@ -569,6 +582,8 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("phasevec: code that phasevec runs is nested more than %d deep", GUARD_MAX)));
+	if (guard_depth == 0)
+		reset_plans_if_dirty();
 	BeginInternalSubTransaction(NULL);
 	L = &levels[guard_depth];
 	GetUserIdAndSecContext(&L->userid, &L->sec);
@@ -711,9 +726,478 @@ static ExecutorEnd_hook_type prev_end = NULL;
 static ProcessUtility_hook_type prev_utility = NULL;
 
 /*
- * A temporary relation is the session's, as its cursors are: whoever runs the code made it, not the code's author or
- * owner. None can be made inside a guard (it is a security-restricted operation), so every one is refused there,
- * named or found through search_path, or reached as the child of a permanent table it inherits from.
+ * The session's temporary objects are the session's, as its cursors are: whoever runs the code made them, not the
+ * code's author or owner. None can be made inside a guard (it is a security-restricted operation), and none may be
+ * used there. Until the fifth review only temporary tables and functions were refused, by the kind of range-table
+ * entry they came in: a temporary view (a subquery entry since PostgreSQL 16), a temporary type, domain, operator or
+ * collation went through, and the verifier's own objects decided a proof.
+ *
+ * So the refusal goes by what a query depends on, not by how it names it: every query parsed inside a guard
+ * (guard_analyze) is walked for the objects it uses, as PostgreSQL walks a view's query to decide whether the view is
+ * temporary (relations, views, types, domains, functions, operators, collations, and the objects regclass-like
+ * constants name), and one in a temporary schema is refused. That walk sees the query before the planner folds it:
+ * 'b'::pg_temp.e < 'a'::pg_temp.e is a constant true once planned.
+ */
+static void
+refuse_temp_object(Oid classId, Oid objectId)
+{
+	const char *kind = "object";
+	char	   *name = NULL;
+
+	switch (classId)
+	{
+		case RelationRelationId:
+			switch (get_rel_relkind(objectId))
+			{
+				case RELKIND_VIEW:
+					kind = "view";
+					break;
+				case RELKIND_SEQUENCE:
+					kind = "sequence";
+					break;
+				default:
+					kind = "table";
+					break;
+			}
+			name = get_rel_name(objectId);
+			break;
+		case TypeRelationId:
+			kind = "type";
+			name = format_type_be(objectId);
+			break;
+		case ProcedureRelationId:
+			kind = "function";
+			name = get_func_name(objectId);
+			break;
+		case OperatorRelationId:
+			{
+				HeapTuple	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(objectId));
+
+				kind = "operator";
+				if (HeapTupleIsValid(tp))
+				{
+					name = pstrdup(NameStr(((Form_pg_operator) GETSTRUCT(tp))->oprname));
+					ReleaseSysCache(tp);
+				}
+			}
+			break;
+		case CollationRelationId:
+			kind = "collation";
+			name = get_collation_name(objectId);
+			break;
+		default:
+			{
+				ObjectAddress a;
+
+				a.classId = classId;
+				a.objectId = objectId;
+				a.objectSubId = 0;
+				name = getObjectDescription(&a, true);
+			}
+			break;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot %s temporary %s \"%s\"",
+					classId == RelationRelationId ? "read" : "use", kind, name ? name : "?"),
+			 errdetail("A temporary object is the session's that runs the code, not the code's author's.")));
+}
+
+static bool
+in_temp_schema(Oid classId, Oid objectId)
+{
+	ObjectAddress a;
+	Oid			nsp;
+
+	if (objectId < FirstNormalObjectId)
+		return false;
+	a.classId = classId;
+	a.objectId = objectId;
+	a.objectSubId = 0;
+	nsp = get_object_namespace(&a);
+	return OidIsValid(nsp) && isAnyTempNamespace(nsp);
+}
+
+/* PostgreSQL 18's walk below either refuses (inside a guard) or only notes that it met one (probing, outside). */
+static bool probing = false;
+static bool probed = false;
+
+static void
+refuse_if_temp(Oid classId, Oid objectId)
+{
+	if (OidIsValid(objectId) && in_temp_schema(classId, objectId))
+	{
+		if (probing)
+			probed = true;
+		else
+			refuse_temp_object(classId, objectId);
+	}
+}
+
+#if PG_VERSION_NUM < 190000
+/*
+ * PostgreSQL 18 has no collectDependenciesOfExpr(): the same walk, over what a query can name. A type is followed to
+ * its domain's base type and its array's element type.
+ */
+static void
+refuse_temp_type(Oid typid)
+{
+	for (int depth = 0; OidIsValid(typid) && typid >= FirstNormalObjectId && depth < 16; depth++)
+	{
+		Oid			next;
+		Oid			elem = get_element_type(typid);
+
+		/* an array of a temporary type is named by its element, as PostgreSQL 19 names it */
+		refuse_if_temp(TypeRelationId, OidIsValid(elem) ? elem : typid);
+		refuse_if_temp(TypeRelationId, typid);
+		next = getBaseType(typid);
+		if (next == typid)
+			next = get_element_type(typid);
+		typid = next;
+	}
+}
+
+static void
+refuse_temp_oper(Oid opno)
+{
+	refuse_if_temp(OperatorRelationId, opno);
+	if (OidIsValid(opno))
+		refuse_if_temp(ProcedureRelationId, get_opcode(opno));
+}
+
+static bool
+temp_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+		ListCell   *lc;
+		List	   *clauses[3] = {q->sortClause, q->groupClause, q->distinctClause};
+
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+			ListCell   *c;
+
+			refuse_if_temp(RelationRelationId, rte->relid);
+			foreach(c, rte->coltypes)
+				refuse_temp_type(lfirst_oid(c));
+			foreach(c, rte->colcollations)
+				refuse_if_temp(CollationRelationId, lfirst_oid(c));
+			if (rte->rtekind == RTE_FUNCTION)
+				foreach(c, rte->functions)
+				{
+					RangeTblFunction *f = (RangeTblFunction *) lfirst(c);
+					ListCell   *t;
+
+					foreach(t, f->funccoltypes)
+						refuse_temp_type(lfirst_oid(t));
+				}
+		}
+		for (int i = 0; i < 3; i++)
+			foreach(lc, clauses[i])
+				if (IsA(lfirst(lc), SortGroupClause))
+				{
+					refuse_temp_oper(((SortGroupClause *) lfirst(lc))->eqop);
+					refuse_temp_oper(((SortGroupClause *) lfirst(lc))->sortop);
+				}
+		return query_tree_walker(q, temp_walker, context, 0);
+	}
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			refuse_temp_type(((Var *) node)->vartype);
+			refuse_if_temp(CollationRelationId, ((Var *) node)->varcollid);
+			break;
+		case T_Const:
+			{
+				Const	   *c = (Const *) node;
+
+				refuse_temp_type(c->consttype);
+				refuse_if_temp(CollationRelationId, c->constcollid);
+				if (!c->constisnull)
+					switch (c->consttype)
+					{
+						case REGCLASSOID:
+							refuse_if_temp(RelationRelationId, DatumGetObjectId(c->constvalue));
+							break;
+						case REGTYPEOID:
+							refuse_temp_type(DatumGetObjectId(c->constvalue));
+							break;
+						case REGPROCOID:
+						case REGPROCEDUREOID:
+							refuse_if_temp(ProcedureRelationId, DatumGetObjectId(c->constvalue));
+							break;
+						case REGOPEROID:
+						case REGOPERATOROID:
+							refuse_temp_oper(DatumGetObjectId(c->constvalue));
+							break;
+						case REGCOLLATIONOID:
+							refuse_if_temp(CollationRelationId, DatumGetObjectId(c->constvalue));
+							break;
+					}
+			}
+			break;
+		case T_Param:
+			refuse_temp_type(((Param *) node)->paramtype);
+			refuse_if_temp(CollationRelationId, ((Param *) node)->paramcollid);
+			break;
+		case T_FuncExpr:
+			refuse_if_temp(ProcedureRelationId, ((FuncExpr *) node)->funcid);
+			refuse_temp_type(((FuncExpr *) node)->funcresulttype);
+			refuse_if_temp(CollationRelationId, ((FuncExpr *) node)->inputcollid);
+			break;
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+			refuse_temp_oper(((OpExpr *) node)->opno);
+			refuse_temp_type(((OpExpr *) node)->opresulttype);
+			refuse_if_temp(CollationRelationId, ((OpExpr *) node)->inputcollid);
+			break;
+		case T_ScalarArrayOpExpr:
+			refuse_temp_oper(((ScalarArrayOpExpr *) node)->opno);
+			refuse_if_temp(CollationRelationId, ((ScalarArrayOpExpr *) node)->inputcollid);
+			break;
+		case T_RowCompareExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((RowCompareExpr *) node)->opnos)
+					refuse_temp_oper(lfirst_oid(lc));
+				foreach(lc, ((RowCompareExpr *) node)->inputcollids)
+					refuse_if_temp(CollationRelationId, lfirst_oid(lc));
+			}
+			break;
+		case T_Aggref:
+			refuse_if_temp(ProcedureRelationId, ((Aggref *) node)->aggfnoid);
+			refuse_temp_type(((Aggref *) node)->aggtype);
+			break;
+		case T_WindowFunc:
+			refuse_if_temp(ProcedureRelationId, ((WindowFunc *) node)->winfnoid);
+			refuse_temp_type(((WindowFunc *) node)->wintype);
+			break;
+		case T_SubscriptingRef:
+			refuse_temp_type(((SubscriptingRef *) node)->refcontainertype);
+			refuse_temp_type(((SubscriptingRef *) node)->refrestype);
+			break;
+		case T_FieldSelect:
+			refuse_temp_type(((FieldSelect *) node)->resulttype);
+			break;
+		case T_FieldStore:
+			refuse_temp_type(((FieldStore *) node)->resulttype);
+			break;
+		case T_RelabelType:
+			refuse_temp_type(((RelabelType *) node)->resulttype);
+			break;
+		case T_CoerceViaIO:
+			refuse_temp_type(((CoerceViaIO *) node)->resulttype);
+			break;
+		case T_ArrayCoerceExpr:
+			refuse_temp_type(((ArrayCoerceExpr *) node)->resulttype);
+			break;
+		case T_ConvertRowtypeExpr:
+			refuse_temp_type(((ConvertRowtypeExpr *) node)->resulttype);
+			break;
+		case T_CollateExpr:
+			refuse_if_temp(CollationRelationId, ((CollateExpr *) node)->collOid);
+			break;
+		case T_CaseExpr:
+			refuse_temp_type(((CaseExpr *) node)->casetype);
+			break;
+		case T_CaseTestExpr:
+			refuse_temp_type(((CaseTestExpr *) node)->typeId);
+			break;
+		case T_ArrayExpr:
+			refuse_temp_type(((ArrayExpr *) node)->array_typeid);
+			break;
+		case T_RowExpr:
+			refuse_temp_type(((RowExpr *) node)->row_typeid);
+			break;
+		case T_CoalesceExpr:
+			refuse_temp_type(((CoalesceExpr *) node)->coalescetype);
+			break;
+		case T_MinMaxExpr:
+			refuse_temp_type(((MinMaxExpr *) node)->minmaxtype);
+			break;
+		case T_CoerceToDomain:
+			refuse_temp_type(((CoerceToDomain *) node)->resulttype);
+			break;
+		case T_CoerceToDomainValue:
+			refuse_temp_type(((CoerceToDomainValue *) node)->typeId);
+			break;
+		case T_SetToDefault:
+			refuse_temp_type(((SetToDefault *) node)->typeId);
+			break;
+		case T_NextValueExpr:
+			refuse_if_temp(RelationRelationId, ((NextValueExpr *) node)->seqid);
+			break;
+		default:
+			break;
+	}
+	return expression_tree_walker(node, temp_walker, context);
+}
+#endif
+
+/* Does a query (or an expression with no range table) use a temporary object? Inside a guard: refused if so. */
+static bool
+temp_in(Node *node, bool refuse)
+{
+	bool		found;
+#if PG_VERSION_NUM >= 190000
+	ObjectAddresses *addrs = new_object_addresses();
+	ObjectAddress obj;
+
+	collectDependenciesOfExpr(addrs, node, NIL);
+	found = find_temp_object(addrs, false, &obj);
+	free_object_addresses(addrs);
+	if (found && refuse)
+		refuse_temp_object(obj.classId, obj.objectId);
+#else
+	probing = !refuse;
+	probed = false;
+	PG_TRY();
+	{
+		(void) temp_walker(node, NULL);
+	}
+	PG_FINALLY();
+	{
+		probing = false;
+	}
+	PG_END_TRY();
+	found = probed;
+#endif
+	return found;
+}
+
+static void
+refuse_temp_in(Node *node)
+{
+	(void) temp_in(node, true);
+}
+
+/*
+ * Out of a guard: may a plan made for this query keep something of the session's temporary objects that a guard
+ * would not see again? It may if it uses one, or if it calls a SQL function that is not phasevec's: the planner
+ * inlines such a body with no hook and folds it (see guard_needs_fmgr).
+ */
+static Oid	own_schema = InvalidOid;
+static bool sql_function(Oid fn);
+
+static bool
+calls_sql_walker(Node *node, void *context)
+{
+	Oid			fn = InvalidOid;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, calls_sql_walker, context, 0);
+	if (IsA(node, FuncExpr))
+		fn = ((FuncExpr *) node)->funcid;
+	else if (IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+		fn = get_opcode(((OpExpr *) node)->opno);
+	else if (IsA(node, ScalarArrayOpExpr))
+		fn = get_opcode(((ScalarArrayOpExpr *) node)->opno);
+	if (OidIsValid(fn) && sql_function(fn))
+	{
+		if (!OidIsValid(own_schema))
+			own_schema = get_namespace_oid("phasevec", true);
+		if (get_func_namespace(fn) != own_schema)
+			return true;
+	}
+	return expression_tree_walker(node, calls_sql_walker, context);
+}
+
+/*
+ * A plan the session made out of a guard is used inside one without being parsed again when nothing it depends on
+ * changed and the search_path matches (a function with its own SET search_path: the same inside and out): a
+ * PL/pgSQL statement or a SQL function body the verifier ran first, with its temporary objects folded in. Such a
+ * plan marks the session (plans_dirty), and before a guard runs code every cached plan is parsed again (inside it,
+ * where guard_analyze sees it). A session with no temporary object never marks itself, nor one whose plans could
+ * not keep one.
+ */
+static bool plans_dirty = false;
+
+static void
+note_plan_outside(Query *query)
+{
+	Oid			nsp;
+	Oid			toast;
+
+	if (plans_dirty)
+		return;
+	GetTempNamespaceState(&nsp, &toast);
+	if (!OidIsValid(nsp))
+		return;					/* no temporary object: nothing to keep */
+	if (temp_in((Node *) query, false) || calls_sql_walker((Node *) query, NULL))
+		plans_dirty = true;
+}
+
+static void
+reset_plans_if_dirty(void)
+{
+	if (plans_dirty)
+	{
+		ResetPlanCache();
+		plans_dirty = false;
+	}
+}
+
+static post_parse_analyze_hook_type prev_analyze = NULL;
+static planner_hook_type prev_planner = NULL;
+
+#if PG_VERSION_NUM >= 190000
+#define JUMBLE const JumbleState
+#else
+#define JUMBLE JumbleState
+#endif
+static void
+guard_analyze(ParseState *pstate, Query *query, JUMBLE *jstate)
+{
+	if (prev_analyze)
+		prev_analyze(pstate, query, jstate);
+	if (guard_depth == 0)
+	{
+		note_plan_outside(query);
+		return;
+	}
+	refuse_temp_in((Node *) query);
+	if (query->commandType == CMD_UTILITY && query->utilityStmt != NULL && IsA(query->utilityStmt, CallStmt))
+		refuse_temp_in((Node *) ((CallStmt *) query->utilityStmt)->funcexpr);
+}
+
+/*
+ * And every query planned, before the planner folds it: a SQL function body written BEGIN ATOMIC is kept parsed and
+ * is planned with no parse (it names its objects by OID).
+ */
+#if PG_VERSION_NUM >= 190000
+static PlannedStmt *
+guard_plan(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams, ExplainState *es)
+#else
+static PlannedStmt *
+guard_plan(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
+#endif
+{
+	if (guard_depth > 0)
+		refuse_temp_in((Node *) parse);
+	else
+		note_plan_outside(parse);
+#if PG_VERSION_NUM >= 190000
+	if (prev_planner)
+		return prev_planner(parse, query_string, cursorOptions, boundParams, es);
+	return standard_planner(parse, query_string, cursorOptions, boundParams, es);
+#else
+	if (prev_planner)
+		return prev_planner(parse, query_string, cursorOptions, boundParams);
+	return standard_planner(parse, query_string, cursorOptions, boundParams);
+#endif
+}
+
+/*
+ * And at the executor, what the planner added: a temporary child of a permanent table it inherits from, and any
+ * relation the plan depends on (a view is a subquery entry that keeps its relation's OID).
  */
 static void
 refuse_temp(const PlannedStmt *ps)
@@ -721,17 +1205,11 @@ refuse_temp(const PlannedStmt *ps)
 	ListCell   *lc;
 
 	foreach(lc, ps->rtable)
-	{
-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
-
-		if (rte->rtekind == RTE_RELATION && get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table \"%s\"",
-							get_rel_name(rte->relid)),
-					 errdetail("A temporary table is the session's that runs the code, not the code's author's.")));
-	}
+		refuse_if_temp(RelationRelationId, ((RangeTblEntry *) lfirst(lc))->relid);
+	foreach(lc, ps->relationOids)
+		refuse_if_temp(RelationRelationId, lfirst_oid(lc));
 }
+
 
 static void
 guard_start(QueryDesc *qd, int eflags)
@@ -927,16 +1405,35 @@ temp_function(Oid fn)
 }
 
 /*
- * Inside a guard a temporary function is never inlined (PostgreSQL does not inline a function a plugin hooks), so
- * that it is set up as a call, and refused there (guard_object_access): inlined, a SQL function's body ran as if the
- * proof had written it.
+ * Inside a guard no function that is not the system's is inlined: PostgreSQL does not inline a function a plugin
+ * hooks. A temporary function is then set up as a call, and refused there (guard_object_access): inlined, a SQL
+ * function's body ran as if the proof had written it. A SQL function's body is then parsed as its own query, where
+ * guard_analyze sees what it uses: inlined, it was parsed with no hook, and 'b'::pg_temp.e < 'a'::pg_temp.e in its
+ * body was folded to a constant before anything could see the temporary type.
  */
+static bool
+sql_function(Oid fn)
+{
+	HeapTuple	tp;
+	bool		sql = false;
+
+	if (fn < FirstNormalObjectId)
+		return false;
+	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
+	if (HeapTupleIsValid(tp))
+	{
+		sql = ((Form_pg_proc) GETSTRUCT(tp))->prolang == SQLlanguageId;
+		ReleaseSysCache(tp);
+	}
+	return sql;
+}
+
 static bool
 guard_needs_fmgr(Oid fn)
 {
 	if (prev_needs_fmgr && prev_needs_fmgr(fn))
 		return true;
-	return guard_depth > 0 && temp_function(fn);
+	return guard_depth > 0 && (temp_function(fn) || sql_function(fn));
 }
 
 static void
@@ -1044,6 +1541,10 @@ phasevec_guard_init(void)
 	object_access_hook = guard_object_access;
 	prev_needs_fmgr = needs_fmgr_hook;
 	needs_fmgr_hook = guard_needs_fmgr;
+	prev_analyze = post_parse_analyze_hook;
+	post_parse_analyze_hook = guard_analyze;
+	prev_planner = planner_hook;
+	planner_hook = guard_plan;
 	prev_start = ExecutorStart_hook;
 	ExecutorStart_hook = guard_start;
 	prev_run = ExecutorRun_hook;

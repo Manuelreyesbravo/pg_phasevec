@@ -117,15 +117,15 @@ CREATE OR REPLACE FUNCTION pg_temp.pv_t_says() RETURNS boolean LANGUAGE sql AS $
 -- (2) and prepares a statement with a secret in it
 PREPARE vstmt AS SELECT $k$sk_live_verifier-api-key$k$::text AS k, id FROM notes WHERE body <> $s$hunter2$s$;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key;
- key | verdict |                                              error                                               
------+---------+--------------------------------------------------------------------------------------------------
+ key | verdict |                                              error                                              
+-----+---------+-------------------------------------------------------------------------------------------------
  1   | refuted | 
  2   | refuted | 
  3   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table "ledger_more"
  4   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot explain a prepared statement
  5   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call txid_current()
  6   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot read temporary table "stock"
- 7   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call temporary function pv_t_says()
+ 7   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary function "pv_t_says"
 (7 rows)
 
 SELECT t.key, t.verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
