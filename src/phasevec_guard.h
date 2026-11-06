@@ -25,8 +25,8 @@ typedef enum GuardMode
 {
 	GUARD_RENDER,				/* a recipe, as the table's owner: every setting at its default, the pins on top,
 								 * FORCE ROW LEVEL SECURITY not applied to the owner (as for a foreign-key check) */
-	GUARD_AUTHOR,				/* a proof, or what its author sees: every setting at its default, the author's
-								 * recorded ones on top */
+	GUARD_AUTHOR,				/* a proof, or what its author sees, in the proof's own session (a new session of
+								 * its author): the author's recorded settings on top */
 	GUARD_READER,				/* what a reader sees of a table: the reader's own settings, the pins on top */
 	GUARD_ASIS					/* the settings as they are (the SQL of 0.14.2 to 0.19.0 proving as the caller) */
 } GuardMode;
@@ -55,19 +55,18 @@ extern int	guard_pin_settings(void);
 extern void guard_unpin_settings(int nest);
 extern bool guard_active(void);
 
-/* A verdict is judged only in a session with no temporary object (see phasevec_guard.c): ERROR otherwise. */
-extern void guard_require_no_temp(const char *what);
-
 /*
- * A verdict is judged only in a session whose custom placeholders are the author's: the first placeholder this
- * session has that the recorded state does not name (NULL: none). And whether the guard would make one it names.
+ * The proof's own session (phasevec_truth.c): this backend is one, the only kind where GUARD_AUTHOR runs. The custom
+ * placeholders a session has (sorted), and the first one it has that is neither among base nor named by env (NULL:
+ * none): one a proof, a recorded state or a recipe made, which the next claim's author may not have had.
  */
-extern const char *guard_env_misfit(const GuardEnv *env);
-extern bool guard_env_creates(const GuardEnv *env);
+extern void guard_proof_session(void);
+extern char **guard_placeholders(int *n);
+extern const char *guard_env_spent(char **base, int nbase, const GuardEnv *env);
 
 /*
- * The settings state of this session that a proof runs with: every replayable setting off its default, and every
- * custom placeholder the session has (with its value, '' if none).
+ * The settings state a proof records: what this session changed over the configuration a new session of it starts
+ * from (every replayable setting it set, every custom placeholder it made, its application_name).
  */
 extern ArrayType *guard_env_now(void);
 /* A recorded state, from its text[] (NULL: none recorded, every setting at its default). */

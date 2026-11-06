@@ -105,7 +105,8 @@ CLOSE sc;
 UNLISTEN leak;
 -- (2) A proof read and used up its verifier's open cursor (the subtransaction it ran in does not rewind a cursor
 -- opened before it), read pg_cursors and pg_prepared_statements (its verifier's statements), and said all of it in
--- its error text.
+-- its error text. (Eighth review: a proof runs in a session of its own, where its verifier's cursors and statements
+-- are not; the guard still refuses pg_cursors, pg_prepared_statements and a cursor opened before it ran.)
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, $t$note $t$ || g FROM generate_series(1, 6) g;
 SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
@@ -179,12 +180,12 @@ SELECT setval($q$pv_s_seq$q$, 40), nextval($q$pv_s_seq$q$);
 BEGIN;
 DECLARE sc CURSOR FOR SELECT s FROM secrets;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
- key | verdict |                                                error                                                 
------+---------+------------------------------------------------------------------------------------------------------
- 1   | refuted | portal "sc" cannot be run
+ key | verdict |                                           error                                           
+-----+---------+-------------------------------------------------------------------------------------------
+ 1   | refuted | cursor "sc" does not exist
  2   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call pg_cursor()
  3   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call pg_prepared_statement()
- 4   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot CLOSE cursor "sc", opened before it ran
+ 4   | refuted | cannot execute CLOSE within security-restricted operation
  5   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot run DEALLOCATE
  6   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call currval()
 (6 rows)

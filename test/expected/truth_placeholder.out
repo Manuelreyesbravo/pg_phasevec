@@ -4,7 +4,8 @@
 -- one that exists from one that does not. An author whose proof only called set_config, judged first in the same
 -- verify(), decided a later author's verdict through the row-level security policy it ran under; and a verifier's
 -- pooled connection that once ran SET LOCAL app.tenant recorded verdicts the persistent state refutes. Now a claim
--- records which placeholders its author's session had, and is judged only in a session whose placeholders are those.
+-- records which placeholders its author's session had. (Eighth review: it is judged in a session of its own, a new
+-- session of its author that has only those; a session where an earlier proof made another one is not reused.)
 \set VERBOSITY terse
 CREATE EXTENSION pg_phasevec;
 SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
@@ -97,39 +98,16 @@ SELECT key, array(SELECT e FROM unnest(proof_env) e WHERE e LIKE $l$app.%$l$) AS
  5   | {app.tenant=zeta}
 (5 rows)
 
--- 1. A routine verify() from a new session: key 1's proof makes the placeholder; no claim whose author did not have it
--- is judged after it in this session (2 and 3 stay unproven, and say why). 4 and 5 run last: the guard makes the
--- placeholder their authors had (it reads '' to 4, 'zeta' to 5).
-\c -
-SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0');
- key | verdict  |                                                                                      error                                                                                      
------+----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 1   | verified | 
- 2   | unproven | not judged in this session: it has the custom setting "app.tenant" (set in it, or once set and rolled back), which its author's session did not have; judge it in a new session
- 3   | unproven | not judged in this session: it has the custom setting "app.tenant" (set in it, or once set and rolled back), which its author's session did not have; judge it in a new session
- 4   | verified | 
- 5   | verified | 
-(5 rows)
-
-SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key::int;
- key | verdict  
------+----------
- 1   | verified
- 2   | unproven
- 3   | unproven
- 4   | verified
- 5   | verified
- 6   | unproven
-(6 rows)
-
--- the next new session judges 2 and 3 (due first: never judged), then 1 again, then 4 and 5
+-- 1. A routine verify(): key 1's proof makes the placeholder in the session it runs in; 2 and 3, whose author did not
+-- have it, are judged in a new one (2 refuted: the policy shows acme's overdue invoice). 4 and 5 run last, where the
+-- placeholder their authors had is made (it reads '' to 4, 'zeta' to 5).
 \c -
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0');
  key | verdict  | error 
 -----+----------+-------
+ 1   | verified | 
  2   | refuted  | 
  3   | verified | 
- 1   | verified | 
  4   | verified | 
  5   | verified | 
 (5 rows)
@@ -144,8 +122,30 @@ SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key::int;
  6   | unproven
 (5 rows)
 
--- 2. A pooled verifier connection that once ran SET LOCAL app.tenant: it judges only the claims whose authors had it,
--- and verify_one() of another says so rather than judge it.
+-- again, from a new session: the same
+\c -
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0');
+ key | verdict  | error 
+-----+----------+-------
+ 1   | verified | 
+ 2   | refuted  | 
+ 3   | verified | 
+ 4   | verified | 
+ 5   | verified | 
+(5 rows)
+
+SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key::int;
+ key | verdict  
+-----+----------
+ 1   | verified
+ 3   | verified
+ 4   | verified
+ 5   | verified
+ 6   | unproven
+(5 rows)
+
+-- 2. A pooled verifier connection that once ran SET LOCAL app.tenant: its placeholder is its own and decides nothing
+-- (the seventh cut judged there only the claims whose authors had it).
 \c -
 BEGIN;
 SET LOCAL app.tenant = $v$zeta$v$;
@@ -157,17 +157,21 @@ SELECT current_setting($s$app.tenant$s$, true) IS NULL AS absent;
 (1 row)
 
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0');
- key | verdict  |                                                                                      error                                                                                      
------+----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 2   | refuted  | not judged in this session: it has the custom setting "app.tenant" (set in it, or once set and rolled back), which its author's session did not have; judge it in a new session
- 3   | verified | not judged in this session: it has the custom setting "app.tenant" (set in it, or once set and rolled back), which its author's session did not have; judge it in a new session
- 1   | verified | not judged in this session: it has the custom setting "app.tenant" (set in it, or once set and rolled back), which its author's session did not have; judge it in a new session
+ key | verdict  | error 
+-----+----------+-------
+ 1   | verified | 
+ 2   | refuted  | 
+ 3   | verified | 
  4   | verified | 
  5   | verified | 
 (5 rows)
 
 SELECT phasevec.verify_one($w$notes$w$, $k$2$k$);
-ERROR:  phasevec: verify_one() does not judge key 2 in this session
+ verify_one 
+------------
+ refuted
+(1 row)
+
 SELECT phasevec.verify_one($w$notes$w$, $k$5$k$);
  verify_one 
 ------------

@@ -5,6 +5,7 @@
 -- pg_temp is searched last, and a temporary relation is refused however it is reached.
 -- (2) Its prepared statements, through EXPLAIN EXECUTE (constants and filters, in the proof's error text).
 -- (3) Its transaction's id: txid_current() and pg_current_xact_id() are stable, and gave it one.
+-- (Eighth review: a proof runs in a session of its own, where none of these is; the guard still refuses (2) and (3).)
 \set VERBOSITY terse
 CREATE EXTENSION pg_phasevec;
 SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
@@ -93,7 +94,7 @@ SELECT phasevec.assert($w$notes$w$, $k$7$k$, $p$pg_temp.pv_t_says()$p$);
 
 RESET search_path;
 RESET ROLE;
--- (sixth review) a verdict is judged only in a session with no temporary object (truth_lookup)
+-- (eighth review) a proof runs in a session of its own (a new session of its author): none of what follows is there
 DISCARD TEMP;
 -- control: no temporary table
 BEGIN;
@@ -119,22 +120,32 @@ CREATE OR REPLACE FUNCTION pg_temp.pv_t_says() RETURNS boolean LANGUAGE sql AS $
 -- (2) and prepares a statement with a secret in it
 PREPARE vstmt AS SELECT $k$sk_live_verifier-api-key$k$::text AS k, id FROM notes WHERE body <> $s$hunter2$s$;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key;
-ERROR:  phasevec: verify() does not run in a session that has temporary objects
-SELECT t.key, t.verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
- WHERE w.name = $w$notes$w$ ORDER BY t.key;
- key | verdict  
------+----------
- 1   | unproven
- 2   | unproven
- 3   | unproven
- 4   | unproven
- 5   | unproven
- 6   | unproven
- 7   | unproven
+ key | verdict |                                           error                                           
+-----+---------+-------------------------------------------------------------------------------------------
+ 1   | refuted | 
+ 2   | refuted | 
+ 3   | refuted | 
+ 4   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot explain a prepared statement
+ 5   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call txid_current()
+ 6   | refuted | relation "pg_temp.stock" does not exist
+ 7   | refuted | schema "pg_temp" does not exist
 (7 rows)
 
--- (sixth review) since then (1) is refused whole: verify() does not run in a session with temporary objects.
--- Dropped, the prepared statement (2) and the transaction's id (3) are still out of reach.
+SELECT t.key, t.verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
+ WHERE w.name = $w$notes$w$ ORDER BY t.key;
+ key | verdict 
+-----+---------
+ 1   | refuted
+ 2   | refuted
+ 3   | refuted
+ 4   | refuted
+ 5   | refuted
+ 6   | refuted
+ 7   | refuted
+(7 rows)
+
+-- every claim reads as the control's: refuted (the sixth cut refused to verify at all in a session with temporary
+-- objects). Dropped, the same.
 DISCARD TEMP;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key;
  key | verdict |                                           error                                           
@@ -145,7 +156,7 @@ SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval
  4   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot explain a prepared statement
  5   | refuted | phasevec: code that phasevec runs (a proof, a recipe) cannot call txid_current()
  6   | refuted | relation "pg_temp.stock" does not exist
- 7   | refuted | function pg_temp.pv_t_says() does not exist
+ 7   | refuted | schema "pg_temp" does not exist
 (7 rows)
 
 DEALLOCATE vstmt;

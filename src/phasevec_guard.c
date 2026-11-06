@@ -13,14 +13,12 @@
  * - A security-restricted operation and transaction_read_only: no SET ROLE, no temporary objects, no writes.
  * - A whole settings state that is not the caller's. A recipe renders with every setting that can change what a value
  *   reads, prints or computes at its default, and DateStyle ISO, TimeZone UTC, search_path pg_catalog, ... pinned on top:
- *   the same text whoever calls it from whatever session. A proof runs with every such setting at its default and its
- *   author's own on top, as recorded when it was asserted (guard_env_now): it means what it meant to its author, and the
- *   values of the verifier's settings (its text search configuration, its timezone abbreviations, a custom setting a
- *   row-level security policy reads) decide nothing. Until the third cut a claim recorded twelve named settings and
- *   every other one came from the verifier. Whether a custom placeholder exists at all is not a value a guard can set:
- *   nothing removes one from a session. A claim records which ones its author's session had, and a session that has
- *   one more does not judge it (guard_env_misfit); until the seventh review an earlier proof's set_config, or a SET
- *   LOCAL the verifier's pooled connection once ran, decided what a later proof's row-level security policy read.
+ *   the same text whoever calls it from whatever session. A proof does not run in its verifier's session at all
+ *   (0.20.0, eighth review): it runs in a session of its own, a new session of its author (phasevec_truth.c), with
+ *   what its author's session had changed on top, as recorded when it was asserted (guard_env_now). Until then it
+ *   ran in the verifier's session, and each review found one more piece of that session that decided verdicts: its
+ *   temporary objects, its settings' values, which custom placeholders it had, its uncommitted writes and DDL, its
+ *   session_user, its application_name.
  * - Nothing that existed before it is in reach. The session's open cursors: those pg_cursors lists are frozen while it
  *   runs, a query begun before it cannot be run inside it, and FETCH, MOVE and CLOSE take only cursors opened inside
  *   it (a recipe read a superuser's open cursor over a table its owner could not read, and NOTIFYed the rows out). The
@@ -36,9 +34,7 @@
  *   by what the query depends on, however it is reached (named, found through search_path, inherited from, inside a
  *   SQL function, in a plan cached before the guard ran: guard_analyze, guard_plan). Until the fourth review a
  *   verifier's temporary table named like the author's took its place in the proof; until the fifth its temporary
- *   view, type, domain or operator did. And a verdict is judged only in a session that has no temporary object at
- *   all (guard_require_no_temp): until the sixth review a name looked up while the code ran (to_regclass(text), a
- *   cast of text to regclass) found the verifier's.
+ *   view, type, domain or operator did. (A proof's own session has none.)
  * - Nothing it keeps outlives what it was kept for: a guard and a pin (the settings and cursors a call reads once)
  *   end with their subtransaction and with their transaction, however they end (guard_subxact, guard_xact).
  */
@@ -123,6 +119,25 @@ typedef struct Level
 
 static Level levels[GUARD_MAX];
 static int	guard_depth = 0;
+
+/*
+ * This backend is a proof's own session (phasevec_truth.c): the only one where a proof runs. Nothing sets a setting
+ * in it outside a guard, so the names off their default are those of its configuration, read once (a recipe's guard
+ * resets them for every row it reads).
+ */
+static bool proof_session = false;
+static List *baseline_nondefault = NIL;
+static List *nondefault_names(void);
+
+void
+guard_proof_session(void)
+{
+	MemoryContext o = MemoryContextSwitchTo(TopMemoryContext);
+
+	proof_session = true;
+	baseline_nondefault = nondefault_names();
+	MemoryContextSwitchTo(o);
+}
 
 static Portal *frozen = NULL;
 static int	nfrozen = 0;
@@ -326,6 +341,28 @@ name_cmp(const void *a, const void *b)
 	return strcmp(*(char *const *) a, *(char *const *) b);
 }
 
+/*
+ * What a proof records of its author's session (0.20.0, eighth review): what that session changed over the
+ * configuration every new session of it starts from (postgresql.conf, ALTER SYSTEM, ALTER DATABASE and ALTER ROLE
+ * ... SET), which the proof's own session (a new session of its author) has anyway. A setting counts when the
+ * session set it (SET, set_config, its startup options: a source from PGC_S_CLIENT up); a custom placeholder when the
+ * session made it (no configuration gave it a value), with its value or none ("app.tenant="). application_name too:
+ * the client named the session, and a proof or a row-level security policy may read it.
+ */
+static bool
+session_made(const struct config_generic *g)
+{
+	if (g->source >= PGC_S_CLIENT)
+		return true;
+	return placeholder(g) && (g->source == PGC_S_DEFAULT || g->source == PGC_S_DYNAMIC_DEFAULT);
+}
+
+static bool
+recorded(const struct config_generic *g)
+{
+	return replayable(g) || pg_strcasecmp(g->name, "application_name") == 0;
+}
+
 ArrayType *
 guard_env_now(void)
 {
@@ -340,8 +377,7 @@ guard_env_now(void)
 		char		buf[64];
 		const char *v;
 
-		/* every placeholder the session has, with a value or not ("app.tenant="): that it exists is recorded */
-		if (!replayable(vars[i]) || (at_default(vars[i]) && !placeholder(vars[i])))
+		if (!recorded(vars[i]) || !session_made(vars[i]))
 			continue;
 		v = value_of(vars[i], false, buf);
 		items[m++] = psprintf("%s=%s", vars[i]->name, v ? v : "");
@@ -386,35 +422,56 @@ guard_env_from(ArrayType *arr)
 	return e;
 }
 
-/*
- * A verdict is judged only in a session whose custom placeholders are the author's (the seventh review): one the
- * session has and the author's did not would read '' to the proof where it read NULL to its author, and nothing can
- * take it away. The first such one (NULL: none). Those the author had and the session has not, the guard makes,
- * which is what the author's session had; they stay in the session after it (guard_env_creates).
- */
-const char *
-guard_env_misfit(const GuardEnv *env)
+static int
+name_casecmp(const void *a, const void *b)
 {
-	int			n;
-	struct config_generic **vars = get_guc_variables(&n);
-	const char *misfit = NULL;
-
-	for (int i = 0; i < n && misfit == NULL; i++)
-		if (placeholder(vars[i]) &&
-			!named_in(vars[i]->name, env ? (const char *const *) env->name : NULL, env ? env->n : 0))
-			misfit = pstrdup(vars[i]->name);
-	pfree(vars);
-	return misfit;
+	return pg_strcasecmp(*(char *const *) a, *(char *const *) b);
 }
 
-/* Would the guard make a placeholder for this recorded state (one the author had and this session has not)? */
-bool
-guard_env_creates(const GuardEnv *env)
+/*
+ * The custom placeholders this session has, sorted (*n of them). A placeholder, once a session has it, stays: no
+ * rollback takes it away, and current_setting(name, true) then reads '' where it read NULL. The proof's own session
+ * notes those it started with (they come from the configuration, which every new session of the author has) and
+ * judges a claim only while it has no other one than those and the ones its author's session had
+ * (guard_env_spent); a session that made one more (a proof's set_config, a recorded state that names one, a
+ * recipe that set one) ends, and the next claim is judged in a new one.
+ */
+char	  **
+guard_placeholders(int *n)
 {
-	for (int i = 0; env && i < env->n; i++)
-		if (strchr(env->name[i], '.') != NULL && find_option(env->name[i], false, true, 0) == NULL)
-			return true;
-	return false;
+	int			nv;
+	struct config_generic **vars = get_guc_variables(&nv);
+	char	  **out = palloc(sizeof(char *) * Max(nv, 1));
+
+	*n = 0;
+	for (int i = 0; i < nv; i++)
+		if (placeholder(vars[i]))
+			out[(*n)++] = pstrdup(vars[i]->name);
+	pfree(vars);
+	qsort(out, *n, sizeof(char *), name_casecmp);
+	return out;
+}
+
+const char *
+guard_env_spent(char **base, int nbase, const GuardEnv *env)
+{
+	int			nv;
+	struct config_generic **vars = get_guc_variables(&nv);
+	const char *spent = NULL;
+
+	for (int i = 0; i < nv && spent == NULL; i++)
+	{
+		const char *name = vars[i]->name;
+
+		if (!placeholder(vars[i]))
+			continue;
+		if (bsearch(&name, base, nbase, sizeof(char *), name_casecmp) != NULL)
+			continue;
+		if (!named_in(name, env ? (const char *const *) env->name : NULL, env ? env->n : 0))
+			spent = pstrdup(name);
+	}
+	pfree(vars);
+	return spent;
 }
 
 static void
@@ -652,7 +709,10 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 	g->level = guard_depth;
 	guard_depth++;
 	MemoryContextSwitchTo(cxt);
-	nondefault = pin ? pin->nondefault : (mode == GUARD_RENDER || mode == GUARD_AUTHOR) ? nondefault_names() : NIL;
+	if (mode == GUARD_AUTHOR && !proof_session)
+		elog(ERROR, "phasevec: a proof runs only in a session of its own");
+	nondefault = pin ? pin->nondefault : mode != GUARD_RENDER ? NIL :
+		proof_session && guard_depth == 1 ? baseline_nondefault : nondefault_names();
 	portals = pin ? pin->portals : visible_portals();
 
 	sec = L->sec | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION;
@@ -666,13 +726,15 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 			apply_pins();
 			break;
 		case GUARD_AUTHOR:
-			to_defaults(nondefault, env ? (const char *const *) env->name : NULL, env ? env->n : 0);
+			/*
+			 * A new session of the author (the proof's own: phasevec_truth.c) with what its author's session changed
+			 * on top. Only what a claim records: a hand-edited row cannot set anything else.
+			 */
 			for (int i = 0; env && i < env->n; i++)
 			{
-				/* only what a claim records: a hand-edited row cannot set anything else */
 				struct config_generic *rec = find_option(env->name[i], false, true, 0);
 
-				if (rec == NULL ? strchr(env->name[i], '.') != NULL : replayable(rec))
+				if (rec == NULL ? strchr(env->name[i], '.') != NULL : recorded(rec))
 					set_one(env->name[i], env->value[i]);
 			}
 			break;
@@ -1239,60 +1301,6 @@ reset_plans_if_dirty(void)
 	}
 }
 
-/*
- * A verdict outlives the session that reached it: it is recorded, and served to everyone. So it is judged only in a
- * session that has no temporary object at all (the sixth review). The walk above refuses what a query names; it
- * cannot see a name looked up while the code runs: to_regclass('pg_temp.v'), a cast of text to regclass or regtype,
- * pg_input_is_valid(text, 'pg_temp.d'), set_config('default_text_search_config', 'pg_temp.cfg'), the RETURNING type
- * of JSON_VALUE ... NULL ON ERROR, a record or an array read from text. Each found the verifier's objects, and four
- * rounds of closing them one by one left the next one open. Hiding the temporary schema inside the guard
- * (SetTempNamespaceState, as a parallel worker starts) was tried and is not sound: it fails an assertion of
- * namespace.c on a server built with assertions, and a relation of the session opened inside the guard is cached
- * as another session's (its own temporary table then fails with "cannot access temporary tables of other
- * sessions"). Here nothing is hidden: there is nothing to find. Every object of the session's temporary schema
- * depends on it in pg_depend (that is how PostgreSQL drops them when the session ends), so one probe of that
- * index answers. DISCARD TEMP empties it.
- */
-static bool
-temp_objects(void)
-{
-	Oid			nsp;
-	Oid			toast;
-	Relation	dep;
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	bool		any;
-
-	GetTempNamespaceState(&nsp, &toast);
-	if (!OidIsValid(nsp))
-		return false;
-	dep = table_open(DependRelationId, AccessShareLock);
-	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(NamespaceRelationId));
-	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
-	scan = systable_beginscan(dep, DependReferenceIndexId, true, NULL, 2, key);
-	any = HeapTupleIsValid(systable_getnext(scan));
-	systable_endscan(scan);
-	table_close(dep, AccessShareLock);
-	return any;
-}
-
-void
-guard_require_no_temp(const char *what)
-{
-	if (guard_depth > 0)
-		return;					/* inside a guard none can be made, and the outermost call checked */
-	if (temp_objects())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("phasevec: %s does not run in a session that has temporary objects", what),
-				 errdetail("A proof would find them by name while it runs, and they are this session's, not its "
-						   "author's; the verdict is recorded for everyone."),
-				 errhint("Verify from a session with no temporary objects, or drop them first (DISCARD TEMP).")));
-	/* and no plan this session cached with one in it (since dropped) is used in a proof */
-	reset_plans_if_dirty();
-}
-
 static post_parse_analyze_hook_type prev_analyze = NULL;
 static planner_hook_type prev_planner = NULL;
 
@@ -1478,8 +1486,8 @@ guard_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree, Pr
 /*
  * Volatile system functions reviewed as safe in a guard: they leave nothing past its rollback (a setting goes back
  * with it, a transaction-level advisory lock is released with it) and read nothing of the session but the clock.
- * set_config of a custom name the session does not have leaves the placeholder behind (no rollback removes one): a
- * claim whose author's session did not have it is not judged in that session after it (guard_env_misfit).
+ * set_config of a custom name the session does not have leaves the placeholder behind (no rollback removes one): in
+ * a proof's own session, the next claim is judged in a new one (guard_env_spent).
  * (random() draws from the session's generator, which a guard cannot seed: setseed is refused.)
  */
 static const char *const volatile_allowed[] = {

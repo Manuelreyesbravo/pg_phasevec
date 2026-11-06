@@ -147,9 +147,9 @@ COMMENT ON COLUMN phasevec.truth.looked_at IS
 COMMENT ON COLUMN phasevec.truth.looked_for IS
     $q$The row's text hash (phasevec.sources) when verify() found it stale (looked_at); NULL when the row was gone (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.proof_env IS
-    $q$The author's settings when it asserted ("name=value": DateStyle, TimeZone, search_path, ...), and every custom placeholder its session had ("app.tenant=" for one with no value): the proof runs with them, and only in a session whose custom placeholders are those (0.20.0).$q$;
+    $q$What the author's session had changed when it asserted, over the configuration every new session of the author starts from ("name=value": DateStyle, TimeZone, search_path, application_name, ...; "app.tenant=" for a custom placeholder it made, with no value): the proof runs in a new session of its author, with these on top (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.halted IS
-    $q$The verifier's session ended while this proof ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
+    $q$The session that ran this proof ended while it ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
 
 -- A verdict judges (text, proof, author, the author's settings). Every part is framed, so no two claims read alike.
 CREATE FUNCTION phasevec._bind(p_text_hash bytea, p_proof text, p_author oid, p_env text[])
@@ -312,15 +312,14 @@ BEGIN
 END;
 $f$;
 
--- A claim whose verifier's session ended while its proof ran (src/phasevec_truth.c keeps the mark in shared memory;
--- the next verify() of the watch finds it): refuted, and not due again until asserted again. The mark names the
--- claim's key (p_key_hash, sha256 of it) and the claim (p_bind): in the third cut it named only the claim, and one
--- session that ended halted every key whose text, proof and author read alike. Recorded only by a verifier that may
--- act as the claim's author (anyone, for a claim whose author is gone): another one neither writes nor locks the
--- row (in the sixth review a role with no rights over the author held it, and the author's assert() waited).
--- A claim asserted again since the proof began (p_started) is not the one that ran: it runs. Returns 1 when
--- recorded, 0 when no such claim is left (the mark is spent either way: the caller clears it when its transaction
--- commits), -1 when this verifier may not record it (the mark stays).
+-- A claim whose proof ended the session that ran it (since the eighth review a session of the proof's own, a
+-- background worker: src/phasevec_truth.c; the verifier that sent it records this): refuted, and not due again until
+-- asserted again. It names the claim's key (p_key_hash, sha256 of it) and the claim (p_bind): in the third cut only
+-- the claim, and one session that ended halted every key whose text, proof and author read alike. Recorded only by a
+-- verifier that may act as the claim's author (anyone, for a claim whose author is gone): another one neither writes
+-- nor locks the row (in the sixth review a role with no rights over the author held it, and the author's assert()
+-- waited). A claim asserted again since the proof began (p_started) is not the one that ran: it runs. Returns 1 when
+-- recorded, 0 when no such claim is left, -1 when this verifier may not record it.
 CREATE FUNCTION phasevec._truth_halted(p_watch int, p_key_hash bytea, p_bind bytea, p_verifier oid,
                                        p_started timestamptz)
 RETURNS int LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
@@ -341,7 +340,7 @@ BEGIN
     END IF;
     UPDATE phasevec.truth t
        SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
-           last_error = $q$the verifier's session ended while this proof ran: not run again until it is asserted again$q$
+           last_error = $q$the session that ran this proof ended while it ran: not run again until it is asserted again$q$
      WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     RETURN CASE WHEN FOUND THEN 1 ELSE 0 END;

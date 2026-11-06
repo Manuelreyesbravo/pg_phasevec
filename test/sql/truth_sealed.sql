@@ -54,7 +54,8 @@ UNLISTEN leak;
 
 -- (2) A proof read and used up its verifier's open cursor (the subtransaction it ran in does not rewind a cursor
 -- opened before it), read pg_cursors and pg_prepared_statements (its verifier's statements), and said all of it in
--- its error text.
+-- its error text. (Eighth review: a proof runs in a session of its own, where its verifier's cursors and statements
+-- are not; the guard still refuses pg_cursors, pg_prepared_statements and a cursor opened before it ran.)
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, $t$note $t$ || g FROM generate_series(1, 6) g;
 SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;

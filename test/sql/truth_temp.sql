@@ -5,7 +5,9 @@
 -- to decide whether the view is temporary, and a temporary object is refused, however the query names it: directly,
 -- inside a SQL function the planner would inline (its body was parsed with no hook and folded to a constant), or in a
 -- plan the verifier's session made before the guard ran (a function with its own search_path keeps one), or in a
--- SQL function body kept parsed (BEGIN ATOMIC), which is planned with no parse.
+-- SQL function body kept parsed (BEGIN ATOMIC), which is planned with no parse. (Eighth review: a proof runs in a
+-- session of its own, which has none of the verifier's objects; the walk still guards a recipe, which renders in the
+-- session that reads or writes the row.)
 \set VERBOSITY terse
 
 CREATE EXTENSION pg_phasevec;
@@ -65,17 +67,20 @@ GRANT EXECUTE ON FUNCTION public.pv_tt_atomic() TO pv_tt_author;
 -- the verifier runs the function first: its plan is made out of the guard, with the temporary type in it, folded
 SELECT public.pv_tt_kept() AS kept_out;
 SELECT public.pv_tt_kept() AS kept_out;
-SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
+-- (eighth review) the proofs run in a session of their own (a new session of their author): the verifier's objects
+-- are not there to be found, and every claim reads as the control's (11 calls a function whose body names the
+-- verifier's temporary type by OID: another session's, refused)
+SELECT key, verdict, regexp_replace(error, $r$pg_temp_[0-9]+$r$, $r$pg_temp_N$r$) AS error
+  FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
 
 -- out of the guard the verifier uses its objects as before
 SELECT qty FROM sv;
 SELECT 'b'::pg_temp.e < 'a'::pg_temp.e AS out_of_guard;
 
--- (sixth review) Since then a verdict is judged only in a session with no temporary object (truth_lookup): above,
--- verify() refuses to run. Dropped, they may leave behind the plan the verifier's session made of pv_tt_kept() with
--- the temporary enum folded in: verify() throws away a plan the session made with one, a proof that calls the
--- function parses it again, and every claim reads as the control's.
+-- (sixth review) verify() refused to run in a session with temporary objects (truth_lookup); (eighth review) its
+-- session is not where proofs run. Dropped, they leave behind the plan the verifier's session made of pv_tt_kept()
+-- with the temporary enum folded in, which is the verifier's session's: every claim reads as the control's.
 DISCARD TEMP;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
 

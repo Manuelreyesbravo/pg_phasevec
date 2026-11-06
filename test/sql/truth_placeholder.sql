@@ -4,7 +4,8 @@
 -- one that exists from one that does not. An author whose proof only called set_config, judged first in the same
 -- verify(), decided a later author's verdict through the row-level security policy it ran under; and a verifier's
 -- pooled connection that once ran SET LOCAL app.tenant recorded verdicts the persistent state refutes. Now a claim
--- records which placeholders its author's session had, and is judged only in a session whose placeholders are those.
+-- records which placeholders its author's session had. (Eighth review: it is judged in a session of its own, a new
+-- session of its author that has only those; a session where an earlier proof made another one is not reused.)
 \set VERBOSITY terse
 
 CREATE EXTENSION pg_phasevec;
@@ -50,19 +51,19 @@ RESET ROLE;
 SELECT key, array(SELECT e FROM unnest(proof_env) e WHERE e LIKE $l$app.%$l$) AS app
   FROM phasevec.truth ORDER BY key::int;
 
--- 1. A routine verify() from a new session: key 1's proof makes the placeholder; no claim whose author did not have it
--- is judged after it in this session (2 and 3 stay unproven, and say why). 4 and 5 run last: the guard makes the
--- placeholder their authors had (it reads '' to 4, 'zeta' to 5).
+-- 1. A routine verify(): key 1's proof makes the placeholder in the session it runs in; 2 and 3, whose author did not
+-- have it, are judged in a new one (2 refuted: the policy shows acme's overdue invoice). 4 and 5 run last, where the
+-- placeholder their authors had is made (it reads '' to 4, 'zeta' to 5).
 \c -
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0');
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key::int;
--- the next new session judges 2 and 3 (due first: never judged), then 1 again, then 4 and 5
+-- again, from a new session: the same
 \c -
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0');
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key::int;
 
--- 2. A pooled verifier connection that once ran SET LOCAL app.tenant: it judges only the claims whose authors had it,
--- and verify_one() of another says so rather than judge it.
+-- 2. A pooled verifier connection that once ran SET LOCAL app.tenant: its placeholder is its own and decides nothing
+-- (the seventh cut judged there only the claims whose authors had it).
 \c -
 BEGIN;
 SET LOCAL app.tenant = $v$zeta$v$;

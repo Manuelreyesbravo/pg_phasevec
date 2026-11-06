@@ -5,6 +5,7 @@
 -- pg_temp is searched last, and a temporary relation is refused however it is reached.
 -- (2) Its prepared statements, through EXPLAIN EXECUTE (constants and filters, in the proof's error text).
 -- (3) Its transaction's id: txid_current() and pg_current_xact_id() are stable, and gave it one.
+-- (Eighth review: a proof runs in a session of its own, where none of these is; the guard still refuses (2) and (3).)
 \set VERBOSITY terse
 
 CREATE EXTENSION pg_phasevec;
@@ -44,7 +45,7 @@ SELECT phasevec.assert($w$notes$w$, $k$6$k$, $p$(SELECT qty FROM pg_temp.stock W
 SELECT phasevec.assert($w$notes$w$, $k$7$k$, $p$pg_temp.pv_t_says()$p$);
 RESET search_path;
 RESET ROLE;
--- (sixth review) a verdict is judged only in a session with no temporary object (truth_lookup)
+-- (eighth review) a proof runs in a session of its own (a new session of its author): none of what follows is there
 DISCARD TEMP;
 
 -- control: no temporary table
@@ -67,8 +68,8 @@ PREPARE vstmt AS SELECT $k$sk_live_verifier-api-key$k$::text AS k, id FROM notes
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key;
 SELECT t.key, t.verdict FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch
  WHERE w.name = $w$notes$w$ ORDER BY t.key;
--- (sixth review) since then (1) is refused whole: verify() does not run in a session with temporary objects.
--- Dropped, the prepared statement (2) and the transaction's id (3) are still out of reach.
+-- every claim reads as the control's: refuted (the sixth cut refused to verify at all in a session with temporary
+-- objects). Dropped, the same.
 DISCARD TEMP;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key;
 DEALLOCATE vstmt;

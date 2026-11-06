@@ -5,7 +5,9 @@
 -- to decide whether the view is temporary, and a temporary object is refused, however the query names it: directly,
 -- inside a SQL function the planner would inline (its body was parsed with no hook and folded to a constant), or in a
 -- plan the verifier's session made before the guard ran (a function with its own search_path keeps one), or in a
--- SQL function body kept parsed (BEGIN ATOMIC), which is planned with no parse.
+-- SQL function body kept parsed (BEGIN ATOMIC), which is planned with no parse. (Eighth review: a proof runs in a
+-- session of its own, which has none of the verifier's objects; the walk still guards a recipe, which renders in the
+-- session that reads or writes the row.)
 \set VERBOSITY terse
 CREATE EXTENSION pg_phasevec;
 SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
@@ -152,12 +154,31 @@ SELECT public.pv_tt_kept() AS kept_out;
  t
 (1 row)
 
-SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
-ERROR:  phasevec: verify() does not run in a session that has temporary objects
+-- (eighth review) the proofs run in a session of their own (a new session of their author): the verifier's objects
+-- are not there to be found, and every claim reads as the control's (11 calls a function whose body names the
+-- verifier's temporary type by OID: another session's, refused)
+SELECT key, verdict, regexp_replace(error, $r$pg_temp_[0-9]+$r$, $r$pg_temp_N$r$) AS error
+  FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
+ key | verdict  |                                             error                                             
+-----+----------+-----------------------------------------------------------------------------------------------
+ 1   | refuted  | relation "pg_temp.sv" does not exist
+ 2   | refuted  | relation "pg_temp.sv2" does not exist
+ 3   | refuted  | schema "pg_temp" does not exist
+ 4   | refuted  | schema "pg_temp" does not exist
+ 5   | refuted  | schema "pg_temp" does not exist
+ 6   | refuted  | schema "pg_temp" does not exist
+ 7   | refuted  | relation "pg_temp.sv" does not exist
+ 8   | refuted  | schema "pg_temp" does not exist
+ 9   | refuted  | type "e" does not exist
+ 10  | verified | 
+ 11  | refuted  | phasevec: code that phasevec runs (a proof, a recipe) cannot use temporary type "pg_temp_N.e"
+(11 rows)
+
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
- key | verdict 
------+---------
-(0 rows)
+ key | verdict  
+-----+----------
+ 10  | verified
+(1 row)
 
 -- out of the guard the verifier uses its objects as before
 SELECT qty FROM sv;
@@ -172,22 +193,21 @@ SELECT 'b'::pg_temp.e < 'a'::pg_temp.e AS out_of_guard;
  t
 (1 row)
 
--- (sixth review) Since then a verdict is judged only in a session with no temporary object (truth_lookup): above,
--- verify() refuses to run. Dropped, they may leave behind the plan the verifier's session made of pv_tt_kept() with
--- the temporary enum folded in: verify() throws away a plan the session made with one, a proof that calls the
--- function parses it again, and every claim reads as the control's.
+-- (sixth review) verify() refused to run in a session with temporary objects (truth_lookup); (eighth review) its
+-- session is not where proofs run. Dropped, they leave behind the plan the verifier's session made of pv_tt_kept()
+-- with the temporary enum folded in, which is the verifier's session's: every claim reads as the control's.
 DISCARD TEMP;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
- key | verdict  |                           error                           
------+----------+-----------------------------------------------------------
+ key | verdict  |                     error                     
+-----+----------+-----------------------------------------------
  1   | refuted  | relation "pg_temp.sv" does not exist
  2   | refuted  | relation "pg_temp.sv2" does not exist
- 3   | refuted  | type "pg_temp.e" does not exist
- 4   | refuted  | type "pg_temp.d" does not exist
- 5   | refuted  | operator does not exist: integer pg_temp.< integer
- 6   | refuted  | collation "pg_temp.ci" for encoding "UTF8" does not exist
+ 3   | refuted  | schema "pg_temp" does not exist
+ 4   | refuted  | schema "pg_temp" does not exist
+ 5   | refuted  | schema "pg_temp" does not exist
+ 6   | refuted  | schema "pg_temp" does not exist
  7   | refuted  | relation "pg_temp.sv" does not exist
- 8   | refuted  | type "pg_temp.e" does not exist
+ 8   | refuted  | schema "pg_temp" does not exist
  9   | refuted  | type "e" does not exist
  10  | verified | 
  11  | refuted  | function public.pv_tt_atomic() does not exist

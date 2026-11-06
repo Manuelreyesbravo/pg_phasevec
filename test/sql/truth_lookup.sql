@@ -3,9 +3,9 @@
 -- PostgreSQL 18, a regconfig or regdictionary constant; and no walk sees a name looked up while the query runs:
 -- to_regclass('pg_temp.v'), pg_input_is_valid(text, 'pg_temp.d'), to_regtypemod, a cast of text to regclass,
 -- set_config('default_text_search_config', 'pg_temp.cfg'). Each found the verifier's temporary objects, and
--- verify() recorded, brief() served, 'verified'. Now a verdict is judged only in a session with no temporary object
--- (there is nothing to find), and the walk sees the RETURNING type and those constants (a recipe runs in the
--- writer's session, which may have them).
+-- verify() recorded, brief() served, 'verified'. The sixth cut judged a verdict only in a session with no temporary
+-- object; since the eighth review a proof runs in a session of its own, which has none (there is nothing to find).
+-- The walk sees the RETURNING type and those constants (a recipe runs in the writer's session, which may have them).
 \set VERBOSITY terse
 
 CREATE EXTENSION pg_phasevec;
@@ -46,17 +46,18 @@ CREATE DOMAIN pg_temp.dj AS jsonb CHECK (jsonb_typeof(VALUE) = 'string');
 CREATE TEXT SEARCH CONFIGURATION pg_temp.cfg (COPY = simple);
 CREATE TEXT SEARCH DICTIONARY pg_temp.dict (TEMPLATE = simple, ACCEPT = false);
 GRANT SELECT ON pg_temp.sv TO pv_tl_author;
--- nothing is judged in this session; nothing is recorded, nothing is served
+-- the proofs run in a session of their own: the verifier's objects are not there, and every claim reads as the
+-- control's
 SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
 SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
 SELECT count(*) AS judged FROM phasevec.truth WHERE verdict <> $v$unproven$v$;
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;
--- in a transaction that made one and dropped it, neither (the schema is empty again)
+-- in a transaction that made one and dropped it, the same
 BEGIN;
 CREATE TEMP TABLE pv_tl_scratch (x int);
 SELECT count(*) FROM phasevec.verify($w$notes$w$, p_every => interval '0');
 ROLLBACK;
--- emptied, the same session judges as the control did
+-- emptied, the same
 DISCARD TEMP;
 SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval '0') ORDER BY key::int;
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) WHERE verdict = $v$verified$v$ ORDER BY key::int;

@@ -6,16 +6,18 @@
 #    Under READ COMMITTED the proof judged Y; the first cut recorded 'verified' for X.
 # 2. Another author asserts the same proof while it runs as the first one: the first cut kept the verdict reached
 #    with the first author's rights on the second author's claim.
-# 3. The verifier's session ends while a proof runs (here it is terminated; a proof that set transaction_timeout did
-#    it with a FATAL in the second cut): nothing of that verify() is written, and in the second cut the same claim
-#    came first again and ended every later verify() too. Now the next verify() records it refuted and runs the rest.
+# 3. The session a proof runs in ends while it runs (here it is terminated; a proof that set transaction_timeout did
+#    it with a FATAL in the second cut): in the second cut that session was the verifier's, nothing of that verify()
+#    was written, and the same claim came first again and ended every later verify() too. Since the eighth review a
+#    proof runs in a session of its own (a background worker): that one ends, the verifier records the claim refuted
+#    and halted (not run again until asserted again), and judges the rest in the same call.
 # 4. (third cut) Only that claim: not every claim of the watch with the same text, proof and author.
-# 5. (third cut) Every such mark is taken: with ten sessions ended, the ninth was dropped and its claim ran again.
-# 6. (sixth review) A mark is spent only by a verifier that may act as the claim's author, and only when the halted
-#    record commits: a verify_one() rolled back, or refused to a role that may not act as the author, erased it,
-#    and the proof that had ended a session ran again. Such a role does not hold the claim's row either: the
-#    author's assert() of that key waited on its open transaction. A claim asserted again since its proof began
-#    is not the one that ran: it runs.
+# 5. Each verify_one() halts the claim whose session ended; one that finds no background worker free records
+#    nothing, and its claim stays due (the third cut dropped a mark past the eighth ended session).
+# 6. (sixth review) A halt is recorded only by a verifier that may act as the claim's author, and only when its record
+#    commits; a role that may not act as the author holds none of its claims (the author's assert() of that key
+#    waited on its open transaction). A claim asserted again since its proof began is not the one that ran: it runs.
+# 7. (eighth review) A verifier canceled or terminated while its proof runs: the proof's session ends with it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -164,7 +166,7 @@ own=$("$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('notes', '1', 10000)")
 echo "author race: verified as its new author: $own"
 [ "$own" = "refuted" ] || { echo "not ok - the claim of the low author was not judged with its own rights"; fallas=1; }
 
-# 3. Session B holds the gate; session A verifies and is terminated inside the proof.
+# 3. Session B holds the gate; session A verifies, and the session its proof runs in is terminated inside it.
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL' &
 SELECT pg_advisory_lock(91);
 DO $$ BEGIN
@@ -181,14 +183,16 @@ for _ in $(seq 1 100); do
     [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 91 AND granted")" -gt 0 ] && break
     sleep 0.05
 done
-"$PG/psql" "${P[@]}" -c "SELECT key, verdict FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000)" >/dev/null 2>&1
+first=$("$PG/psql" "${P[@]}" -c "SELECT string_agg(key || ' ' || verdict, ', ' ORDER BY key) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000)" 2>&1)
 wait $b
+echo "ended session: that verify said: $first"
+[ "$first" = "1 refuted, 2 verified, 3 verified" ] && echo "ok - the verifier outlives the session its proof ended, and judges the rest" || { echo "not ok - the verifier did not outlive the session its proof ended"; fallas=1; }
 next=$("$PG/psql" "${P[@]}" -c "SELECT string_agg(key || ' ' || verdict, ', ' ORDER BY key) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000)")
 echo "ended session: the next verify said: $next"
 halted=$("$PG/psql" "${P[@]}" -c "SELECT verdict || ' | ' || halted || ' | ' || last_error FROM phasevec.truth WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'jobs')")
 echo "ended session: key 1 is: $halted"
 case "$next|$halted" in
-    "2 verified, 3 verified|refuted | true | "*) echo "ok - the claim whose verifier's session ended is refuted, and the others are judged" ;;
+    "2 verified, 3 verified|refuted | true | "*) echo "ok - the claim whose proof's session ended is refuted and halted, and the others are judged" ;;
     *) echo "not ok - a claim that ended its verifier's session still blocks the watch"; fallas=1 ;;
 esac
 again=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('jobs', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
@@ -221,10 +225,13 @@ wait $b
 "$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('twins', 0)" >/dev/null
 twins=$("$PG/psql" "${P[@]}" -c "SELECT string_agg(key || ' ' || verdict || CASE WHEN halted THEN ' halted' ELSE '' END, ', ' ORDER BY key) FROM phasevec.truth WHERE watch = (SELECT id FROM phasevec.watches WHERE name = 'twins')")
 echo "claims alike: $twins"
-[ "$twins" = "1 refuted halted, 2 verified, 3 verified" ] && echo "ok - only the claim whose verifier's session ended is halted" || { echo "not ok - a session that ended halted claims it never ran"; fallas=1; }
+[ "$twins" = "1 refuted halted, 2 verified, 3 verified" ] && echo "ok - only the claim whose proof's session ended is halted" || { echo "not ok - a session that ended halted claims it never ran"; fallas=1; }
 
-# 5. Ten sessions verifying ten claims of one watch end inside them. In the third cut the first verify() after took
-# eight marks and dropped the ninth, whose claim then ran again.
+# 5. Ten verify_one() calls of ten claims, each in a session of its own: as many as there are background workers
+# free wait at the gate, and the rest are told that none is free (nothing recorded: their claims stay due). Then the
+# waiting ones are ended inside their proofs: each of those claims is halted, by the verify_one() that ran it, which
+# goes on. In the third cut a mark of a verifier's ended session was dropped past the eighth, and its claim ran again.
+W5=$(mktemp -d "${TMPDIR:-/tmp}/pv-race.XXXXXX")
 pids=()
 "$PG/psql" "${P[@]}" -c "SELECT pg_advisory_lock(96), pg_sleep(30)" >/dev/null 2>&1 &
 holder=$!
@@ -233,24 +240,34 @@ for _ in $(seq 1 100); do
     sleep 0.05
 done
 for k in $(seq 1 10); do
-    "$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('pool', '$k', 30000)" >/dev/null 2>&1 &
+    "$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('pool', '$k', 30000)" >"$W5/$k" 2>&1 &
     pids+=($!)
 done
+# settled: every call either waits at the gate or has ended
 for _ in $(seq 1 200); do
-    [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND NOT granted")" -ge 10 ] && break
+    waiting=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND NOT granted")
+    nofree=$(grep -l "no background worker is free" "$W5"/* 2>/dev/null | wc -l)
+    [ $((waiting + nofree)) -ge 10 ] && break
     sleep 0.05
 done
+echo "ten verify_one(): $waiting wait in their own sessions, $nofree found no background worker free"
 "$PG/psql" "${P[@]}" -c "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND NOT granted" >/dev/null
 for p in "${pids[@]}"; do wait "$p"; done
 "$PG/psql" "${P[@]}" -c "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND objid = 96 AND granted" >/dev/null
 wait $holder
-"$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('pool', 0)" >/dev/null
-pool=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FILTER (WHERE halted) || ' halted of ' || count(*) FROM phasevec.truth WHERE watch = (SELECT id FROM phasevec.watches WHERE name = 'pool')")
-echo "ten ended sessions: $pool"
-[ "$pool" = "10 halted of 10" ] && echo "ok - every mark is taken, none is lost past the eighth" || { echo "not ok - a mark of an ended session was lost"; fallas=1; }
+pool=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FILTER (WHERE halted) || ' halted, ' || count(*) FILTER (WHERE NOT halted AND verdict = 'unproven') || ' due' FROM phasevec.truth WHERE watch = (SELECT id FROM phasevec.watches WHERE name = 'pool')")
+said=$(cat "$W5"/* | grep -c "^refuted$")
+echo "ten ended or refused: $pool; verify_one() said refuted $said times"
+[ "$pool" = "$waiting halted, $nofree due" ] && [ "$said" = "$waiting" ] && [ "$waiting" -gt 0 ] \
+    && echo "ok - every claim whose session ended is halted by its own verifier; one with no worker free stays due" \
+    || { echo "not ok - a claim whose session ended was not halted, or one not judged was recorded"; fallas=1; }
+rest=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('pool', 10, interval '0', interval '30 seconds', 20000) WHERE verdict = 'verified'")
+[ "$rest" = "$nofree" ] && echo "ok - the claims that stayed due are judged by the next verify()" || { echo "not ok - the claims that stayed due were not judged ($rest)"; fallas=1; }
+rm -rf "$W5"
 
-# 6. A verifier is terminated inside claim 1 of 'halts'; then a role that may not act as its author calls
-# verify_one() in a transaction it rolls back, and is refused it for that key, and runs verify().
+# 6. The session of claim 1 of 'halts' is terminated inside its proof (its verifier records it halted); then a role
+# that may not act as its author calls verify_one() in a transaction it rolls back, and is refused it for that key,
+# and runs verify(): the halt stays.
 end_in_gate() {  # $1 gate, $2 the verify that waits at it (terminated there)
     "$PG/psql" "${P[@]}" >/dev/null <<SQL &
 SELECT pg_advisory_lock($1);
@@ -278,8 +295,8 @@ end_in_gate 97 "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', 
 "$PG/psql" "${M[@]}" -c "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0')" >/dev/null 2>&1
 "$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000)" >/dev/null
 h1=$("$PG/psql" "${P[@]}" -c "SELECT verdict || ' | ' || halted FROM phasevec.truth WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'halts')")
-echo "mark after a rollback and a refusal: key 1 is: $h1"
-[ "$h1" = "refuted | true" ] && echo "ok - a mark outlives a rollback and a verifier that may not act as its author" || { echo "not ok - a halt mark was erased, and its claim ran again"; fallas=1; }
+echo "halt after a rollback and a refusal: key 1 is: $h1"
+[ "$h1" = "refuted | true" ] && echo "ok - a halt outlives a rollback and a verifier that may not act as its author" || { echo "not ok - a halt was erased, and its claim ran again"; fallas=1; }
 # the author asserts it again: a new mark, and that role's open transaction while the author asserts again
 "$PG/psql" "${P[@]}" -c "SELECT phasevec.assert('halts', '1', 'public.gate(97)')" >/dev/null
 end_in_gate 97 "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000)"
@@ -296,8 +313,43 @@ echo "assert while that role's transaction is open: $re"
 back=$("$PG/psql" "${P[@]}" -c "SELECT verdict FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
 [ "$back" = "verified" ] && echo "ok - asserted again after its proof began, it runs" || { echo "not ok - a claim asserted again was halted by its old mark ($back)"; fallas=1; }
 
+# 7. (eighth review) A verifier canceled (its statement_timeout) while its proof waits at a gate, and one terminated
+# there: the session of each one's proof ends with it, and nothing is recorded (the claim is not halted: its proof did
+# not end anything).
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL'
-DROP TABLE notes, jobs, twins, pool, halts;
+CREATE TABLE gated (id int PRIMARY KEY, body text);
+INSERT INTO gated VALUES (1, 'waits at the gate');
+SELECT phasevec.watch('gated', 'gated'::regclass, 'id', 'r.body', 'r1');
+SELECT phasevec.assert('gated', '1', 'public.gate(98)');
+SQL
+"$PG/psql" "${P[@]}" -c "SELECT pg_advisory_lock(98), pg_sleep(30)" >/dev/null 2>&1 &
+holder=$!
+for _ in $(seq 1 100); do
+    [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 98 AND granted")" -gt 0 ] && break
+    sleep 0.05
+done
+proofs() { "$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof'"; }
+gone() { for _ in $(seq 1 60); do [ "$(proofs)" = "0" ] && return 0; sleep 0.05; done; return 1; }
+canceled=$("$PG/psql" "${P[@]}" -c "SET statement_timeout = '1s'" -c "SELECT phasevec.verify_one('gated', '1', 20000)" 2>&1)
+echo "canceled verifier: $canceled"
+case "$canceled" in *"statement timeout"*) gone && echo "ok - a canceled verifier's proof session ends with it" || { echo "not ok - a canceled verifier left its proof's session running"; fallas=1; } ;;
+    *) echo "not ok - the verifier's statement_timeout did not cancel it"; fallas=1 ;; esac
+"$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('gated', '1', 20000)" >/dev/null 2>&1 &
+v=$!
+for _ in $(seq 1 100); do
+    [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 98 AND NOT granted")" -gt 0 ] && break
+    sleep 0.05
+done
+"$PG/psql" "${P[@]}" -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE query LIKE 'SELECT phasevec.verify_one(''gated''%' AND backend_type = 'client backend'" >/dev/null
+wait $v
+gone && echo "ok - a terminated verifier's proof session ends with it" || { echo "not ok - a terminated verifier left its proof's session running"; fallas=1; }
+"$PG/psql" "${P[@]}" -c "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND objid = 98 AND granted" >/dev/null
+wait $holder
+g=$("$PG/psql" "${P[@]}" -c "SELECT verdict || ' | ' || halted FROM phasevec.truth WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'gated')")
+[ "$g" = "unproven | false" ] && echo "ok - nothing is recorded for the claim of a verifier that ended" || { echo "not ok - a verifier that ended recorded or halted its claim ($g)"; fallas=1; }
+
+"$PG/psql" "${P[@]}" >/dev/null <<'SQL'
+DROP TABLE notes, jobs, twins, pool, halts, gated;
 DROP EXTENSION pg_phasevec;
 DROP SCHEMA pv_private CASCADE;
 DROP OWNED BY pv_race_admin, pv_race_low;
