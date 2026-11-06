@@ -1663,7 +1663,12 @@ note_set(int32 watch, const char *key, Datum hash, bool hash_null, const char *b
 /*
  * The watch trigger's reading of a row, prepared once per watch and row type (a partition has its own) and kept:
  * prepared inside the guard, as the table's owner in the pinned settings, as it always runs. A watch whose recipe,
- * key column or table owner changed is prepared again.
+ * key column or table owner changed is prepared again, and so is one whose table's columns changed: the plan binds
+ * them. "(SELECT ($2).*) r" is expanded by column number when it is parsed, and the composite parameter gives the
+ * plan cache no dependency on the table, so in the fifth cut a session that wrote before a RENAME, DROP and ADD, or
+ * ALTER COLUMN TYPE kept hashing the old column (a changed row stayed 'fresh'), or failed every later write with
+ * "attribute N has wrong type", until it reconnected. The plan is kept with the row type it was parsed for (names,
+ * types, typmods, collations, dropped columns: equalRowTypes), and parsed again when the table's is another.
  */
 typedef struct ObserveKey
 {
@@ -1677,13 +1682,14 @@ typedef struct ObservePlans
 	Oid			relowner;
 	char	   *key_col;
 	char	   *recipe;
+	TupleDesc	desc;			/* the table's columns when it was parsed */
 	SPIPlanPtr	plan[2];		/* the old row's key; the new row's keys, text and hash */
 } ObservePlans;
 
 static HTAB *observe_plans = NULL;
 
 static SPIPlanPtr
-observe_plan(const Target *t, Oid rowtype, bool new_row)
+observe_plan(const Target *t, Oid rowtype, TupleDesc desc, bool new_row)
 {
 	ObserveKey	k;
 	ObservePlans *e;
@@ -1705,11 +1711,14 @@ observe_plan(const Target *t, Oid rowtype, bool new_row)
 	if (!found)
 	{
 		e->key_col = e->recipe = NULL;
+		e->desc = NULL;
 		e->plan[0] = e->plan[1] = NULL;
 	}
-	if (e->key_col == NULL || e->recipe == NULL || e->relowner != t->relowner ||
-		strcmp(e->key_col, t->key_col) != 0 || strcmp(e->recipe, t->recipe) != 0)
+	if (e->key_col == NULL || e->recipe == NULL || e->desc == NULL || e->relowner != t->relowner ||
+		strcmp(e->key_col, t->key_col) != 0 || strcmp(e->recipe, t->recipe) != 0 || !equalRowTypes(e->desc, desc))
 	{
+		MemoryContext o;
+
 		for (int i = 0; i < 2; i++)
 			if (e->plan[i] != NULL)
 				SPI_freeplan(e->plan[i]);
@@ -1718,10 +1727,16 @@ observe_plan(const Target *t, Oid rowtype, bool new_row)
 			pfree(e->key_col);
 		if (e->recipe)
 			pfree(e->recipe);
+		if (e->desc)
+			FreeTupleDesc(e->desc);
 		e->key_col = e->recipe = NULL;
+		e->desc = NULL;
 		e->relowner = t->relowner;
 		e->key_col = MemoryContextStrdup(TopMemoryContext, t->key_col);
 		e->recipe = MemoryContextStrdup(TopMemoryContext, t->recipe);
+		o = MemoryContextSwitchTo(TopMemoryContext);
+		e->desc = CreateTupleDescCopy(desc);
+		MemoryContextSwitchTo(o);
 	}
 	if (new_row)
 		return kept_plan(&e->plan[1], psprintf(OBSERVE_SQL, t->key_col, t->key_col, t->recipe), 2, at);
@@ -1794,7 +1809,7 @@ phasevec_observe(PG_FUNCTION_ARGS)
 			av[0] = oldt ? heap_copy_tuple_as_datum(oldt, desc) : (Datum) 0;
 			av[1] = newt ? heap_copy_tuple_as_datum(newt, desc) : (Datum) 0;
 			guard_enter(&g, t.relowner, GUARD_RENDER, NULL);
-			if (SPI_execute_plan(observe_plan(&t, rowtype, newt != NULL), av, nulls, true, 1)
+			if (SPI_execute_plan(observe_plan(&t, rowtype, desc, newt != NULL), av, nulls, true, 1)
 				!= SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "phasevec: the row could not be read");
 			o = MemoryContextSwitchTo(keep);
