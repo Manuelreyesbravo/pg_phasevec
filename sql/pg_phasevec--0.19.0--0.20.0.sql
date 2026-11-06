@@ -102,6 +102,22 @@
 --    verifier.
 -- 24. Two verify() of one watch deadlocked on verdict rows under writes, and the aborted call lost every verdict it
 --    had reached. verify() takes each claim's row before judging it, or leaves it to whoever holds it.
+--
+-- Then a sixth adversarial review ran attacks against the sixth cut (78e1e89, never released):
+--
+-- 25. The verifier's temporary objects decided proofs through names looked up while they run (to_regclass, a cast of
+--    text to regclass, pg_input_is_valid, set_config of default_text_search_config) and through the RETURNING type
+--    of JSON_VALUE and JSON_QUERY; on PostgreSQL 18 also through a regconfig or regdictionary constant. verify() and
+--    verify_one() run only in a session with no temporary object; the walk sees those types and constants
+--    (src/phasevec_guard.c).
+-- 26. A halt mark was cleared before its record was written, in the caller's transaction: a rollback, or a
+--    verify_one() refused to a role that may not act as the author, erased it, and that role held the claim's row.
+--    It is cleared when the record commits, by a verifier that may act as the author (_truth_halted's p_verifier).
+-- 27. On a partition whose columns stand in another order the watch trigger rendered a whole-row recipe in the
+--    partition's order. It reads a partition's row as one of the watch's table.
+-- 28. verify() wrote 'unproven' over the verdict of a claim whose row said something else when it looked, and the
+--    verdict stayed when the text came back. It leaves the verdict and records that it looked (truth.looked_at,
+--    looked_for).
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
