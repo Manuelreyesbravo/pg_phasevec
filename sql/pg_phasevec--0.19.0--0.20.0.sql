@@ -67,6 +67,26 @@
 -- 13. _note() checked that its caller wrote the watched table at all: a writer limited by row-level security, or
 --    with UPDATE on one unrelated column, forged, invented or forgot every key of the watch. The watch trigger is C
 --    now and renders the row it fires for; _note() is gone.
+--
+-- Then a third adversarial review ran attacks against the third cut (ee1ec24, never released). The guard is now a
+-- sealed room (src/phasevec_guard.c), and the doors compute over what their caller sees:
+--
+-- 14. A recipe had no subtransaction of its own: it read its caller's open cursor (a superuser's, over a table its
+--    owner could not read) and NOTIFYed the rows out at the caller's COMMIT; a proof read, used up and printed its
+--    verifier's open cursor. Each guard is a subtransaction, always rolled back; the session's cursors are frozen
+--    while it runs; only a reviewed few commands and volatile system functions run in it.
+-- 15. A claim recorded twelve named settings; every other one (text search configuration, timezone abbreviations,
+--    transform_null_equals, row_security, a custom setting a policy reads) came from the verifier and decided the
+--    verdict. A claim records every setting that changes meaning and is off its default; a proof and a recipe start
+--    from the defaults.
+-- 16. recall()'s disputed_by named keys of rows the caller does not see; replacement() followed a chain through such
+--    a row and showed its reason. Each _door_* takes the caller's visible keys (p_visible) and computes over them.
+-- 17. A verifier in REPEATABLE READ judged against its first snapshot and recorded the verdict as reached now. verify()
+--    judges at READ COMMITTED, and verified_at is when the row was read (_truth_set's p_at).
+-- 18. One ended verifier halted every claim that read alike, and past eight ended sessions a mark was dropped. The mark
+--    names the claim's key (_truth_halted's p_key_hash); every mark is taken.
+-- 19. A watch over a FORCE ROW LEVEL SECURITY table rendered nothing as its owner; a key column that is not unique let
+--    a writer forget another's key. The owner renders without FORCE; watch() needs a unique key.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -208,15 +228,17 @@ $f$;
 
 -- Record what a proof's run found, only for the claim it judged (p_bind: the same text, proof, author and settings).
 -- Anything else changed meanwhile: nothing is recorded. p_outcome NULL records nothing (the row moved while the
--- proof ran). Returns the verdict as it reads now.
+-- proof ran). p_at: when the row was read for it, the state it judged (verified_at). Returns the verdict as it
+-- reads now.
 DROP FUNCTION phasevec._truth_set(int, text, boolean, text);
-CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_error text, p_bind bytea)
+CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_error text, p_bind bytea,
+                                    p_at timestamptz)
 RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE v text;
 BEGIN
     IF p_outcome IS NOT NULL THEN
         UPDATE phasevec.truth t
-           SET verdict = p_outcome, verified_at = now(), last_error = p_error, halted = false,
+           SET verdict = p_outcome, verified_at = coalesce(p_at, now()), last_error = p_error, halted = false,
                verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
@@ -227,13 +249,16 @@ END;
 $f$;
 
 -- A claim whose verifier's session ended while its proof ran (src/phasevec_truth.c keeps the mark in shared memory;
--- the next verify() of the watch finds it): refuted, and not due again until asserted again.
-CREATE FUNCTION phasevec._truth_halted(p_watch int, p_bind bytea)
+-- the next verify() of the watch finds it): refuted, and not due again until asserted again. The mark names the
+-- claim's key (p_key_hash, sha256 of it) and the claim (p_bind): in the third cut it named only the claim, and one
+-- session that ended halted every key whose text, proof and author read alike.
+CREATE FUNCTION phasevec._truth_halted(p_watch int, p_key_hash bytea, p_bind bytea)
 RETURNS void LANGUAGE sql SET search_path = pg_catalog, pg_temp AS $f$
     UPDATE phasevec.truth t
        SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
            last_error = $q$the verifier's session ended while this proof ran: not run again until it is asserted again$q$
      WHERE t.watch = p_watch AND t.verdict <> $q$replaced$q$
+       AND sha256(convert_to(t.key, $q$UTF8$q$)) = p_key_hash
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
 $f$;
 
@@ -392,6 +417,14 @@ BEGIN
                    AND a.attnum > 0 AND NOT a.attisdropped) THEN
         RAISE EXCEPTION 'phasevec: % has no column %', p_source, p_key;
     END IF;
+    -- A key names one row (0.20.0): with two rows under one key, a writer who could see and delete only its own
+    -- forgot the other's, with its verdict.
+    IF NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attname = p_key
+                    WHERE i.indrelid = p_source AND i.indisunique AND i.indnkeyatts = 1
+                      AND i.indkey[0] = a.attnum AND i.indpred IS NULL AND i.indexprs IS NULL) THEN
+        RAISE EXCEPTION 'phasevec: % is not a key of %: a watch needs a column with a unique index of its own', p_key, p_source
+            USING HINT = 'A PRIMARY KEY or a UNIQUE constraint on that column alone.';
+    END IF;
     SELECT id INTO rid FROM phasevec.readers WHERE name = p_reader;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'phasevec: no reader named %', p_reader
@@ -443,18 +476,23 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_brief$q$ LANGUAGE C STABLE;
 
 -- 12. recall(), disputes(), replacement(), truth_coverage(): the same signatures and grants, now one C door that
 -- shows a watch only to a role that may SELECT its table, and runs the body (phasevec._door_<name>) as the owner.
-CREATE FUNCTION phasevec._door_recall(p_watch text, p_question text, p_k int, p_partial boolean)
+-- p_visible (the last argument of each _door_*): the keys of the rows the caller sees when row-level security filters
+-- them, NULL when it does not. The body computes over those keys only, so no field (disputed_by, a reason, a count)
+-- carries a row the caller does not see.
+CREATE FUNCTION phasevec._door_recall(p_watch text, p_question text, p_k int, p_partial boolean, p_visible text[])
 RETURNS TABLE (key text, score double precision, adjusted double precision, verdict text, support jsonb,
                verified_at timestamptz, topic text, disputed_by text[], usefulness integer, state text)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     WITH w AS (SELECT (phasevec._watch(p_watch)).id AS id),
-    hits AS (SELECT * FROM phasevec.search(p_watch, p_question, least(p_k * 3, 1000), p_partial)),
+    hits AS (SELECT * FROM phasevec.search(p_watch, p_question, least(p_k * 3, 1000), p_partial) x
+              WHERE p_visible IS NULL OR x.key = ANY (p_visible)),
     th AS (SELECT h.key, t.topic AS tp, t.support AS sp, t.verified_at AS va,
                   coalesce(phasevec._verdict(t), $q$unproven$q$) AS v
              FROM hits h CROSS JOIN w LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = h.key),
     vivas AS (SELECT t.topic, t.key, s.text_hash FROM phasevec.truth t CROSS JOIN w
                 JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
                WHERE t.watch = w.id AND t.topic IN (SELECT th.tp FROM th WHERE th.tp IS NOT NULL)
+                 AND (p_visible IS NULL OR t.key = ANY (p_visible))
                  AND phasevec._verdict(t) IN ($q$verified$q$, $q$unproven$q$)),
     disp AS (SELECT a.key, array_agg(b.key ORDER BY b.key) AS keys
                FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key <> a.key AND b.text_hash <> a.text_hash
@@ -471,19 +509,21 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
      ORDER BY 3 DESC NULLS LAST, (th.v = $q$verified$q$) DESC, h.key
      LIMIT p_k
 $f$;
-CREATE FUNCTION phasevec._door_disputes(p_watch text)
+CREATE FUNCTION phasevec._door_disputes(p_watch text, p_visible text[])
 RETURNS TABLE (topic text, key_a text, key_b text)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     WITH vivas AS (
         SELECT t.topic, t.key, s.text_hash FROM phasevec.truth t
           JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
          WHERE t.watch = (phasevec._watch(p_watch)).id AND t.topic IS NOT NULL
+           AND (p_visible IS NULL OR t.key = ANY (p_visible))
            AND phasevec._verdict(t) IN ($q$verified$q$, $q$unproven$q$))
     SELECT a.topic, a.key, b.key FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key > a.key
      WHERE a.text_hash <> b.text_hash
      ORDER BY 1, 2, 3
 $f$;
-CREATE FUNCTION phasevec._door_replacement(p_watch text, p_key text)
+-- A chain is followed only through rows the caller sees: it ends before the first one it does not.
+CREATE FUNCTION phasevec._door_replacement(p_watch text, p_key text, p_visible text[])
 RETURNS TABLE (step integer, key text, reason text)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     WITH RECURSIVE c(step, key, reason, seen) AS (
@@ -491,16 +531,17 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
       UNION ALL
         SELECT c.step + 1, t.replaced_by, t.reason, c.seen || t.replaced_by
           FROM c JOIN phasevec.truth t ON t.watch = (phasevec._watch(p_watch)).id AND t.key = c.key
-         WHERE t.verdict = $q$replaced$q$ AND c.step < 50 AND NOT t.replaced_by = ANY (c.seen))
+         WHERE t.verdict = $q$replaced$q$ AND c.step < 50 AND NOT t.replaced_by = ANY (c.seen)
+           AND (p_visible IS NULL OR t.replaced_by = ANY (p_visible)))
     SELECT step, key, reason FROM c ORDER BY step
 $f$;
-CREATE FUNCTION phasevec._door_truth_coverage(p_watch text)
+CREATE FUNCTION phasevec._door_truth_coverage(p_watch text, p_visible text[])
 RETURNS TABLE (verdict text, n bigint)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT coalesce(phasevec._verdict(t), $q$unproven$q$) AS verdict, count(*)
       FROM phasevec.sources s
       LEFT JOIN phasevec.truth t ON t.watch = s.watch AND t.key = s.key
-     WHERE s.watch = (phasevec._watch(p_watch)).id
+     WHERE s.watch = (phasevec._watch(p_watch)).id AND (p_visible IS NULL OR s.key = ANY (p_visible))
      GROUP BY 1 ORDER BY 1
 $f$;
 CREATE OR REPLACE FUNCTION phasevec.recall(p_watch text, p_question text, p_k int DEFAULT 10, p_partial boolean DEFAULT false)
@@ -524,10 +565,10 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
 REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_text_changed(),
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
-    phasevec._truth_set(int, text, text, text, bytea), phasevec._truth_halted(int, bytea),
+    phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea),
     phasevec._note_set(int, text, bytea, text), phasevec.adopt(text, regrole, text[], text[]),
-    phasevec._door_recall(text, text, int, boolean), phasevec._door_disputes(text),
-    phasevec._door_replacement(text, text), phasevec._door_truth_coverage(text)
+    phasevec._door_recall(text, text, int, boolean, text[]), phasevec._door_disputes(text, text[]),
+    phasevec._door_replacement(text, text, text[]), phasevec._door_truth_coverage(text, text[])
   FROM PUBLIC;
 -- 6 and 7: closed to PUBLIC. brief() calls _brief_keys() as the owner: whoever may brief is granted brief() only.
 REVOKE ALL ON FUNCTION phasevec._forget(int, text) FROM PUBLIC;
@@ -549,6 +590,25 @@ BEGIN
                   WHERE s.text_hash IS DISTINCT FROM r.text_hash LOOP
             PERFORM phasevec._note_set(w.id, x.key, x.text_hash, x.body);
         END LOOP;
+    END LOOP;
+END
+$d$;
+
+-- A key names one row: watch() refuses a key column without a unique index of its own (0.20.0). A watch made before
+-- keeps working, but with two rows under one key they share one verdict, and a writer who deletes its own row (one
+-- row-level security lets it see) forgets the other's. Each such watch is named here.
+DO $d$
+DECLARE
+    w record;
+BEGIN
+    FOR w IN SELECT x.name, x.source, x.key_col FROM phasevec.watches x
+              WHERE NOT EXISTS (SELECT 1 FROM pg_index i
+                                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attname = x.key_col
+                                 WHERE i.indrelid = x.source AND i.indisunique AND i.indnkeyatts = 1
+                                   AND i.indkey[0] = a.attnum AND i.indpred IS NULL AND i.indexprs IS NULL)
+              ORDER BY x.id LOOP
+        RAISE WARNING 'phasevec: watch % reads % by %, which is not unique there', w.name, w.source, w.key_col
+            USING HINT = 'Add a UNIQUE constraint on that column alone: two rows under one key share one verdict.';
     END LOOP;
 END
 $d$;

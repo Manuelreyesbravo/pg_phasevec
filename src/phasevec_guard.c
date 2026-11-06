@@ -1,92 +1,105 @@
 /*
  * pg_phasevec 0.20.0: the one way phasevec runs code that is not its own (see phasevec_guard.h).
  *
- * What a guard is, and why each part:
+ * The guard is a sealed room. What it is, and why each part:
  *
+ * - Its own subtransaction, always rolled back: whatever the code queued, took or set (a NOTIFY, a lock, a setting, a
+ *   cursor) ends with it. Until the third cut of 0.20.0 a recipe ran with no subtransaction, and a NOTIFY it queued
+ *   went out with its caller's COMMIT.
  * - One role, named by the caller of guard_enter: the table's owner for a recipe (as PostgreSQL runs an index
- *   expression in VACUUM, ANALYZE or REINDEX), the author for a proof, the reader for "which rows may I see". Code
- *   never runs with the rights of whoever happened to call phasevec (a superuser reading a brief made a table owner
- *   superuser through a cast the owner wrote).
- * - A security-restricted operation and transaction_read_only: no SET ROLE, no temporary objects, no PREPARE, LISTEN
- *   or DISCARD, no writes.
- * - A GUC nest level, rolled back as an abort rolls it back (AtEOXact_GUC(false)), with the settings that change how
- *   a value reads or prints pinned: a recipe renders the same text whoever calls it from whatever session (a writer
- *   in another TimeZone made a row print as the text its author had vouched for), and a proof means what it meant
- *   to its author (its settings are recorded with the claim). Nothing a proof sets survives it.
- * - The session's own state is out of reach. Its timeouts cannot be changed (a proof that set transaction_timeout
- *   ended the verifier's connection with a FATAL before any verdict was written, and every later verify() of the
- *   watch died the same way): each timeout setting's check hook refuses while a guard is open. Functions that change
- *   the session and are not undone by a rollback cannot be called (session-level advisory locks: a proof released
- *   the verifier's own; setseed: a proof chose the verifier's random(); pg_cancel_backend and pg_terminate_backend):
- *   the object access hook refuses them while a guard is open.
+ *   expression in VACUUM, ANALYZE or REINDEX, and with FORCE ROW LEVEL SECURITY not applied to it, as for a foreign-key
+ *   check), the author for a proof, the reader for "which rows may I see". Code never runs with the rights of whoever
+ *   happened to call phasevec (a superuser reading a brief made a table owner superuser through a cast the owner wrote).
+ * - A security-restricted operation and transaction_read_only: no SET ROLE, no temporary objects, no writes.
+ * - A whole settings state that is not the caller's. A recipe renders with every setting that can change what a value
+ *   reads, prints or computes at its default, and DateStyle ISO, TimeZone UTC, search_path pg_catalog, ... pinned on top:
+ *   the same text whoever calls it from whatever session. A proof runs with every such setting at its default and its
+ *   author's own on top, as recorded when it was asserted (guard_env_now): it means what it meant to its author, and the
+ *   verifier's settings (its text search configuration, its timezone abbreviations, a custom setting a row-level
+ *   security policy reads) decide nothing. Until the third cut a claim recorded twelve named settings and every other one
+ *   came from the verifier.
+ * - Nothing that existed before it is in reach. The session's open cursors: those pg_cursors lists are frozen while it
+ *   runs, a query begun before it cannot be run inside it, and FETCH, MOVE and CLOSE take only cursors opened inside
+ *   it (a recipe read a superuser's open cursor over a table its owner could not read, and NOTIFYed the rows out). The
+ *   session's timeouts and exit_on_error cannot be changed (a proof that set transaction_timeout ended the verifier's
+ *   connection with a FATAL). Of the commands, only SET, SHOW, EXPLAIN, DECLARE, FETCH, MOVE, CLOSE, CALL and DO run:
+ *   NOTIFY, LISTEN, PREPARE, DISCARD, LOAD and the rest are refused. Of the system's own functions, every one that
+ *   only reads (stable or immutable) runs, and of the volatile ones only a reviewed few (the clock, sleep, random
+ *   numbers, set_config): pg_notify, the advisory locks, setseed, currval, the large-object descriptors, signalling a
+ *   backend, and every volatile system function no one reviewed are refused, as are pg_cursor and
+ *   pg_prepared_statement, which read the session's own statements.
  */
 #include "postgres.h"
 
+#include "access/transam.h"
+#include "access/xact.h"
 #include "catalog/objectaccess.h"
+#include "access/htup_details.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
+#include "funcapi.h"
 #include "miscadmin.h"
-#include "utils/fmgrtab.h"
+#include "nodes/execnodes.h"
+#include "nodes/parsenodes.h"
+#include "tcop/cmdtag.h"
+#include "tcop/utility.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/portal.h"
+#include "utils/resowner.h"
+#include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 #include "phasevec_guard.h"
 
-const char *const phasevec_env_names[PHASEVEC_ENV_N] = {
+/* ------------------------------------------------------------------------------------------- the pins -- */
+
+#define NPINS 14
+static const char *const pin_name[NPINS] = {
 	"DateStyle", "IntervalStyle", "TimeZone", "extra_float_digits", "bytea_output", "search_path",
-	"lc_monetary", "lc_numeric", "lc_time", "standard_conforming_strings", "xmloption", "xmlbinary"
+	"lc_monetary", "lc_numeric", "lc_time", "standard_conforming_strings", "xmloption", "xmlbinary",
+	"timezone_abbreviations", "row_security"
 };
-const char *const phasevec_env_canon[PHASEVEC_ENV_N] = {
+static const char *const pin_value[NPINS] = {
 	"ISO, MDY", "postgres", "UTC", "1", "hex", "pg_catalog, pg_temp",
-	"C", "C", "C", "on", "content", "base64"
+	"C", "C", "C", "on", "content", "base64",
+	"Default", "on"
 };
 
+/* ----------------------------------------------------------------------------------- the guard stack -- */
+
+#define GUARD_MAX 32
+
+typedef struct Level
+{
+	Oid			userid;			/* who was acting before */
+	int			sec;
+	MemoryContext cxt;			/* the caller's memory context and resource owner */
+	ResourceOwner owner;
+	SubTransactionId subid;		/* the guard's subtransaction */
+	MemoryContext subcxt;		/* its CurTransactionContext */
+	List	   *started;		/* the queries begun inside it */
+	int			frozen_base;	/* its frozen cursors start here */
+} Level;
+
+static Level levels[GUARD_MAX];
 static int	guard_depth = 0;
+
+static Portal *frozen = NULL;
+static int	nfrozen = 0;
+static int	frozen_cap = 0;
 
 bool
 guard_active(void)
 {
 	return guard_depth > 0;
-}
-
-/* ------------------------------------------------------------------------------------------ the settings -- */
-
-static void
-apply_setting(const char *name, const char *value)
-{
-	const char *now = GetConfigOption(name, true, false);
-
-	if (now != NULL && strcmp(now, value) == 0)
-		return;
-	(void) set_config_option(name, value, superuser() ? PGC_SUSET : PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
-}
-
-void
-guard_enter(Guard *g, Oid role, const char *const *values)
-{
-	GetUserIdAndSecContext(&g->userid, &g->sec);
-	g->depth = guard_depth;
-	g->nest = NewGUCNestLevel();
-	SetUserIdAndSecContext(role, g->sec | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
-	for (int i = 0; i < PHASEVEC_ENV_N; i++)
-	{
-		const char *v = values ? values[i] : phasevec_env_canon[i];
-
-		if (v != NULL)
-			apply_setting(phasevec_env_names[i], v);
-	}
-	/* LOCAL (it cannot be SAVEd): the abort-style rollback of the nest level takes it back all the same */
-	(void) set_config_option("transaction_read_only", "on", PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_LOCAL, true, 0, false);
-	guard_depth = g->depth + 1;
-}
-
-void
-guard_leave(Guard *g)
-{
-	guard_depth = g->depth;
-	AtEOXact_GUC(false, g->nest);
-	SetUserIdAndSecContext(g->userid, g->sec);
 }
 
 int
@@ -95,109 +108,668 @@ guard_mark(void)
 	return guard_depth;
 }
 
-void
-guard_unwind_to(int mark)
+/* ------------------------------------------------------------------------------------------- settings -- */
+
+#if PG_VERSION_NUM >= 190000
+#define G_BOOL(g) (&(g)->_bool)
+#define G_INT(g) (&(g)->_int)
+#define G_REAL(g) (&(g)->_real)
+#define G_STR(g) (&(g)->_string)
+#define G_ENUM(g) (&(g)->_enum)
+#define ENUM_NAME(g, v) config_enum_lookup_by_value((g), (v))
+#else
+#define G_BOOL(g) ((struct config_bool *) (g))
+#define G_INT(g) ((struct config_int *) (g))
+#define G_REAL(g) ((struct config_real *) (g))
+#define G_STR(g) ((struct config_string *) (g))
+#define G_ENUM(g) ((struct config_enum *) (g))
+#define ENUM_NAME(g, v) config_enum_lookup_by_value((struct config_enum *) (g), (v))
+#endif
+
+/*
+ * Settings a claim records and a guard sets: every one a user can set (USERSET or SUSET, and RESET ALL resets) of the
+ * groups that decide what a value reads, prints or computes (statement behavior, locale and formatting, compatibility,
+ * other client defaults) and every custom one (a placeholder such as app.tenant, an extension's). Not resources,
+ * planner, logging, statistics, replication or connections: they change how fast or where, not what. Of the kept
+ * groups, not those below: the session's timeouts (a guard refuses them), how messages reach the client (and in which
+ * language), and where libraries and extensions are found.
+ */
+static const char *const not_replayed[] = {
+	"client_encoding", "client_min_messages", "lc_messages", "statement_timeout", "lock_timeout", "transaction_timeout",
+	"idle_in_transaction_session_timeout", "idle_session_timeout", "dynamic_library_path", "extension_control_path"
+};
+
+static bool
+replayable(const struct config_generic *g)
 {
-	guard_depth = mark;
+	if (g->context != PGC_USERSET && g->context != PGC_SUSET)
+		return false;
+	if (g->flags & (GUC_NO_RESET | GUC_NO_RESET_ALL | GUC_NOT_WHILE_SEC_REST))
+		return false;
+	switch (g->group)
+	{
+		case CLIENT_CONN_STATEMENT:
+		case CLIENT_CONN_LOCALE:
+		case CLIENT_CONN_OTHER:
+		case COMPAT_OPTIONS_PREVIOUS:
+		case COMPAT_OPTIONS_OTHER:
+		case CUSTOM_OPTIONS:
+			break;
+		default:
+			return false;
+	}
+	if (pg_strncasecmp(g->name, "phasevec.", 9) == 0)
+		return false;
+	for (int i = 0; i < (int) lengthof(not_replayed); i++)
+		if (pg_strcasecmp(g->name, not_replayed[i]) == 0)
+			return false;
+	return true;
+}
+
+/* A setting's value as text, current or default (NULL: a string default that is NULL). buf: 64 bytes. */
+static const char *
+value_of(const struct config_generic *g, bool boot, char *buf)
+{
+	struct config_generic *gg = unconstify(struct config_generic *, g);
+
+	switch (g->vartype)
+	{
+		case PGC_BOOL:
+			return (boot ? G_BOOL(gg)->boot_val : *G_BOOL(gg)->variable) ? "on" : "off";
+		case PGC_INT:
+			snprintf(buf, 64, "%d", boot ? G_INT(gg)->boot_val : *G_INT(gg)->variable);
+			return buf;
+		case PGC_REAL:
+			snprintf(buf, 64, "%.17g", boot ? G_REAL(gg)->boot_val : *G_REAL(gg)->variable);
+			return buf;
+		case PGC_STRING:
+			{
+				const char *s = boot ? G_STR(gg)->boot_val : *G_STR(gg)->variable;
+
+				/* a placeholder starts NULL and reads as '' (current_setting) */
+				if (s == NULL && (g->flags & GUC_CUSTOM_PLACEHOLDER))
+					return "";
+				return s;
+			}
+		case PGC_ENUM:
+			return ENUM_NAME(gg, boot ? G_ENUM(gg)->boot_val : *G_ENUM(gg)->variable);
+	}
+	return NULL;
+}
+
+static bool
+at_default(const struct config_generic *g)
+{
+	char		b1[64];
+	char		b2[64];
+	const char *now = value_of(g, false, b1);
+	const char *dflt = value_of(g, true, b2);
+
+	if (dflt == NULL || now == NULL)
+		return dflt == now;
+	return strcmp(now, dflt) == 0;
+}
+
+/* SAVE-set one setting in the current nest level, if it is not that already. */
+static void
+set_one(const char *name, const char *value)
+{
+	const char *now = GetConfigOption(name, true, false);
+
+	if (now != NULL && strcmp(now, value) == 0)
+		return;
+	/*
+	 * As SUSET: the value is one the author had (recorded by the extension, never passed by a caller) or a default,
+	 * and the nest level it goes into ends with the guard.
+	 */
+	(void) set_config_option(name, value, PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+}
+
+static bool
+named_in(const char *name, const char *const *names, int n)
+{
+	for (int i = 0; i < n; i++)
+		if (pg_strcasecmp(name, names[i]) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * Every replayable setting at its default, but those named in keep (which the caller then sets): the state a recipe
+ * or a proof starts from, whatever the session it runs in.
+ */
+static List *
+nondefault_names(void)
+{
+	int			n;
+	struct config_generic **vars = get_guc_variables(&n);
+	List	   *names = NIL;
+
+	for (int i = 0; i < n; i++)
+		if (replayable(vars[i]) && !at_default(vars[i]))
+			names = lappend(names, pstrdup(vars[i]->name));
+	pfree(vars);
+	return names;
+}
+
+static void
+to_defaults(List *nondefault, const char *const *keep, int nkeep)
+{
+	ListCell   *lc;
+
+	foreach(lc, nondefault)
+	{
+		const char *name = (const char *) lfirst(lc);
+		struct config_generic *g;
+		char		buf[64];
+		const char *dflt;
+
+		if (named_in(name, keep, nkeep))
+			continue;
+		g = find_option(name, false, true, 0);
+		if (g == NULL || !replayable(g) || at_default(g))
+			continue;
+		dflt = value_of(g, true, buf);
+		if (dflt != NULL)
+			set_one(g->name, dflt);
+	}
+}
+
+static int
+name_cmp(const void *a, const void *b)
+{
+	return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+ArrayType *
+guard_env_now(void)
+{
+	int			n;
+	int			m = 0;
+	struct config_generic **vars = get_guc_variables(&n);
+	char	  **items = palloc(sizeof(char *) * Max(n, 1));
+	Datum	   *d;
+
+	for (int i = 0; i < n; i++)
+	{
+		char		buf[64];
+		const char *v;
+
+		if (!replayable(vars[i]) || at_default(vars[i]))
+			continue;
+		v = value_of(vars[i], false, buf);
+		items[m++] = psprintf("%s=%s", vars[i]->name, v ? v : "");
+	}
+	pfree(vars);
+	qsort(items, m, sizeof(char *), name_cmp);
+	d = palloc(sizeof(Datum) * Max(m, 1));
+	for (int i = 0; i < m; i++)
+		d[i] = CStringGetTextDatum(items[i]);
+	return construct_array_builtin(d, m, TEXTOID);
+}
+
+GuardEnv *
+guard_env_from(ArrayType *arr)
+{
+	GuardEnv   *e = palloc0(sizeof(GuardEnv));
+	Datum	   *d;
+	bool	   *nulls;
+	int			n;
+
+	if (arr == NULL)
+		return e;
+	deconstruct_array_builtin(arr, TEXTOID, &d, &nulls, &n);
+	e->name = palloc(sizeof(char *) * Max(n, 1));
+	e->value = palloc(sizeof(char *) * Max(n, 1));
+	for (int k = 0; k < n; k++)
+	{
+		char	   *s;
+		char	   *eq;
+
+		if (nulls[k])
+			continue;
+		s = TextDatumGetCString(d[k]);
+		eq = strchr(s, '=');
+		if (eq == NULL)
+			continue;
+		*eq = '\0';
+		e->name[e->n] = s;
+		e->value[e->n] = eq + 1;
+		e->n++;
+	}
+	return e;
+}
+
+static void
+apply_pins(void)
+{
+	for (int i = 0; i < NPINS; i++)
+		set_one(pin_name[i], pin_value[i]);
+}
+
+/*
+ * A pinned call (verify, brief, _render, ...) opens many guards one after the other, and between them only
+ * phasevec's own code runs: the settings off their default and the open cursors are the same at each. They are read
+ * once, when the call pins its settings, and each guard opened directly in the call uses them. A pin whose
+ * subtransaction is gone (its call ended in an error, caught further out) is never used again.
+ */
+typedef struct Pin
+{
+	int			nest;
+	SubTransactionId subid;		/* the subtransaction it was made in */
+	int			depth;			/* the guard depth it was made at */
+	List	   *nondefault;		/* names of the replayable settings off their default */
+	List	   *portals;		/* names of the cursors pg_cursors listed */
+} Pin;
+
+static Pin	pins[GUARD_MAX];
+static int	npins = 0;
+
+static List *nondefault_names(void);
+static List *visible_portals(void);
+
+static Pin *
+current_pin(void)
+{
+	while (npins > 0 && !SubTransactionIsActive(pins[npins - 1].subid))
+		npins--;
+	if (npins > 0 && pins[npins - 1].depth == guard_depth)
+		return &pins[npins - 1];
+	return NULL;
 }
 
 int
 guard_pin_settings(void)
 {
 	int			nest = NewGUCNestLevel();
+	Pin		   *p;
 
-	for (int i = 0; i < PHASEVEC_ENV_N; i++)
-		apply_setting(phasevec_env_names[i], phasevec_env_canon[i]);
+	while (npins > 0 && pins[npins - 1].nest >= nest)
+		npins--;
+	apply_pins();
+	if (npins < GUARD_MAX)
+	{
+		p = &pins[npins++];
+		p->nest = nest;
+		p->subid = GetCurrentSubTransactionId();
+		p->depth = guard_depth;
+		p->nondefault = nondefault_names();
+		p->portals = visible_portals();
+	}
 	return nest;
 }
 
 void
 guard_unpin_settings(int nest)
 {
+	while (npins > 0 && pins[npins - 1].nest >= nest)
+		npins--;
 	AtEOXact_GUC(false, nest);
 }
 
-char	  **
-guard_env_now(void)
+/* ----------------------------------------------------------------------------- the session's cursors -- */
+
+/* The names of the cursors pg_cursors lists (every one but the protocol's). */
+static List *
+visible_portals(void)
 {
-	char	  **env = palloc(sizeof(char *) * PHASEVEC_ENV_N);
+	LOCAL_FCINFO(fcinfo, 0);
+	FmgrInfo	flinfo;
+	ReturnSetInfo rsinfo;
+	ExprContext econtext;
+	TupleTableSlot *slot;
+	List	   *names = NIL;
 
-	for (int i = 0; i < PHASEVEC_ENV_N; i++)
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(&econtext, 0, sizeof(econtext));
+	econtext.type = T_ExprContext;
+	econtext.ecxt_per_query_memory = CurrentMemoryContext;
+	rsinfo.type = T_ReturnSetInfo;
+	rsinfo.econtext = &econtext;
+	rsinfo.allowedModes = SFRM_Materialize;
+	fmgr_info(F_PG_CURSOR, &flinfo);
+	InitFunctionCallInfoData(*fcinfo, &flinfo, 0, InvalidOid, NULL, (Node *) &rsinfo);
+	(void) FunctionCallInvoke(fcinfo);
+	if (rsinfo.setResult == NULL)
+		return NIL;
+	slot = MakeSingleTupleTableSlot(rsinfo.setDesc, &TTSOpsMinimalTuple);
+	while (tuplestore_gettupleslot(rsinfo.setResult, true, false, slot))
 	{
-		const char *v = GetConfigOption(phasevec_env_names[i], true, false);
+		bool		isnull;
+		Datum		v = slot_getattr(slot, 1, &isnull);
 
-		env[i] = psprintf("%s=%s", phasevec_env_names[i], v ? v : phasevec_env_canon[i]);
+		if (!isnull)
+			names = lappend(names, TextDatumGetCString(v));
 	}
-	return env;
+	ExecDropSingleTupleTableSlot(slot);
+	tuplestore_end(rsinfo.setResult);
+	return names;
 }
 
-/* ------------------------------------------------------------------------------- the session's timeouts -- */
+/*
+ * Freeze the session's ready cursors: marked active, PostgreSQL itself refuses to run or drop them (a PL/pgSQL FETCH
+ * or CLOSE through a refcursor, SPI, a utility FETCH). Thawed when the guard ends.
+ */
+static void
+freeze_portals(List *names)
+{
+	ListCell   *lc;
 
-#define NTIMEOUTS 5
-static const char *const timeout_names[NTIMEOUTS] = {
-	"transaction_timeout", "statement_timeout", "lock_timeout",
-	"idle_in_transaction_session_timeout", "idle_session_timeout"
-};
-static GucIntCheckHook timeout_prev[NTIMEOUTS];
+	foreach(lc, names)
+	{
+		Portal		p = GetPortalByName((const char *) lfirst(lc));
 
-static bool
-timeout_check(int i, int *newval, void **extra, GucSource source)
+		if (p == NULL || p->status != PORTAL_READY)
+			continue;
+		if (nfrozen == frozen_cap)
+		{
+			frozen_cap = Max(16, frozen_cap * 2);
+			frozen = frozen ? repalloc(frozen, sizeof(Portal) * frozen_cap)
+				: MemoryContextAlloc(TopMemoryContext, sizeof(Portal) * frozen_cap);
+		}
+		frozen[nfrozen++] = p;
+		p->status = PORTAL_ACTIVE;
+	}
+}
+
+static void
+thaw_to(int base)
+{
+	while (nfrozen > base)
+	{
+		Portal		p = frozen[--nfrozen];
+
+		if (p->status == PORTAL_ACTIVE)
+			p->status = PORTAL_READY;
+	}
+}
+
+/* ----------------------------------------------------------------------------------- entering, leaving -- */
+
+void
+guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	Level	   *L;
+	int			sec;
+	Pin		   *pin = current_pin();
+	List	   *nondefault;
+	List	   *portals;
+
+	if (guard_depth >= GUARD_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("phasevec: code that phasevec runs is nested more than %d deep", GUARD_MAX)));
+	BeginInternalSubTransaction(NULL);
+	L = &levels[guard_depth];
+	GetUserIdAndSecContext(&L->userid, &L->sec);
+	L->cxt = cxt;
+	L->owner = owner;
+	L->subid = GetCurrentSubTransactionId();
+	L->subcxt = CurTransactionContext;
+	L->started = NIL;
+	L->frozen_base = nfrozen;
+	g->level = guard_depth;
+	guard_depth++;
+	MemoryContextSwitchTo(cxt);
+	nondefault = pin ? pin->nondefault : (mode == GUARD_RENDER || mode == GUARD_AUTHOR) ? nondefault_names() : NIL;
+	portals = pin ? pin->portals : visible_portals();
+
+	sec = L->sec | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION;
+	if (mode == GUARD_RENDER)
+		sec |= SECURITY_NOFORCE_RLS;
+	SetUserIdAndSecContext(role, sec);
+	switch (mode)
+	{
+		case GUARD_RENDER:
+			to_defaults(nondefault, pin_name, NPINS);
+			apply_pins();
+			break;
+		case GUARD_AUTHOR:
+			to_defaults(nondefault, env ? (const char *const *) env->name : NULL, env ? env->n : 0);
+			for (int i = 0; env && i < env->n; i++)
+			{
+				/* only what a claim records: a hand-edited row cannot set anything else */
+				struct config_generic *rec = find_option(env->name[i], false, true, 0);
+
+				if (rec == NULL ? strchr(env->name[i], '.') != NULL : replayable(rec))
+					set_one(env->name[i], env->value[i]);
+			}
+			break;
+		case GUARD_READER:
+			apply_pins();
+			break;
+		case GUARD_ASIS:
+			break;
+	}
+	/* LOCAL (it cannot be SAVEd): the rollback of the subtransaction takes it back all the same */
+	(void) set_config_option("transaction_read_only", "on", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_LOCAL, true, 0, false);
+	freeze_portals(portals);
+}
+
+/* Roll back the innermost guard: its subtransaction (and any left inside it), its cursors thawed. */
+static void
+unwind_one(void)
+{
+	Level	   *L = &levels[guard_depth - 1];
+
+	thaw_to(L->frozen_base);
+	while (IsSubTransaction() && GetCurrentSubTransactionId() >= L->subid)
+		RollbackAndReleaseCurrentSubTransaction();
+	guard_depth--;
+	SetUserIdAndSecContext(L->userid, L->sec);
+	MemoryContextSwitchTo(L->cxt);
+	CurrentResourceOwner = L->owner;
+}
+
+void
+guard_leave(Guard *g)
+{
+	if (g->level != guard_depth - 1 || GetCurrentSubTransactionId() != levels[g->level].subid)
+		elog(ERROR, "phasevec: a guard left out of order");
+	unwind_one();
+}
+
+ErrorData *
+guard_catch(int mark, MemoryContext cxt)
+{
+	ErrorData  *e;
+
+	MemoryContextSwitchTo(cxt);
+	e = CopyErrorData();
+	FlushErrorState();
+	while (guard_depth > mark)
+		unwind_one();
+	MemoryContextSwitchTo(cxt);
+	return e;
+}
+
+/* The transaction ended with guards open (an error no one caught): nothing stays frozen. */
+static void
+guard_xact(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		thaw_to(0);
+		guard_depth = 0;
+		npins = 0;
+	}
+}
+
+/* ------------------------------------------------------------------------------------ queries and commands -- */
+
+static ExecutorStart_hook_type prev_start = NULL;
+static ExecutorRun_hook_type prev_run = NULL;
+static ExecutorEnd_hook_type prev_end = NULL;
+static ProcessUtility_hook_type prev_utility = NULL;
+
+static void
+guard_start(QueryDesc *qd, int eflags)
+{
+	if (prev_start)
+		prev_start(qd, eflags);
+	else
+		standard_ExecutorStart(qd, eflags);
+	if (guard_depth > 0)
+	{
+		Level	   *L = &levels[guard_depth - 1];
+		MemoryContext o = MemoryContextSwitchTo(L->subcxt);
+
+		L->started = lappend(L->started, qd);
+		MemoryContextSwitchTo(o);
+	}
+}
+
+static void
+guard_run(QueryDesc *qd, ScanDirection direction, uint64 count)
+{
+	if (guard_depth > 0 && !list_member_ptr(levels[guard_depth - 1].started, qd))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot read a cursor opened before it ran"),
+				 errdetail("The session's cursors are its caller's, read with its caller's rights.")));
+	if (prev_run)
+		prev_run(qd, direction, count);
+	else
+		standard_ExecutorRun(qd, direction, count);
+}
+
+static void
+guard_end(QueryDesc *qd)
+{
+	if (guard_depth > 0)
+		levels[guard_depth - 1].started = list_delete_ptr(levels[guard_depth - 1].started, qd);
+	if (prev_end)
+		prev_end(qd);
+	else
+		standard_ExecutorEnd(qd);
+}
+
+/* A cursor named in FETCH, MOVE or CLOSE must have been opened inside the guard. */
+static void
+own_cursor(const char *name, const char *what)
+{
+	Portal		p;
+
+	if (name == NULL || name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot run %s on every cursor", what)));
+	p = GetPortalByName(name);
+	if (p == NULL)
+		return;					/* PostgreSQL says it does not exist */
+	if (p->createSubid == InvalidSubTransactionId || p->createSubid < levels[guard_depth - 1].subid)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot %s cursor \"%s\", opened before it ran",
+						what, name),
+				 errdetail("The session's cursors are its caller's, read with its caller's rights.")));
+}
+
+static void
+guard_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree, ProcessUtilityContext context,
+			  ParamListInfo params, QueryEnvironment *queryEnv, DestReceiver *dest, QueryCompletion *qc)
 {
 	if (guard_depth > 0)
 	{
-		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
-		GUC_check_errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot change %s",
-						 timeout_names[i]);
-		GUC_check_errdetail("It would outlive the code: a timeout armed by a proof ends the session that runs it.");
-		return false;
+		Node	   *stmt = pstmt->utilityStmt;
+
+		switch (nodeTag(stmt))
+		{
+			case T_VariableSetStmt:
+			case T_VariableShowStmt:
+			case T_ExplainStmt:
+			case T_DeclareCursorStmt:
+			case T_CallStmt:
+			case T_DoStmt:
+				break;
+			case T_FetchStmt:
+				own_cursor(((FetchStmt *) stmt)->portalname, ((FetchStmt *) stmt)->ismove ? "MOVE" : "FETCH");
+				break;
+			case T_ClosePortalStmt:
+				own_cursor(((ClosePortalStmt *) stmt)->portalname, "CLOSE");
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot run %s",
+								GetCommandTagName(CreateCommandTag(stmt))),
+						 errdetail("It reads; of the commands only SET, SHOW, EXPLAIN, DECLARE, FETCH, MOVE, CLOSE, CALL and DO run.")));
+		}
 	}
-	return timeout_prev[i] ? timeout_prev[i] (newval, extra, source) : true;
+	if (prev_utility)
+		prev_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
 }
 
-#define TIMEOUT_CHECK(i) \
-	static bool timeout_check_##i(int *newval, void **extra, GucSource source) \
-	{ return timeout_check(i, newval, extra, source); }
-TIMEOUT_CHECK(0)
-TIMEOUT_CHECK(1)
-TIMEOUT_CHECK(2)
-TIMEOUT_CHECK(3)
-TIMEOUT_CHECK(4)
-static const GucIntCheckHook timeout_hooks[NTIMEOUTS] = {
-	timeout_check_0, timeout_check_1, timeout_check_2, timeout_check_3, timeout_check_4
+/* -------------------------------------------------------------------------------- the system's functions -- */
+
+/*
+ * Volatile system functions reviewed as safe in a guard: they leave nothing past its rollback (a setting goes back
+ * with it, a transaction-level advisory lock is released with it) and read nothing of the session but the clock.
+ * (random() draws from the session's generator, which a guard cannot seed: setseed is refused.)
+ */
+static const char *const volatile_allowed[] = {
+	"clock_timestamp", "timeofday", "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+	"random", "random_normal", "gen_random_uuid", "uuidv4", "uuidv7", "set_config",
+	"pg_advisory_xact_lock", "pg_advisory_xact_lock_shared", "pg_try_advisory_xact_lock",
+	"pg_try_advisory_xact_lock_shared"
 };
 
-#if PG_VERSION_NUM >= 190000
-#define INT_CHECK_HOOK(g) ((g)->_int.check_hook)
-#else
-#define INT_CHECK_HOOK(g) (((struct config_int *) (g))->check_hook)
-#endif
+/* Functions that read the session's own statements and channels, whatever their volatility. */
+static const char *const session_readers[] = {
+	"pg_cursor", "pg_prepared_statement", "pg_listening_channels", "pg_notification_queue_usage"
+};
 
-static void
-freeze_timeouts(void)
+typedef struct FnVerdict
 {
-	for (int i = 0; i < NTIMEOUTS; i++)
-	{
-		struct config_generic *g = find_option(timeout_names[i], false, true, 0);
+	Oid			fn;
+	bool		refused;
+} FnVerdict;
 
-		if (g == NULL || g->vartype != PGC_INT || INT_CHECK_HOOK(g) == timeout_hooks[i])
-			continue;			/* not in this server, or already ours */
-		timeout_prev[i] = INT_CHECK_HOOK(g);
-		INT_CHECK_HOOK(g) = timeout_hooks[i];
+static HTAB *fn_verdicts = NULL;
+
+static bool
+refused_function(Oid fn)
+{
+	FnVerdict  *v;
+	bool		found;
+
+	if (fn >= FirstNormalObjectId)
+		return false;			/* not the system's: its body runs in the guard too */
+	if (fn_verdicts == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(FnVerdict);
+		fn_verdicts = hash_create("phasevec guard functions", 256, &ctl, HASH_ELEM | HASH_BLOBS);
 	}
+	v = hash_search(fn_verdicts, &fn, HASH_FIND, NULL);
+	if (v == NULL)
+	{
+		HeapTuple	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
+		bool		refused = false;
+
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tp);
+			const char *name = NameStr(p->proname);
+
+			refused = named_in(name, session_readers, lengthof(session_readers)) ||
+				(p->provolatile == PROVOLATILE_VOLATILE &&
+				 !named_in(name, volatile_allowed, lengthof(volatile_allowed)));
+			ReleaseSysCache(tp);
+		}
+		v = hash_search(fn_verdicts, &fn, HASH_ENTER, &found);
+		v->refused = refused;
+	}
+	return v->refused;
 }
 
-/* ----------------------------------------------------------------------- functions that change the session -- */
-
-static const char *const session_functions[] = {
-	"pg_advisory_lock_int8", "pg_advisory_lock_shared_int8", "pg_try_advisory_lock_int8",
-	"pg_try_advisory_lock_shared_int8", "pg_advisory_unlock_int8", "pg_advisory_unlock_shared_int8",
-	"pg_advisory_lock_int4", "pg_advisory_lock_shared_int4", "pg_try_advisory_lock_int4",
-	"pg_try_advisory_lock_shared_int4", "pg_advisory_unlock_int4", "pg_advisory_unlock_shared_int4",
-	"pg_advisory_unlock_all", "setseed", "pg_cancel_backend", "pg_terminate_backend"
-};
-#define NSESSION (sizeof(session_functions) / sizeof(session_functions[0]))
-static Oid	session_oids[NSESSION * 2];
-static int	nsession_oids = 0;
 static object_access_hook_type prev_object_access = NULL;
 
 static void
@@ -207,12 +779,82 @@ guard_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subI
 		prev_object_access(access, classId, objectId, subId, arg);
 	if (access != OAT_FUNCTION_EXECUTE || guard_depth == 0)
 		return;
-	for (int i = 0; i < nsession_oids; i++)
-		if (session_oids[i] == objectId)
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot call %s()", get_func_name(objectId)),
-					 errdetail("It changes the session it runs in, and a rollback does not undo that.")));
+	if (refused_function(objectId))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot call %s()", get_func_name(objectId)),
+				 errdetail("Of the system's volatile functions only a reviewed few run there: this one may change or read "
+						   "the session it runs in past a rollback.")));
+}
+
+/* ------------------------------------------------------------------------------- the session's settings -- */
+
+#define NFROZEN_INT 5
+static const char *const frozen_int_names[NFROZEN_INT] = {
+	"transaction_timeout", "statement_timeout", "lock_timeout",
+	"idle_in_transaction_session_timeout", "idle_session_timeout"
+};
+static GucIntCheckHook int_prev[NFROZEN_INT];
+static GucBoolCheckHook exit_prev = NULL;
+
+static bool
+int_check(int i, int *newval, void **extra, GucSource source)
+{
+	if (guard_depth > 0)
+	{
+		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+		GUC_check_errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot change %s",
+						 frozen_int_names[i]);
+		GUC_check_errdetail("It would outlive the code: a timeout armed by a proof ends the session that runs it.");
+		return false;
+	}
+	return int_prev[i] ? int_prev[i] (newval, extra, source) : true;
+}
+
+#define INT_CHECK(i) \
+	static bool int_check_##i(int *newval, void **extra, GucSource source) \
+	{ return int_check(i, newval, extra, source); }
+INT_CHECK(0)
+INT_CHECK(1)
+INT_CHECK(2)
+INT_CHECK(3)
+INT_CHECK(4)
+static const GucIntCheckHook int_hooks[NFROZEN_INT] = {
+	int_check_0, int_check_1, int_check_2, int_check_3, int_check_4
+};
+
+static bool
+exit_check(bool *newval, void **extra, GucSource source)
+{
+	if (guard_depth > 0 && *newval)
+	{
+		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+		GUC_check_errmsg("phasevec: code that phasevec runs (a proof, a recipe) cannot change exit_on_error");
+		GUC_check_errdetail("Its next error would end the session that runs it.");
+		return false;
+	}
+	return exit_prev ? exit_prev(newval, extra, source) : true;
+}
+
+static void
+freeze_settings(void)
+{
+	struct config_generic *g;
+
+	for (int i = 0; i < NFROZEN_INT; i++)
+	{
+		g = find_option(frozen_int_names[i], false, true, 0);
+		if (g == NULL || g->vartype != PGC_INT || G_INT(g)->check_hook == int_hooks[i])
+			continue;			/* not in this server, or already ours */
+		int_prev[i] = G_INT(g)->check_hook;
+		G_INT(g)->check_hook = int_hooks[i];
+	}
+	g = find_option("exit_on_error", false, true, 0);
+	if (g != NULL && g->vartype == PGC_BOOL && G_BOOL(g)->check_hook != exit_check)
+	{
+		exit_prev = G_BOOL(g)->check_hook;
+		G_BOOL(g)->check_hook = exit_check;
+	}
 }
 
 void
@@ -223,14 +865,16 @@ phasevec_guard_init(void)
 	if (done)
 		return;
 	done = true;
-	for (int i = 0; i < fmgr_nbuiltins && nsession_oids < (int) lengthof(session_oids); i++)
-		for (int j = 0; j < (int) NSESSION; j++)
-			if (strcmp(fmgr_builtins[i].funcName, session_functions[j]) == 0)
-			{
-				session_oids[nsession_oids] = fmgr_builtins[i].foid;
-				nsession_oids++;
-			}
-	freeze_timeouts();
+	freeze_settings();
 	prev_object_access = object_access_hook;
 	object_access_hook = guard_object_access;
+	prev_start = ExecutorStart_hook;
+	ExecutorStart_hook = guard_start;
+	prev_run = ExecutorRun_hook;
+	ExecutorRun_hook = guard_run;
+	prev_end = ExecutorEnd_hook;
+	ExecutorEnd_hook = guard_end;
+	prev_utility = ProcessUtility_hook;
+	ProcessUtility_hook = guard_utility;
+	RegisterXactCallback(guard_xact, NULL);
 }

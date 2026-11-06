@@ -207,7 +207,7 @@ SELECT key FROM phasevec.sources WHERE watch = :pid;
 
 -- (6) recall(), disputes(), replacement() and truth_coverage() gave any role with USAGE on the schema the keys,
 -- verdicts, topics and reasons of every watch. A watch is shown only to a role that may SELECT its table; with
--- row-level security, only the keys of the rows it sees (and no count over all of them).
+-- row-level security, only the keys of the rows it sees (and a count over those rows only, src/phasevec_truth.c).
 SELECT phasevec.assert($w$notes$w$, $k$1$k$, NULL, $t$colour$t$);
 SELECT phasevec.assert($w$notes$w$, $k$2$k$, NULL, $t$colour$t$);
 SELECT phasevec.supersede($w$notes$w$, $k$3$k$, $k$2$k$, $t$newer$t$);

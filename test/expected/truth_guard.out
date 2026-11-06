@@ -83,7 +83,7 @@ CREATE OR REPLACE FUNCTION public.pv_g_btext_out(b public.pv_g_btext) RETURNS te
 BEGIN CREATE TABLE public.pv_g_planted (x int); RETURN b.v; END $f$;
 RESET ROLE;
 SELECT key, line FROM phasevec.brief($w$bobdocs$w$);
-ERROR:  cannot execute CREATE TABLE in a read-only transaction
+ERROR:  phasevec: code that phasevec runs (a proof, a recipe) cannot run CREATE TABLE
 SELECT to_regclass($r$public.pv_g_planted$r$) IS NULL AS nothing_planted;
  nothing_planted 
 -----------------
@@ -413,7 +413,7 @@ SELECT key FROM phasevec.sources WHERE watch = :pid;
 
 -- (6) recall(), disputes(), replacement() and truth_coverage() gave any role with USAGE on the schema the keys,
 -- verdicts, topics and reasons of every watch. A watch is shown only to a role that may SELECT its table; with
--- row-level security, only the keys of the rows it sees (and no count over all of them).
+-- row-level security, only the keys of the rows it sees (and a count over those rows only, src/phasevec_truth.c).
 SELECT phasevec.assert($w$notes$w$, $k$1$k$, NULL, $t$colour$t$);
  assert 
 --------
@@ -506,9 +506,10 @@ SELECT * FROM phasevec.disputes($w$tnotes$w$);
 (0 rows)
 
 SELECT * FROM phasevec.truth_coverage($w$tnotes$w$);
- verdict | n 
----------+---
-(0 rows)
+ verdict  | n 
+----------+---
+ unproven | 1
+(1 row)
 
 SELECT key, line FROM phasevec.brief($w$tnotes$w$);
  key |        line        

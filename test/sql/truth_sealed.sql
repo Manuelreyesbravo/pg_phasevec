@@ -1,0 +1,264 @@
+-- 0.20.0: the guard is a sealed room (src/phasevec_guard.c). Each block is an attack a third adversarial review ran
+-- against ee1ec24 (never released); there each one worked.
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+CREATE TABLE secrets (s text);
+INSERT INTO secrets VALUES ($s$TOP-SECRET-1$s$), ($s$TOP-SECRET-2$s$);
+REVOKE ALL ON secrets FROM PUBLIC;
+
+-- (1) A recipe (the table owner's code) ran with no subtransaction of its own: it read its caller's open cursor (a
+-- superuser's, over a table the owner may not read) and sent the rows out with NOTIFY, delivered at the caller's
+-- COMMIT. In brief(), and in the watch trigger of every writer. Each attempt is shown, caught by the recipe itself.
+CREATE ROLE pv_s_bob;
+GRANT CREATE ON SCHEMA public TO pv_s_bob;
+SET ROLE pv_s_bob;
+CREATE TABLE bobdocs (id int PRIMARY KEY, body text);
+INSERT INTO bobdocs VALUES (1, $t$hello$t$);
+GRANT SELECT ON bobdocs TO PUBLIC;
+CREATE FUNCTION public.pv_s_peek(b text) RETURNS text LANGUAGE plpgsql AS $f$
+DECLARE c refcursor := 'sc'; x text; acc text := '';
+BEGIN
+    BEGIN
+        LOOP FETCH c INTO x; EXIT WHEN NOT FOUND; acc := acc || ' ' || x; END LOOP;
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'recipe, FETCH: %', SQLERRM; END;
+    BEGIN EXECUTE 'MOVE BACKWARD ALL IN sc';
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'recipe, MOVE: %', SQLERRM; END;
+    BEGIN PERFORM pg_notify('leak', 'read:' || acc);
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'recipe, pg_notify: %', SQLERRM; END;
+    BEGIN EXECUTE format('NOTIFY leak, %L', 'read:' || acc);
+    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'recipe, NOTIFY: %', SQLERRM; END;
+    RETURN b;
+END $f$;
+RESET ROLE;
+SELECT phasevec.watch($w$bobdocs$w$, $w$bobdocs$w$::regclass, $k$id$k$, $r$public.pv_s_peek(r.body)$r$, $n$r1$n$) > 0 AS watch;
+LISTEN leak;
+BEGIN;
+DECLARE sc CURSOR FOR SELECT s FROM secrets;
+SELECT key, verdict, line FROM phasevec.brief($w$bobdocs$w$);
+FETCH ALL FROM sc;
+COMMIT;
+-- the watch trigger, in a writer that has a cursor open
+BEGIN;
+DECLARE sc CURSOR FOR SELECT s FROM secrets;
+UPDATE bobdocs SET body = $t$hello again$t$ WHERE id = 1;
+FETCH ALL FROM sc;
+COMMIT;
+-- a cursor held from an earlier transaction (its rows already read into memory)
+DECLARE sc CURSOR WITH HOLD FOR SELECT s FROM secrets;
+SELECT key, line FROM phasevec.brief($w$bobdocs$w$);
+FETCH ALL FROM sc;
+CLOSE sc;
+UNLISTEN leak;
+
+-- (2) A proof read and used up its verifier's open cursor (the subtransaction it ran in does not rewind a cursor
+-- opened before it), read pg_cursors and pg_prepared_statements (its verifier's statements), and said all of it in
+-- its error text.
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes SELECT g, $t$note $t$ || g FROM generate_series(1, 6) g;
+SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+CREATE ROLE pv_s_author;
+GRANT USAGE ON SCHEMA phasevec TO pv_s_author;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_s_author;
+GRANT SELECT ON notes TO pv_s_author;
+GRANT CREATE ON SCHEMA public TO pv_s_author;
+CREATE SEQUENCE pv_s_seq;
+GRANT USAGE, SELECT ON SEQUENCE pv_s_seq TO pv_s_author;
+SET ROLE pv_s_author;
+CREATE FUNCTION public.pv_s_fetch() RETURNS boolean LANGUAGE plpgsql AS $f$
+DECLARE c refcursor := 'sc'; x text; acc text := '';
+BEGIN
+    LOOP FETCH c INTO x; EXIT WHEN NOT FOUND; acc := acc || ' ' || x; END LOOP;
+    RAISE EXCEPTION 'leak:%', acc;
+END $f$;
+CREATE FUNCTION public.pv_s_close() RETURNS boolean LANGUAGE plpgsql AS $f$
+BEGIN EXECUTE 'CLOSE sc'; RETURN true; END $f$;
+CREATE FUNCTION public.pv_s_deallocate() RETURNS boolean LANGUAGE plpgsql AS $f$
+BEGIN EXECUTE 'DEALLOCATE pv_s_stmt'; RETURN true; END $f$;
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$public.pv_s_fetch()$p$);
+SELECT phasevec.assert($w$notes$w$, $k$2$k$, $p$(SELECT string_agg(name || ':' || statement, ' ') FROM pg_cursors) = 'x'$p$);
+SELECT phasevec.assert($w$notes$w$, $k$3$k$, $p$(SELECT string_agg(statement, ' ') FROM pg_prepared_statements) = 'x'$p$);
+SELECT phasevec.assert($w$notes$w$, $k$4$k$, $p$public.pv_s_close()$p$);
+SELECT phasevec.assert($w$notes$w$, $k$5$k$, $p$public.pv_s_deallocate()$p$);
+SELECT phasevec.assert($w$notes$w$, $k$6$k$, $p$currval('public.pv_s_seq') = 41$p$);
+RESET ROLE;
+PREPARE pv_s_stmt AS SELECT s FROM secrets;
+SELECT setval($q$pv_s_seq$q$, 40), nextval($q$pv_s_seq$q$);
+BEGIN;
+DECLARE sc CURSOR FOR SELECT s FROM secrets;
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$) ORDER BY key;
+FETCH ALL FROM sc;
+COMMIT;
+SELECT count(*) AS still_prepared FROM pg_prepared_statements WHERE name = $n$pv_s_stmt$n$;
+DEALLOCATE pv_s_stmt;
+-- the guard ends with the proof: the verifier itself does all of it as before
+BEGIN;
+DECLARE sc CURSOR FOR SELECT s FROM secrets;
+MOVE FORWARD 1 IN sc;
+FETCH ALL FROM sc;
+COMMIT;
+
+-- (3) A claim recorded twelve named settings, and every other one came from the verifier: its text search
+-- configuration, its timezone abbreviations, transform_null_equals, row_security, a custom setting a row-level security
+-- policy reads. With some of them a verifier recorded 'verified' for proofs that, as their author wrote them, are
+-- false, and 'refuted' for one that is true. A proof runs with every such setting at its default, and its author's
+-- own on top.
+CREATE TABLE ev (id int PRIMARY KEY, body text, at timestamptz);
+INSERT INTO ev VALUES (1, $t$kickoff$t$, $d$2025-12-31 18:30:00+00$d$), (2, $t$she runs every day$t$, NULL),
+                      (3, $t$no date yet$t$, NULL), (4, $t$tenant t1 is up to date$t$, NULL);
+SELECT phasevec.watch($w$ev$w$, $w$ev$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+CREATE TABLE inv (id int PRIMARY KEY, tenant text, overdue boolean);
+INSERT INTO inv VALUES (1, $t$t1$t$, false), (2, $t$t2$t$, true);
+ALTER TABLE inv ENABLE ROW LEVEL SECURITY;
+CREATE POLICY by_tenant ON inv USING (tenant = current_setting($s$app.tenant$s$, true));
+GRANT SELECT ON ev, inv TO pv_s_author;
+SET ROLE pv_s_author;
+SET timezone_abbreviations = $s$Default$s$;            -- IST is Israel Standard Time
+SET default_text_search_config = $s$pg_catalog.english$s$;
+SET app.tenant = $s$t1$s$;
+SELECT (SELECT at FROM public.ev WHERE id = 1) = '2026-01-01 00:00 IST'::timestamptz AS author_reads_1,
+       NOT (to_tsvector((SELECT body FROM public.ev WHERE id = 2)) @@ plainto_tsquery('running')) AS author_reads_2,
+       (SELECT at = NULL FROM public.ev WHERE id = 3) IS NOT DISTINCT FROM true AS author_reads_3,
+       NOT EXISTS (SELECT 1 FROM public.inv WHERE overdue) AS author_reads_4;
+SELECT phasevec.assert($w$ev$w$, $k$1$k$, $p$(SELECT at FROM public.ev WHERE id = 1) = '2026-01-01 00:00 IST'::timestamptz$p$);
+SELECT phasevec.assert($w$ev$w$, $k$2$k$, $p$NOT (to_tsvector((SELECT body FROM public.ev WHERE id = 2)) @@ plainto_tsquery('running'))$p$);
+SELECT phasevec.assert($w$ev$w$, $k$3$k$, $p$(SELECT at = NULL FROM public.ev WHERE id = 3) IS NOT DISTINCT FROM true$p$);
+SELECT phasevec.assert($w$ev$w$, $k$4$k$, $p$NOT EXISTS (SELECT 1 FROM public.inv WHERE overdue)$p$);
+RESET timezone_abbreviations;
+RESET default_text_search_config;
+RESET app.tenant;
+RESET ROLE;
+SELECT x FROM phasevec.truth t, unnest(t.proof_env) x
+ WHERE t.watch = (SELECT id FROM phasevec.watches WHERE name = $w$ev$w$) AND t.key = $k$4$k$
+   AND (x LIKE $l$app.%$l$ OR x LIKE $l$default_text_search_config=%$l$ OR x LIKE $l$timezone_abbreviations=%$l$);
+SET timezone_abbreviations = $s$India$s$;                -- IST is India Standard Time
+SET default_text_search_config = $s$pg_catalog.simple$s$;
+SET transform_null_equals = on;
+SET app.tenant = $s$t2$s$;
+SELECT key, verdict, error FROM phasevec.verify($w$ev$w$, p_every => interval $i$0$i$) ORDER BY key;
+SET row_security = off;
+SELECT key, verdict, error FROM phasevec.verify($w$ev$w$, p_every => interval $i$0$i$) WHERE key = $k$4$k$;
+RESET row_security;
+RESET timezone_abbreviations;
+RESET default_text_search_config;
+RESET transform_null_equals;
+RESET app.tenant;
+
+-- (4) A recipe renders at every setting's default too: what its caller set (here a custom setting the recipe reads)
+-- does not reach the text.
+CREATE TABLE greet (id int PRIMARY KEY, body text);
+INSERT INTO greet VALUES (1, $t$hello$t$);
+SELECT phasevec.watch($w$greet$w$, $w$greet$w$::regclass, $k$id$k$,
+                      $r$r.body || coalesce(current_setting('app.suffix', true), '')$r$, $n$r1$n$) > 0 AS watch;
+SET app.suffix = $s$, written by whoever called$s$;
+SELECT key, line FROM phasevec.brief($w$greet$w$);
+UPDATE greet SET body = $t$hello$t$;
+RESET app.suffix;
+SELECT s.text_hash = sha256(convert_to($t$hello$t$, $e$UTF8$e$)) AS noted_as_rendered
+  FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch WHERE w.name = $w$greet$w$;
+
+-- (5) FORCE ROW LEVEL SECURITY: the recipe ran as the table's owner under the policies, so every row was hidden from
+-- the watch (verified in 0.19.0, unjudgeable after) or not, depending on a custom setting of whoever called. A recipe
+-- renders as the owner with FORCE not applied to it, as PostgreSQL checks a foreign key.
+SET ROLE pv_s_bob;
+CREATE TABLE fw (id int PRIMARY KEY, tenant text, body text);
+INSERT INTO fw VALUES (1, $t$t1$t$, $t$first$t$), (2, $t$t2$t$, $t$second$t$);
+ALTER TABLE fw ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fw FORCE ROW LEVEL SECURITY;
+CREATE POLICY fw_tenant ON fw USING (tenant = current_setting('app.tenant', true));
+GRANT SELECT ON fw TO pv_s_author;
+RESET ROLE;
+SELECT phasevec.watch($w$fw$w$, $w$fw$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+SELECT s.key FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch WHERE w.name = $w$fw$w$ ORDER BY 1;
+SET ROLE pv_s_author;
+SET app.tenant = $s$t1$s$;
+SELECT phasevec.assert($w$fw$w$, $k$1$k$, $p$true$p$);
+RESET app.tenant;
+RESET ROLE;
+SET app.tenant = $s$t2$s$;
+SELECT key, verdict, error FROM phasevec.verify($w$fw$w$, p_every => interval $i$0$i$);
+RESET app.tenant;
+SELECT key, verdict, line FROM phasevec.brief($w$fw$w$);
+
+-- (6) recall(), replacement() and truth_coverage() filtered rows by key and nothing else: disputed_by named a row
+-- row-level security hides, a replacement chain went on through one and showed its reason, and a role under
+-- row-level security got no coverage at all. Each door now computes over the rows its caller sees. (search() needs a
+-- reader process; here it is replaced by one that returns every key of the watch, which is what recall() then filters.)
+CREATE OR REPLACE FUNCTION phasevec.search(p_watch text, p_question text, p_k int DEFAULT 10, p_partial boolean DEFAULT false,
+                                           p_m int DEFAULT 200, p_nprobe int DEFAULT 16)
+RETURNS TABLE (key text, score double precision, hamming int, state text, familiarity real, read_at timestamptz,
+               truncated boolean)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT s.key, 1.0::float8, 0, $s$fresh$s$::text, 1.0::real, NULL::timestamptz, false
+      FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch WHERE w.name = p_watch
+     ORDER BY s.key LIMIT p_k
+$f$;
+CREATE ROLE pv_s_alice;
+CREATE ROLE pv_s_bobby;
+CREATE TABLE hr (id int PRIMARY KEY, owner_name text, body text);
+INSERT INTO hr VALUES (1, $o$pv_s_alice$o$, $t$alice: the salary review is done$t$),
+                      (2, $o$pv_s_bobby$o$, $t$bob: the salary review is not done$t$),
+                      (3, $o$pv_s_alice$o$, $t$alice: plan v1$t$),
+                      (4, $o$pv_s_bobby$o$, $t$bob: plan v2, layoffs$t$),
+                      (5, $o$pv_s_alice$o$, $t$alice: plan v3$t$);
+ALTER TABLE hr ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON hr USING (owner_name = current_user);
+GRANT USAGE ON SCHEMA phasevec TO pv_s_alice, pv_s_bobby;
+GRANT SELECT ON hr TO pv_s_alice, pv_s_bobby;
+SELECT phasevec.watch($w$hr$w$, $w$hr$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+SELECT phasevec.assert($w$hr$w$, $k$1$k$, p_topic => $t$salary review$t$);
+SELECT phasevec.assert($w$hr$w$, $k$2$k$, p_topic => $t$salary review$t$);
+SELECT phasevec.supersede($w$hr$w$, $k$3$k$, $k$4$k$, $r$v2 replaces v1$r$);
+SELECT phasevec.supersede($w$hr$w$, $k$4$k$, $k$5$k$, $r$layoffs approved by the board, see v3$r$);
+SET ROLE pv_s_alice;
+SELECT id FROM hr ORDER BY id;
+SELECT key, verdict, disputed_by FROM phasevec.recall($w$hr$w$, $q$salary$q$, 10) ORDER BY key;
+SELECT * FROM phasevec.disputes($w$hr$w$);
+SELECT * FROM phasevec.replacement($w$hr$w$, $k$3$k$);
+SELECT * FROM phasevec.truth_coverage($w$hr$w$);
+RESET ROLE;
+-- control: the owner sees every row, and the doors say so
+SELECT key, verdict, disputed_by FROM phasevec.recall($w$hr$w$, $q$salary$q$, 10) ORDER BY key;
+SELECT * FROM phasevec.replacement($w$hr$w$, $k$3$k$);
+
+-- (7) A verifier in a REPEATABLE READ transaction judged every proof against its first snapshot, and recorded the
+-- verdicts as reached now. verify() and verify_one() judge at READ COMMITTED only, and a verdict records when its
+-- row was read.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT key, verdict FROM phasevec.verify($w$notes$w$, p_every => interval $i$0$i$);
+ROLLBACK;
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
+ROLLBACK;
+SET ROLE pv_s_author;
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$true$p$);
+RESET ROLE;
+BEGIN;
+SELECT pg_sleep(0.2) IS NOT NULL AS waited;
+SELECT phasevec.verify_one($w$notes$w$, $k$1$k$);
+SELECT verified_at >= now() + interval $i$0.15 s$i$ AS recorded_when_read FROM phasevec.truth t
+ WHERE t.watch = (SELECT id FROM phasevec.watches WHERE name = $w$notes$w$) AND t.key = $k$1$k$;
+COMMIT;
+
+-- (8) watch() took a key column with no unique index: two rows under one key, and a writer limited by row-level
+-- security, deleting its own row, forgot the other's key and its verdict.
+CREATE TABLE nu (id int, body text);
+SELECT phasevec.watch($w$nu$w$, $w$nu$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$);
+ALTER TABLE nu ADD UNIQUE (id);
+SELECT phasevec.watch($w$nu$w$, $w$nu$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+
+-- (9) Nor does a proof change the session for good through exit_on_error (its next error would end the session).
+SET ROLE pv_s_author;
+SELECT phasevec.assert($w$notes$w$, $k$2$k$, $p$set_config('exit_on_error', 'on', true) IS NOT NULL AND 1/0 = 1$p$);
+RESET ROLE;
+SELECT phasevec.verify_one($w$notes$w$, $k$2$k$);
+SELECT last_error FROM phasevec.truth t
+ WHERE t.watch = (SELECT id FROM phasevec.watches WHERE name = $w$notes$w$) AND t.key = $k$2$k$;
+SELECT current_setting($s$exit_on_error$s$) AS exit_on_error;
+
+DROP TABLE secrets, bobdocs, notes, ev, inv, greet, fw, hr, nu;
+DROP SEQUENCE pv_s_seq;
+DROP EXTENSION pg_phasevec;
+DROP OWNED BY pv_s_bob, pv_s_author, pv_s_alice, pv_s_bobby CASCADE;
+DROP ROLE pv_s_bob, pv_s_author, pv_s_alice, pv_s_bobby;

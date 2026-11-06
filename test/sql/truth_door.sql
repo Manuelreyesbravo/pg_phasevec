@@ -46,7 +46,7 @@ SELECT phasevec._truth_set(:notes_id, $k$1$k$, true, NULL,
        (SELECT bound FROM phasevec._truth_of(:notes_id, $k$1$k$))) AS forged;
 -- the internals of this version, even granted, write and read nothing: they carry no rights of their own
 SELECT key FROM phasevec._truth_due(:notes_id, 100, interval $i$0$i$, $r$pv_admin$r$::regrole::oid);
-SELECT phasevec._truth_set(:notes_id, $k$1$k$, $v$verified$v$, NULL, NULL);
+SELECT phasevec._truth_set(:notes_id, $k$1$k$, $v$verified$v$, NULL, NULL, NULL);
 RESET ROLE;
 SELECT key, verdict, phasevec._verdict(t) AS now FROM phasevec.truth t WHERE key = $k$1$k$;
 SELECT phasevec.verify_one($w$notes$w$, $k$1$k$) AS real_verdict;

@@ -29,8 +29,10 @@
  *   again.
  * - The watch trigger is C: it renders the row it fires for, so no caller can note a text that is not the row's.
  * - Every surface that shows verdicts (recall, disputes, replacement, truth_coverage, brief) is a C door that knows
- *   its caller: it shows a watch only to a role that may SELECT its table, and with row-level security only the
- *   keys of the rows that role sees.
+ *   its caller: it shows a watch only to a role that may SELECT its table, and with row-level security it computes
+ *   over the rows that role sees (every field, not only the result rows).
+ * - A verdict is judged at READ COMMITTED, in a new snapshot, and records when its row was read. A proof's mark in
+ *   shared memory names its key: an ended session halts that claim only.
  */
 #include "postgres.h"
 
@@ -43,6 +45,8 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "commands/trigger.h"
 #include "datatype/timestamp.h"
 #include "executor/spi.h"
@@ -379,9 +383,11 @@ text_array(char **v, int n)
  * row-level security filters what the role sees. SPI connected. Returns the number found; keys in *out.
  */
 static int
-visible_keys(const Target *t, Oid role, ArrayType *among, char ***out, MemoryContext keep)
+visible_keys(const Target *t, Oid role, GuardMode mode, const GuardEnv *env, ArrayType *among, char ***out,
+			 MemoryContext keep)
 {
 	Guard		g;
+	MemoryContext cx = CurrentMemoryContext;
 	volatile int mark = guard_mark();
 	int			n = 0;
 	Oid			at[2];
@@ -391,7 +397,7 @@ visible_keys(const Target *t, Oid role, ArrayType *among, char ***out, MemoryCon
 
 	PG_TRY();
 	{
-		guard_enter(&g, role, NULL);
+		guard_enter(&g, role, mode, env);
 		if (SPI_execute_with_args(sql, nargs, at, av, NULL, true, 0) != SPI_OK_SELECT)
 			elog(ERROR, "phasevec: the rows could not be read");
 		*out = MemoryContextAlloc(keep, sizeof(char *) * Max(SPI_processed, 1));
@@ -406,20 +412,19 @@ visible_keys(const Target *t, Oid role, ArrayType *among, char ***out, MemoryCon
 	}
 	PG_CATCH();
 	{
-		guard_unwind_to(mark);
-		PG_RE_THROW();
+		ReThrowError(guard_catch(mark, cx));
 	}
 	PG_END_TRY();
 	return n;
 }
 
 static bool
-key_visible(const Target *t, Oid role, const char *key)
+key_visible(const Target *t, Oid role, GuardMode mode, const GuardEnv *env, const char *key)
 {
 	char	   *one[1] = {(char *) key};
 	char	  **seen;
 
-	return visible_keys(t, role, text_array(one, 1), &seen, CurrentMemoryContext) > 0;
+	return visible_keys(t, role, mode, env, text_array(one, 1), &seen, CurrentMemoryContext) > 0;
 }
 
 /* key_visible from outside SPI */
@@ -429,7 +434,7 @@ key_visible_out(const Target *t, Oid role, const char *key)
 	bool		v;
 
 	spi_connect();
-	v = key_visible(t, role, key);
+	v = key_visible(t, role, GUARD_READER, NULL, key);
 	SPI_finish();
 	return v;
 }
@@ -447,6 +452,7 @@ static void
 render_rows(const Target *t, ArrayType *keys, Rendered *out, MemoryContext keep)
 {
 	Guard		g;
+	MemoryContext cx = CurrentMemoryContext;
 	volatile int mark = guard_mark();
 	Oid			at[2];
 	Datum		av[2];
@@ -458,7 +464,7 @@ render_rows(const Target *t, ArrayType *keys, Rendered *out, MemoryContext keep)
 	{
 		MemoryContext o;
 
-		guard_enter(&g, t->relowner, NULL);
+		guard_enter(&g, t->relowner, GUARD_RENDER, NULL);
 		if (SPI_execute_with_args(sql, nargs, at, av, NULL, true, 0) != SPI_OK_SELECT)
 			elog(ERROR, "phasevec: the rows could not be read");
 		o = MemoryContextSwitchTo(keep);
@@ -486,8 +492,7 @@ render_rows(const Target *t, ArrayType *keys, Rendered *out, MemoryContext keep)
 	}
 	PG_CATCH();
 	{
-		guard_unwind_to(mark);
-		PG_RE_THROW();
+		ReThrowError(guard_catch(mark, cx));
 	}
 	PG_END_TRY();
 }
@@ -501,7 +506,7 @@ keys_for_reader(const Target *t, Oid reader, ArrayType *keys)
 
 	if (!rls_for(t, reader))
 		return keys;
-	n = visible_keys(t, reader, keys, &seen, CurrentMemoryContext);
+	n = visible_keys(t, reader, GUARD_READER, NULL, keys, &seen, CurrentMemoryContext);
 	return text_array(seen, n);
 }
 
@@ -526,6 +531,7 @@ static void
 read_row(const Target *t, const char *key, Seen *s, MemoryContext keep)
 {
 	Guard		g;
+	MemoryContext cx = CurrentMemoryContext;
 	volatile int mark = guard_mark();
 	Oid			at[2] = {TEXTOID, t->keytype};
 	Datum		av[2] = {CStringGetTextDatum(key), (Datum) 0};
@@ -537,7 +543,7 @@ read_row(const Target *t, const char *key, Seen *s, MemoryContext keep)
 	{
 		int			rc;
 
-		guard_enter(&g, t->relowner, NULL);
+		guard_enter(&g, t->relowner, GUARD_RENDER, NULL);
 		/* not read_only: each read takes a new snapshot (READ COMMITTED), or a row that moved would not show */
 		if (t->read_plan)
 			rc = SPI_execute_plan(t->read_plan, av, NULL, false, 1);
@@ -561,8 +567,7 @@ read_row(const Target *t, const char *key, Seen *s, MemoryContext keep)
 	}
 	PG_CATCH();
 	{
-		guard_unwind_to(mark);
-		PG_RE_THROW();
+		ReThrowError(guard_catch(mark, cx));
 	}
 	PG_END_TRY();
 }
@@ -572,12 +577,13 @@ static void
 prepare_read(Target *t)
 {
 	Guard		g;
+	MemoryContext cx = CurrentMemoryContext;
 	volatile int mark = guard_mark();
 	Oid			at[2] = {TEXTOID, t->keytype};
 
 	PG_TRY();
 	{
-		guard_enter(&g, t->relowner, NULL);
+		guard_enter(&g, t->relowner, GUARD_RENDER, NULL);
 		t->read_plan = SPI_prepare(t->read_sql, t->typed ? 2 : 1, at);
 		if (t->read_plan == NULL)
 			elog(ERROR, "phasevec: the watched rows cannot be read: %s", SPI_result_code_string(SPI_result));
@@ -586,8 +592,7 @@ prepare_read(Target *t)
 	}
 	PG_CATCH();
 	{
-		guard_unwind_to(mark);
-		PG_RE_THROW();
+		ReThrowError(guard_catch(mark, cx));
 	}
 	PG_END_TRY();
 }
@@ -610,7 +615,8 @@ typedef struct Flight
 	Oid			db;
 	int32		watch;
 	bool		active;
-	uint8		bind[FLIGHT_BIND];
+	uint8		key[FLIGHT_BIND];	/* sha256 of the claim's key */
+	uint8		bind[FLIGHT_BIND];	/* phasevec._bind of the claim */
 } Flight;
 
 typedef struct Flights
@@ -662,24 +668,49 @@ flight_gone(const Flight *f, int slot)
 }
 
 static void
-flight_begin(int32 watch, const bytea *bind)
+key_hash(const char *key, uint8 *out)
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+
+	if (pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, (const uint8 *) key, strlen(key)) < 0 ||
+		pg_cryptohash_final(ctx, out, FLIGHT_BIND) < 0)
+		elog(ERROR, "phasevec: could not hash a key: %s", pg_cryptohash_error(ctx));
+	pg_cryptohash_free(ctx);
+}
+
+static void
+flight_begin(int32 watch, const char *key, const bytea *bind)
 {
 	Flights    *fs = flights_get();
 	Flight	   *s;
+	uint8		kh[FLIGHT_BIND];
 
 	if (MyProcNumber < 0 || MyProcNumber >= fs->nslots || bind == NULL || VARSIZE_ANY_EXHDR(bind) != FLIGHT_BIND)
 		return;
+	key_hash(key, kh);
 	SpinLockAcquire(&fs->mutex);
 	s = &fs->slot[MyProcNumber];
 	if (s->active && s->pid != MyProcPid)
 	{
-		/* the mark of a session that ended in this slot before: keep it for its watch */
-		fs->gone[fs->next_gone] = *s;
-		fs->next_gone = (fs->next_gone + 1) % FLIGHT_GONE;
+		/*
+		 * The mark of a session that ended in this slot before: kept for its watch, in a free place of the ring if
+		 * there is one (only past FLIGHT_GONE marks no verify() has taken yet does the oldest go).
+		 */
+		int			at = fs->next_gone;
+
+		for (int i = 0; i < FLIGHT_GONE; i++)
+			if (!fs->gone[(fs->next_gone + i) % FLIGHT_GONE].active)
+			{
+				at = (fs->next_gone + i) % FLIGHT_GONE;
+				break;
+			}
+		fs->gone[at] = *s;
+		fs->next_gone = (at + 1) % FLIGHT_GONE;
 	}
 	s->pid = MyProcPid;
 	s->db = MyDatabaseId;
 	s->watch = watch;
+	memcpy(s->key, kh, FLIGHT_BIND);
 	memcpy(s->bind, VARDATA_ANY(bind), FLIGHT_BIND);
 	s->active = true;
 	SpinLockRelease(&fs->mutex);
@@ -698,32 +729,28 @@ flight_end(void)
 	SpinLockRelease(&fs->mutex);
 }
 
-/* Takes the marks this watch's claims left in sessions that are gone; returns how many, binds in *out. */
+/*
+ * Takes up to FLIGHTS_TAKEN marks this watch's claims left in sessions that are gone, into out; returns how many.
+ * Only the marks taken are cleared (until the third cut of 0.20.0 the ninth was cleared and dropped): the caller
+ * records them and asks again until fewer come back.
+ */
+#define FLIGHTS_TAKEN 8
+
 static int
-flights_ended(int32 watch, bytea ***out)
+flights_ended(int32 watch, Flight *out)
 {
 	Flights    *fs = flights_get();
 	int			n = 0;
-	int			cap = 8;
 
-	*out = palloc(sizeof(bytea *) * cap);
 	SpinLockAcquire(&fs->mutex);
-	for (int i = -FLIGHT_GONE; i < fs->nslots; i++)
+	for (int i = -FLIGHT_GONE; i < fs->nslots && n < FLIGHTS_TAKEN; i++)
 	{
 		Flight	   *f = i < 0 ? &fs->gone[i + FLIGHT_GONE] : &fs->slot[i];
 
 		if (!flight_gone(f, i) || f->db != MyDatabaseId || f->watch != watch)
 			continue;
+		out[n++] = *f;
 		f->active = false;
-		if (n == cap)
-		{
-			/* no palloc under a spinlock: the rest wait for the next verify() */
-			break;
-		}
-		(*out)[n] = (bytea *) palloc(VARHDRSZ + FLIGHT_BIND);
-		SET_VARSIZE((*out)[n], VARHDRSZ + FLIGHT_BIND);
-		memcpy(VARDATA((*out)[n]), f->bind, FLIGHT_BIND);
-		n++;
 	}
 	SpinLockRelease(&fs->mutex);
 	return n;
@@ -745,6 +772,7 @@ typedef struct Judgment
 {
 	Outcome		out;
 	char	   *err;
+	TimestampTz at;				/* when the row was read for it: the state it judged */
 } Judgment;
 
 typedef struct Claim
@@ -754,8 +782,7 @@ typedef struct Claim
 	Oid			author;			/* InvalidOid: asserted before 0.20.0 */
 	bool		author_known;	/* the OID is still a role, with the name it had */
 	bytea	   *asserted_for;
-	char	   *env[PHASEVEC_ENV_N];	/* the author's settings (NULL: as they are) */
-	bool		has_env;
+	GuardEnv   *env;			/* the author's settings, as recorded */
 	bytea	   *bind;			/* phasevec._bind of the claim */
 } Claim;
 
@@ -770,6 +797,23 @@ static bool
 user_request(const ErrorData *e)
 {
 	return e->message_id != NULL && strcmp(e->message_id, "canceling statement due to user request") == 0;
+}
+
+/*
+ * A verdict is about the state it read. Under READ COMMITTED each proof reads the rows anew; under REPEATABLE READ or
+ * SERIALIZABLE every proof would read the transaction's first snapshot, and a verdict about an old state would be
+ * recorded as reached now (until the third cut of 0.20.0 it was).
+ */
+static void
+require_fresh_snapshots(void)
+{
+	if (IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("phasevec: proofs are judged at READ COMMITTED, each in a new snapshot"),
+				 errdetail("Under REPEATABLE READ or SERIALIZABLE every proof would read the transaction's first snapshot, "
+						   "and its verdict would be recorded as reached now."),
+				 errhint("Verify outside the transaction, or in one at READ COMMITTED.")));
 }
 
 static void
@@ -789,7 +833,7 @@ require_clock(int timeout_ms)
  * (author_rls) must still see it.
  */
 static void
-judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, const char *const *env,
+judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode mode, const GuardEnv *env,
 	  const Target *target, bool author_rls, const char *key, const bytea *asserted_for, Judgment *j)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
@@ -801,6 +845,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, const cha
 	volatile int phase = 1;		/* 0 reading the row, 1 proving, 2 reading it again */
 	volatile TimestampTz started = 0;
 
+	j->at = 0;
 	if (prove_in_progress)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -830,7 +875,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, const cha
 		{
 			phase = 0;
 			read_row(target, key, &first, oldcontext);
-			if (first.found && author_rls && !key_visible(target, as_role, key))
+			if (first.found && author_rls && !key_visible(target, as_role, mode, env, key))
 				first.found = false;
 			phase = 1;
 			if (!first.found)
@@ -851,7 +896,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, const cha
 			double		cost = -1;
 			SPIPlanPtr	plan;
 
-			guard_enter(&g, as_role, env);
+			guard_enter(&g, as_role, mode, env);
 			plan = SPI_prepare(sql.data, 0, NULL);
 			if (plan == NULL)
 				elog(ERROR, "the proof could not be prepared: %s", SPI_result_code_string(SPI_result));
@@ -929,10 +974,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, const cha
 		if (timeout_ms > 0)
 			disable_timeout(prove_timeout, false);
 		prove_fired = false;
-		guard_unwind_to(mark);
-		MemoryContextSwitchTo(oldcontext);
-		edata = CopyErrorData();
-		FlushErrorState();
+		edata = guard_catch(mark, oldcontext);
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
 		CurrentResourceOwner = oldowner;
@@ -963,10 +1005,8 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, const cha
 
 	j->out = out;
 	j->err = err ? pstrdup(err) : NULL;
+	j->at = started;
 }
-
-/* No setting pinned: the SQL of 0.14.2 to 0.19.0 ran proofs in the caller's settings. */
-static const char *const as_they_are[PHASEVEC_ENV_N] = {NULL};
 
 /* phasevec._prove_c(proof text, timeout_ms int, max_cost float8, OUT ok boolean, OUT err text): the SQL of 0.14.2 to
  * 0.19.0 runs proofs through this, as the caller, with the clock above. */
@@ -981,8 +1021,9 @@ phasevec_prove(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "phasevec_prove: the result must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
-	judge(text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_INT32(1), PG_GETARG_FLOAT8(2), GetUserId(), as_they_are,
-		  NULL, false, NULL, NULL, &j);
+	/* no setting pinned: the SQL of 0.14.2 to 0.19.0 ran proofs in the caller's settings */
+	judge(text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_INT32(1), PG_GETARG_FLOAT8(2), GetUserId(), GUARD_ASIS,
+		  NULL, NULL, false, NULL, NULL, &j);
 	values[0] = BoolGetDatum(j.out == OUT_VERIFIED);
 	if (j.err)
 		values[1] = CStringGetTextDatum(j.err);
@@ -994,36 +1035,6 @@ phasevec_prove(PG_FUNCTION_ARGS)
 /* ------------------------------------------------------------------------------------------- the claims -- */
 
 #define CLAIM_COLUMNS "key, proof, author, author_known, asserted_for, env, bind"
-
-/* "name=value" settings of a claim, into the values guard_enter takes, by name. */
-static bool
-env_from(Datum arr, char **values)
-{
-	Datum	   *d;
-	bool	   *nulls;
-	int			n;
-
-	for (int i = 0; i < PHASEVEC_ENV_N; i++)
-		values[i] = NULL;
-	deconstruct_array_builtin(DatumGetArrayTypeP(arr), TEXTOID, &d, &nulls, &n);
-	for (int k = 0; k < n; k++)
-	{
-		char	   *s;
-		char	   *eq;
-
-		if (nulls[k])
-			continue;
-		s = TextDatumGetCString(d[k]);
-		eq = strchr(s, '=');
-		if (eq == NULL)
-			continue;
-		*eq = '\0';
-		for (int i = 0; i < PHASEVEC_ENV_N; i++)
-			if (pg_strcasecmp(s, phasevec_env_names[i]) == 0)
-				values[i] = eq + 1;
-	}
-	return true;
-}
 
 static void
 claim_from(HeapTuple tup, TupleDesc td, Claim *c, MemoryContext keep)
@@ -1043,21 +1054,21 @@ claim_from(HeapTuple tup, TupleDesc td, Claim *c, MemoryContext keep)
 	d = SPI_getbinval(tup, td, 5, &isnull);
 	c->asserted_for = isnull ? NULL : DatumGetByteaPCopy(d);
 	d = SPI_getbinval(tup, td, 6, &isnull);
-	c->has_env = !isnull && env_from(d, c->env);
+	c->env = guard_env_from(isnull ? NULL : DatumGetArrayTypeP(d));
 	d = SPI_getbinval(tup, td, 7, &isnull);
 	c->bind = isnull ? NULL : DatumGetByteaPCopy(d);
 	MemoryContextSwitchTo(o);
 }
 
-#define RECORD_SQL "SELECT phasevec._truth_set($1, $2, $3, $4, $5)"
+#define RECORD_SQL "SELECT phasevec._truth_set($1, $2, $3, $4, $5, $6)"
 
 /* Record a judgment through phasevec._truth_set, as the owner; the verdict as it reads now. */
 static char *
 record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 {
-	Oid			at[5] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID};
-	Datum		av[5];
-	char		nulls[6] = "     ";
+	Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
+	Datum		av[6];
+	char		nulls[7] = "      ";
 	const char *name = outcome_name[j->out];
 	MemoryContext keep = CurrentMemoryContext;
 	char	   *v = NULL;
@@ -1071,11 +1082,13 @@ record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 	nulls[3] = j->err ? ' ' : 'n';
 	av[4] = c->bind ? PointerGetDatum(c->bind) : (Datum) 0;
 	nulls[4] = c->bind ? ' ' : 'n';
+	av[5] = TimestampTzGetDatum(j->at);
+	nulls[5] = j->at != 0 ? ' ' : 'n';
 
 	become(owner, &was);
 	spi_connect();
 	if ((t->record_plan ? SPI_execute_plan(t->record_plan, av, nulls, false, 1)
-		 : SPI_execute_with_args(RECORD_SQL, 5, at, av, nulls, false, 1)) != SPI_OK_SELECT)
+		 : SPI_execute_with_args(RECORD_SQL, 6, at, av, nulls, false, 1)) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the verdict was not recorded");
 	if (SPI_processed == 1)
 	{
@@ -1090,21 +1103,36 @@ record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 }
 
 /* The claims of this watch whose verifier's session ended while they ran: refuted, and not run again. SPI, owner. */
+static bytea *
+bytes32(const uint8 *b)
+{
+	bytea	   *v = (bytea *) palloc(VARHDRSZ + FLIGHT_BIND);
+
+	SET_VARSIZE(v, VARHDRSZ + FLIGHT_BIND);
+	memcpy(VARDATA(v), b, FLIGHT_BIND);
+	return v;
+}
+
 static void
 record_ended(int32 watch)
 {
-	bytea	  **binds;
-	int			n = flights_ended(watch, &binds);
+	Flight		taken[FLIGHTS_TAKEN];
+	int			n;
 
-	for (int i = 0; i < n; i++)
+	do
 	{
-		Oid			at[2] = {INT4OID, BYTEAOID};
-		Datum		av[2] = {Int32GetDatum(watch), PointerGetDatum(binds[i])};
+		n = flights_ended(watch, taken);
+		for (int i = 0; i < n; i++)
+		{
+			Oid			at[3] = {INT4OID, BYTEAOID, BYTEAOID};
+			Datum		av[3] = {Int32GetDatum(watch), PointerGetDatum(bytes32(taken[i].key)),
+			PointerGetDatum(bytes32(taken[i].bind))};
 
-		if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2)", 2, at, av, NULL, false, 1)
-			!= SPI_OK_SELECT)
-			elog(ERROR, "phasevec: an ended proof could not be recorded");
-	}
+			if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3)", 3, at, av, NULL, false, 1)
+				!= SPI_OK_SELECT)
+				elog(ERROR, "phasevec: an ended proof could not be recorded");
+		}
+	} while (n == FLIGHTS_TAKEN);
 }
 
 typedef struct Readers
@@ -1159,11 +1187,10 @@ judge_claim(const Claim *c, int timeout_ms, double max_cost, const Target *t, Re
 						  GetUserNameFromId(c->author, false), t->src);
 		return;
 	}
-	flight_begin(t->watch, c->bind);
+	flight_begin(t->watch, c->key, c->bind);
 	PG_TRY();
 	{
-		judge(c->proof, timeout_ms, max_cost, c->author,
-			  c->has_env ? (const char *const *) c->env : NULL, t, rls, c->key, c->asserted_for, j);
+		judge(c->proof, timeout_ms, max_cost, c->author, GUARD_AUTHOR, c->env, t, rls, c->key, c->asserted_for, j);
 	}
 	PG_FINALLY();
 	{
@@ -1212,6 +1239,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	timeout_ms = PG_GETARG_INT32(4);
 	max_cost = PG_GETARG_FLOAT8(5);
 	require_clock(timeout_ms);
+	require_fresh_snapshots();
 	budget_us = interval_usec(PG_GETARG_INTERVAL_P(3));
 	InitMaterializedSRF(fcinfo, 0);
 	nest = guard_pin_settings();
@@ -1241,12 +1269,12 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	t0 = GetCurrentTimestamp();
 	if (nclaims > 0)
 	{
-		Oid			at[5] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID};
+		Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
 
 		spi_connect();
 		prepare_read(&target);
 		become(owner, &was);
-		target.record_plan = SPI_prepare(RECORD_SQL, 5, at);
+		target.record_plan = SPI_prepare(RECORD_SQL, 6, at);
 		if (target.record_plan == NULL)
 			elog(ERROR, "phasevec: verdicts cannot be recorded: %s", SPI_result_code_string(SPI_result));
 		SPI_keepplan(target.record_plan);
@@ -1322,6 +1350,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("phasevec: verify_one() takes no NULL argument")));
 	timeout_ms = PG_GETARG_INT32(2);
 	require_clock(timeout_ms);
+	require_fresh_snapshots();
 	nest = guard_pin_settings();
 
 	become(owner, &was);
@@ -1376,7 +1405,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
  */
 static void
 assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool proof_null, Datum topic,
-			 bool topic_null, Datum support, bool support_null, Datum expires, bool expires_null, char **env)
+			 bool topic_null, Datum support, bool support_null, Datum expires, bool expires_null, ArrayType *env)
 {
 	MemoryContext keep = CurrentMemoryContext;
 	Oid			types[9] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, JSONBOID, TIMESTAMPTZOID, OIDOID, BYTEAOID,
@@ -1397,7 +1426,7 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 		Rendered	r;
 
 		must_read(&t, author);
-		if (!rls_for(&t, author) || key_visible(&t, author, k))
+		if (!rls_for(&t, author) || key_visible(&t, author, GUARD_READER, NULL, k))
 		{
 			render_rows(&t, text_array(one, 1), &r, keep);
 			if (r.n > 0)
@@ -1417,7 +1446,7 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 	values[6] = ObjectIdGetDatum(author);
 	values[7] = seen ? PointerGetDatum(seen) : (Datum) 0;
 	nulls[7] = seen ? ' ' : 'n';
-	values[8] = PointerGetDatum(text_array(env, PHASEVEC_ENV_N));
+	values[8] = PointerGetDatum(env);
 
 	become(owner, &was);
 	if (SPI_execute_with_args("SELECT phasevec._assert_set($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -1491,7 +1520,7 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	Who			was;
 	SPITupleTable *orphans;
 	uint64		norphans;
-	char	  **env = guard_env_now();
+	ArrayType  *env = guard_env_now();
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -1658,6 +1687,7 @@ phasevec_observe(PG_FUNCTION_ARGS)
 						td->tg_trigger->tgname, RelationGetRelationName(rel), watch, t.src)));
 	{
 		Guard		g;
+		MemoryContext cx = CurrentMemoryContext;
 		volatile int mark = guard_mark();
 		Oid			rowtype = RelationGetForm(rel)->reltype;
 		TupleDesc	desc = RelationGetDescr(rel);
@@ -1671,7 +1701,7 @@ phasevec_observe(PG_FUNCTION_ARGS)
 
 			av[0] = oldt ? heap_copy_tuple_as_datum(oldt, desc) : (Datum) 0;
 			av[1] = newt ? heap_copy_tuple_as_datum(newt, desc) : (Datum) 0;
-			guard_enter(&g, t.relowner, NULL);
+			guard_enter(&g, t.relowner, GUARD_RENDER, NULL);
 			if (newt)
 			{
 				if (SPI_execute_with_args(psprintf(OBSERVE_SQL, t.key_col, t.key_col, t.recipe), 2, at, av, nulls,
@@ -1704,8 +1734,7 @@ phasevec_observe(PG_FUNCTION_ARGS)
 		}
 		PG_CATCH();
 		{
-			guard_unwind_to(mark);
-			PG_RE_THROW();
+			ReThrowError(guard_catch(mark, cx));
 		}
 		PG_END_TRY();
 	}
@@ -1876,9 +1905,9 @@ phasevec_brief(PG_FUNCTION_ARGS)
 /*
  * The SQL functions recall, disputes, replacement and truth_coverage are this one C function. It knows who calls
  * it; it shows a watch (the first argument) only to a role that may SELECT its table, and nothing to anyone else;
- * then it runs phasevec._door_<name>(the same arguments) as the extension's owner. With row-level security on the
- * table for that role, it keeps only the result rows whose keys (columns key, key_a, key_b) the role sees, and a
- * result without keys (an aggregate over every row) is not shown. Until 0.20.0 these were SECURITY DEFINER and open
+ * then it runs phasevec._door_<name>(the same arguments, and the keys of the rows the role sees) as the extension's
+ * owner. With row-level security on the table for that role, the body computes over those keys only, and of its
+ * result only the rows whose keys (columns key, key_a, key_b) the role sees are shown. Until 0.20.0 these were SECURITY DEFINER and open
  * to PUBLIC: any role with USAGE on the schema read the keys, verdicts, topics, reasons and support of every watch.
  */
 Datum
@@ -1903,6 +1932,9 @@ phasevec_door(PG_FUNCTION_ARGS)
 	int			keycols[3];
 	int			nkeycols = 0;
 	int			keyarg = -1;
+	ArrayType  *visible = NULL;
+	char	  **seen = NULL;
+	int			nseen = 0;
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
@@ -1935,22 +1967,36 @@ phasevec_door(PG_FUNCTION_ARGS)
 	if (rls && keyarg >= 0 && (PG_ARGISNULL(keyarg) || !key_visible_out(&t, caller, TextDatumGetCString(PG_GETARG_DATUM(keyarg)))))
 		return (Datum) 0;
 
-	args = palloc(sizeof(Datum) * nargs);
-	nulls = palloc(nargs + 1);
+	/*
+	 * With row-level security the body computes over the keys of the rows the caller sees (its last argument), so no
+	 * field carries a hidden row: not the rows, not disputed_by, not a replacement chain or its reasons, not a count.
+	 * Until the third cut of 0.20.0 only the result rows were filtered, and disputed_by named hidden keys.
+	 */
+	spi_connect();
+	if (rls)
+	{
+		nseen = visible_keys(&t, caller, GUARD_READER, NULL, NULL, &seen, CurrentMemoryContext);
+		visible = text_array(seen, nseen);
+	}
+	args = palloc(sizeof(Datum) * (nargs + 1));
+	nulls = palloc(nargs + 2);
 	initStringInfo(&q);
 	appendStringInfo(&q, "SELECT * FROM phasevec.%s(", quote_identifier(psprintf("_door_%s", name)));
 	for (int i = 0; i < nargs; i++)
 	{
 		args[i] = PG_ARGISNULL(i) ? (Datum) 0 : PG_GETARG_DATUM(i);
 		nulls[i] = PG_ARGISNULL(i) ? 'n' : ' ';
-		appendStringInfo(&q, "%s$%d", i ? ", " : "", i + 1);
+		appendStringInfo(&q, "$%d, ", i + 1);
 	}
-	nulls[nargs] = '\0';
-	appendStringInfoChar(&q, ')');
+	argtypes = repalloc(argtypes, sizeof(Oid) * (nargs + 1));
+	argtypes[nargs] = TEXTARRAYOID;
+	args[nargs] = visible ? PointerGetDatum(visible) : (Datum) 0;
+	nulls[nargs] = visible ? ' ' : 'n';
+	nulls[nargs + 1] = '\0';
+	appendStringInfo(&q, "$%d)", nargs + 1);
 
-	spi_connect();
 	become(owner, &was);
-	if (SPI_execute_with_args(q.data, nargs, argtypes, args, nulls, true, 0) != SPI_OK_SELECT)
+	if (SPI_execute_with_args(q.data, nargs + 1, argtypes, args, nulls, true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: %s could not be read", name);
 	unbecome(&was);
 	rtd = SPI_tuptable->tupdesc;
@@ -1961,41 +2007,24 @@ phasevec_door(PG_FUNCTION_ARGS)
 		if (strcmp(cn, "key") == 0 || strcmp(cn, "key_a") == 0 || strcmp(cn, "key_b") == 0)
 			keycols[nkeycols++] = c + 1;
 	}
-	if (!rls || nkeycols > 0)
 	{
 		SPITupleTable *res = SPI_tuptable;
 		uint64		nres = SPI_processed;
-		char	  **seen = NULL;
-		int			nseen = 0;
 
-		if (rls && nres > 0)
-		{
-			char	  **all = palloc(sizeof(char *) * nres * nkeycols);
-			int			nall = 0;
-
-			for (uint64 i = 0; i < nres; i++)
-				for (int c = 0; c < nkeycols; c++)
-				{
-					char	   *k = SPI_getvalue(res->vals[i], rtd, keycols[c]);
-
-					if (k)
-						all[nall++] = k;
-				}
-			nseen = visible_keys(&t, caller, text_array(all, nall), &seen, CurrentMemoryContext);
-		}
 		for (uint64 i = 0; i < nres; i++)
 		{
 			bool		show = true;
 			Datum	   *values = palloc(sizeof(Datum) * rtd->natts);
 			bool	   *isnull = palloc(sizeof(bool) * rtd->natts);
 
-			for (int c = 0; rls && c < nkeycols && show; c++)
+			/* and, again, a row whose key the caller does not see is not shown */
+			for (int c = 0; visible && c < nkeycols && show; c++)
 			{
 				char	   *k = SPI_getvalue(res->vals[i], rtd, keycols[c]);
 				bool		found = (k == NULL);
 
-				for (int s = 0; s < nseen && !found; s++)
-					found = strcmp(seen[s], k) == 0;
+				for (int v = 0; v < nseen && !found; v++)
+					found = strcmp(seen[v], k) == 0;
 				show = found;
 			}
 			if (!show)
