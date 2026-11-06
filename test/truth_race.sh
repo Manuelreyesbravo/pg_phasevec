@@ -11,6 +11,11 @@
 #    came first again and ended every later verify() too. Now the next verify() records it refuted and runs the rest.
 # 4. (third cut) Only that claim: not every claim of the watch with the same text, proof and author.
 # 5. (third cut) Every such mark is taken: with ten sessions ended, the ninth was dropped and its claim ran again.
+# 6. (sixth review) A mark is spent only by a verifier that may act as the claim's author, and only when the halted
+#    record commits: a verify_one() rolled back, or refused to a role that may not act as the author, erased it,
+#    and the proof that had ended a session ran again. Such a role does not hold the claim's row either: the
+#    author's assert() of that key waited on its open transaction. A claim asserted again since its proof began
+#    is not the one that ran: it runs.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -26,6 +31,7 @@ trap '"$PG/pg_ctl" -D "$DATA" -w stop >/dev/null' EXIT
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL'
 DROP ROLE IF EXISTS pv_race_admin;
 DROP ROLE IF EXISTS pv_race_low;
+DROP ROLE IF EXISTS pv_race_mal;
 CREATE EXTENSION pg_phasevec;
 SELECT phasevec.reader_register('r1', repeat('a', 64), 4);
 CREATE TABLE notes (id int PRIMARY KEY, body text);
@@ -73,6 +79,15 @@ CREATE TABLE pool (id int PRIMARY KEY, body text);
 INSERT INTO pool SELECT g, 'job ' || g FROM generate_series(1, 10) g;
 SELECT phasevec.watch('pool', 'pool'::regclass, 'id', 'r.body', 'r1');
 SELECT phasevec.assert('pool', k::text, 'public.gate(96)') FROM generate_series(1, 10) k;
+CREATE TABLE halts (id int PRIMARY KEY, body text);
+INSERT INTO halts VALUES (1, 'waits at the gate'), (2, 'plain');
+SELECT phasevec.watch('halts', 'halts'::regclass, 'id', 'r.body', 'r1');
+SELECT phasevec.assert('halts', '1', 'public.gate(97)');
+SELECT phasevec.assert('halts', '2', 'true');
+CREATE ROLE pv_race_mal LOGIN;
+GRANT USAGE ON SCHEMA phasevec TO pv_race_mal;
+GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, float8),
+                          phasevec.verify_one(text, text, int, float8) TO pv_race_mal;
 SQL
 
 waits_on() {  # until some session waits on advisory lock $1
@@ -234,13 +249,62 @@ pool=$("$PG/psql" "${P[@]}" -c "SELECT count(*) FILTER (WHERE halted) || ' halte
 echo "ten ended sessions: $pool"
 [ "$pool" = "10 halted of 10" ] && echo "ok - every mark is taken, none is lost past the eighth" || { echo "not ok - a mark of an ended session was lost"; fallas=1; }
 
+# 6. A verifier is terminated inside claim 1 of 'halts'; then a role that may not act as its author calls
+# verify_one() in a transaction it rolls back, and is refused it for that key, and runs verify().
+end_in_gate() {  # $1 gate, $2 the verify that waits at it (terminated there)
+    "$PG/psql" "${P[@]}" >/dev/null <<SQL &
+SELECT pg_advisory_lock($1);
+DO \$\$ BEGIN
+    WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND NOT granted) LOOP
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+    PERFORM pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND NOT granted;
+    PERFORM pg_sleep(0.2);
+END \$\$;
+SELECT pg_advisory_unlock($1);
+SQL
+    local g=$!
+    for _ in $(seq 1 100); do
+        [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = $1 AND granted")" -gt 0 ] && break
+        sleep 0.05
+    done
+    "$PG/psql" "${P[@]}" -c "$2" >/dev/null 2>&1
+    wait $g
+}
+M=(-h "$SOCK" -p "$PORT" -X -q -At -d pv_race -U pv_race_mal)
+end_in_gate 97 "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000)"
+"$PG/psql" "${M[@]}" -c "BEGIN" -c "SELECT phasevec.verify_one('halts', 'nokey')" -c "ROLLBACK" >/dev/null 2>&1
+"$PG/psql" "${M[@]}" -c "SELECT phasevec.verify_one('halts', '1')" >/dev/null 2>&1
+"$PG/psql" "${M[@]}" -c "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0')" >/dev/null 2>&1
+"$PG/psql" "${P[@]}" -c "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000)" >/dev/null
+h1=$("$PG/psql" "${P[@]}" -c "SELECT verdict || ' | ' || halted FROM phasevec.truth WHERE key = '1' AND watch = (SELECT id FROM phasevec.watches WHERE name = 'halts')")
+echo "mark after a rollback and a refusal: key 1 is: $h1"
+[ "$h1" = "refuted | true" ] && echo "ok - a mark outlives a rollback and a verifier that may not act as its author" || { echo "not ok - a halt mark was erased, and its claim ran again"; fallas=1; }
+# the author asserts it again: a new mark, and that role's open transaction while the author asserts again
+"$PG/psql" "${P[@]}" -c "SELECT phasevec.assert('halts', '1', 'public.gate(97)')" >/dev/null
+end_in_gate 97 "SELECT count(*) FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000)"
+"$PG/psql" "${M[@]}" -c "BEGIN" -c "SELECT phasevec.verify_one('halts', 'nokey')" -c "SELECT pg_sleep(4)" -c "COMMIT" >/dev/null 2>&1 &
+mal=$!
+for _ in $(seq 1 100); do
+    [ "$("$PG/psql" "${P[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE usename = 'pv_race_mal' AND query LIKE 'SELECT pg_sleep(4)%'")" -gt 0 ] && break
+    sleep 0.05
+done
+re=$("$PG/psql" "${P[@]}" -c "SET lock_timeout = '2s'" -c "SELECT 'asserted' FROM phasevec.assert('halts', '1', 'public.gate(97)')" 2>&1)
+wait $mal
+echo "assert while that role's transaction is open: $re"
+[ "$re" = "asserted" ] && echo "ok - a verifier that may not act as the author holds none of its claims" || { echo "not ok - the author's assert() waited on a role with no rights over its claim"; fallas=1; }
+back=$("$PG/psql" "${P[@]}" -c "SELECT verdict FROM phasevec.verify('halts', 10, interval '0', interval '30 seconds', 20000) WHERE key = '1'")
+[ "$back" = "verified" ] && echo "ok - asserted again after its proof began, it runs" || { echo "not ok - a claim asserted again was halted by its old mark ($back)"; fallas=1; }
+
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL'
-DROP TABLE notes, jobs, twins, pool;
+DROP TABLE notes, jobs, twins, pool, halts;
 DROP EXTENSION pg_phasevec;
 DROP SCHEMA pv_private CASCADE;
 DROP OWNED BY pv_race_admin, pv_race_low;
 DROP ROLE pv_race_admin;
 DROP ROLE pv_race_low;
+DROP OWNED BY pv_race_mal;
+DROP ROLE pv_race_mal;
 SQL
 "$PG/dropdb" -h "$SOCK" -p "$PORT" pv_race
 exit $fallas

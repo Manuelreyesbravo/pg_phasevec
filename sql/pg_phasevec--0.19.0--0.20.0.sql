@@ -262,15 +262,37 @@ $f$;
 -- A claim whose verifier's session ended while its proof ran (src/phasevec_truth.c keeps the mark in shared memory;
 -- the next verify() of the watch finds it): refuted, and not due again until asserted again. The mark names the
 -- claim's key (p_key_hash, sha256 of it) and the claim (p_bind): in the third cut it named only the claim, and one
--- session that ended halted every key whose text, proof and author read alike.
-CREATE FUNCTION phasevec._truth_halted(p_watch int, p_key_hash bytea, p_bind bytea)
-RETURNS void LANGUAGE sql SET search_path = pg_catalog, pg_temp AS $f$
-    UPDATE phasevec.truth t
-       SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
-           last_error = $q$the verifier's session ended while this proof ran: not run again until it is asserted again$q$
+-- session that ended halted every key whose text, proof and author read alike. Recorded only by a verifier that may
+-- act as the claim's author (anyone, for a claim whose author is gone): another one neither writes nor locks the
+-- row (in the sixth review a role with no rights over the author held it, and the author's assert() waited).
+-- A claim asserted again since the proof began (p_started) is not the one that ran: it runs. Returns 1 when
+-- recorded, 0 when no such claim is left (the mark is spent either way: the caller clears it when its transaction
+-- commits), -1 when this verifier may not record it (the mark stays).
+CREATE FUNCTION phasevec._truth_halted(p_watch int, p_key_hash bytea, p_bind bytea, p_verifier oid,
+                                       p_started timestamptz)
+RETURNS int LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE k text; a oid; known boolean;
+BEGIN
+    SELECT t.key, t.asserted_by_oid, r.oid IS NOT NULL INTO k, a, known
+      FROM phasevec.truth t
+      LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
      WHERE t.watch = p_watch AND t.verdict <> $q$replaced$q$
        AND sha256(convert_to(t.key, $q$UTF8$q$)) = p_key_hash
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+       AND (t.changed_at IS NULL OR t.changed_at <= p_started);
+    IF NOT FOUND THEN
+        RETURN 0;
+    END IF;
+    IF known AND NOT pg_catalog.pg_has_role(p_verifier, a, $q$USAGE$q$) THEN
+        RETURN -1;
+    END IF;
+    UPDATE phasevec.truth t
+       SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
+           last_error = $q$the verifier's session ended while this proof ran: not run again until it is asserted again$q$
+     WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$
+       AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
+    RETURN CASE WHEN FOUND THEN 1 ELSE 0 END;
+END;
 $f$;
 
 -- verify() and verify_one(): the same signatures and grants; now C. See src/phasevec_truth.c.
@@ -583,7 +605,7 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
 REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_stale(phasevec.truth),
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
-    phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea),
+    phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea, oid, timestamptz),
     phasevec._note_set(int, text, bytea, text), phasevec.adopt(text, regrole, text[], text[]),
     phasevec._door_recall(text, text, int, boolean, text[]), phasevec._door_disputes(text, text[]),
     phasevec._door_replacement(text, text, text[]), phasevec._door_truth_coverage(text, text[])

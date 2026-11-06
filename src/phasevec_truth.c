@@ -638,6 +638,7 @@ typedef struct Flight
 	Oid			db;
 	int32		watch;
 	bool		active;
+	TimestampTz started;		/* when the proof began: a claim asserted again since is not this one */
 	uint8		key[FLIGHT_BIND];	/* sha256 of the claim's key */
 	uint8		bind[FLIGHT_BIND];	/* phasevec._bind of the claim */
 } Flight;
@@ -733,6 +734,7 @@ flight_begin(int32 watch, const char *key, const bytea *bind)
 	s->pid = MyProcPid;
 	s->db = MyDatabaseId;
 	s->watch = watch;
+	s->started = GetCurrentTimestamp();
 	memcpy(s->key, kh, FLIGHT_BIND);
 	memcpy(s->bind, VARDATA_ANY(bind), FLIGHT_BIND);
 	s->active = true;
@@ -753,30 +755,100 @@ flight_end(void)
 }
 
 /*
- * Takes up to FLIGHTS_TAKEN marks this watch's claims left in sessions that are gone, into out; returns how many.
- * Only the marks taken are cleared (until the third cut of 0.20.0 the ninth was cleared and dropped): the caller
- * records them and asks again until fewer come back.
+ * The marks this watch's claims left in sessions that are gone, copied (palloc'd; *n of them). None is cleared here:
+ * a mark goes only when the halted claim it names is recorded and that record commits (flights_settle). Until the
+ * sixth review it was cleared here, in shared memory, before the record was written in the caller's transaction:
+ * a rollback, an error, or a verify_one() refused to a role that may not act as the author erased it for good, and
+ * the proof that had ended a verifier's session ran again in the next one.
  */
-#define FLIGHTS_TAKEN 8
-
-static int
-flights_ended(int32 watch, Flight *out)
+static Flight *
+flights_ended(int32 watch, int *n)
 {
 	Flights    *fs = flights_get();
-	int			n = 0;
+	Flight	   *out = palloc(sizeof(Flight) * (fs->nslots + FLIGHT_GONE));
 
+	*n = 0;
 	SpinLockAcquire(&fs->mutex);
-	for (int i = -FLIGHT_GONE; i < fs->nslots && n < FLIGHTS_TAKEN; i++)
+	for (int i = -FLIGHT_GONE; i < fs->nslots; i++)
 	{
 		Flight	   *f = i < 0 ? &fs->gone[i + FLIGHT_GONE] : &fs->slot[i];
 
-		if (!flight_gone(f, i) || f->db != MyDatabaseId || f->watch != watch)
-			continue;
-		out[n++] = *f;
-		f->active = false;
+		if (flight_gone(f, i) && f->db == MyDatabaseId && f->watch == watch)
+			out[(*n)++] = *f;
 	}
 	SpinLockRelease(&fs->mutex);
-	return n;
+	return out;
+}
+
+/* Marks whose claim this transaction recorded halted (or found gone): cleared when it commits. */
+typedef struct Settled
+{
+	Flight		f;
+	SubTransactionId subid;		/* the subtransaction that recorded it */
+} Settled;
+
+static Settled *settled = NULL;
+static int	nsettled = 0;
+static int	settled_cap = 0;
+
+static bool
+same_flight(const Flight *a, const Flight *b)
+{
+	return a->pid == b->pid && a->db == b->db && a->watch == b->watch && a->started == b->started &&
+		memcmp(a->key, b->key, FLIGHT_BIND) == 0 && memcmp(a->bind, b->bind, FLIGHT_BIND) == 0;
+}
+
+static void
+flights_xact(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_COMMIT && nsettled > 0)
+	{
+		Flights    *fs = flights_get();
+
+		SpinLockAcquire(&fs->mutex);
+		for (int k = 0; k < nsettled; k++)
+			for (int i = -FLIGHT_GONE; i < fs->nslots; i++)
+			{
+				Flight	   *f = i < 0 ? &fs->gone[i + FLIGHT_GONE] : &fs->slot[i];
+
+				if (flight_gone(f, i) && same_flight(f, &settled[k].f))
+					f->active = false;
+			}
+		SpinLockRelease(&fs->mutex);
+	}
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
+		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
+		nsettled = 0;
+}
+
+static void
+flights_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		while (nsettled > 0 && settled[nsettled - 1].subid >= mySubid)
+			nsettled--;
+}
+
+static void
+flights_settle(const Flight *f)
+{
+	static bool registered = false;
+
+	if (!registered)
+	{
+		RegisterXactCallback(flights_xact, NULL);
+		RegisterSubXactCallback(flights_subxact, NULL);
+		registered = true;
+	}
+	if (nsettled == settled_cap)
+	{
+		settled_cap = Max(16, settled_cap * 2);
+		settled = settled ? repalloc(settled, sizeof(Settled) * settled_cap)
+			: MemoryContextAlloc(TopMemoryContext, sizeof(Settled) * settled_cap);
+	}
+	settled[nsettled].f = *f;
+	settled[nsettled].subid = GetCurrentSubTransactionId();
+	nsettled++;
 }
 
 /* ------------------------------------------------------------------------------------------- the judge -- */
@@ -1136,26 +1208,35 @@ bytes32(const uint8 *b)
 	return v;
 }
 
+/*
+ * Only for a verifier that may act as the claim's author (or for a claim whose author is gone, which anyone may set
+ * unproven): _truth_halted neither writes nor locks the claim for another one, and its mark stays for a verifier
+ * that may. Until the sixth review any role that could call verify_one() wrote it, and held the claim's row in its
+ * open transaction, so its author's assert() of that key waited.
+ */
 static void
-record_ended(int32 watch)
+record_ended(int32 watch, Oid verifier)
 {
-	Flight		taken[FLIGHTS_TAKEN];
 	int			n;
+	Flight	   *taken = flights_ended(watch, &n);
 
-	do
+	for (int i = 0; i < n; i++)
 	{
-		n = flights_ended(watch, taken);
-		for (int i = 0; i < n; i++)
-		{
-			Oid			at[3] = {INT4OID, BYTEAOID, BYTEAOID};
-			Datum		av[3] = {Int32GetDatum(watch), PointerGetDatum(bytes32(taken[i].key)),
-			PointerGetDatum(bytes32(taken[i].bind))};
+		Oid			at[5] = {INT4OID, BYTEAOID, BYTEAOID, OIDOID, TIMESTAMPTZOID};
+		Datum		av[5] = {Int32GetDatum(watch), PointerGetDatum(bytes32(taken[i].key)),
+		PointerGetDatum(bytes32(taken[i].bind)), ObjectIdGetDatum(verifier), TimestampTzGetDatum(taken[i].started)};
+		bool		isnull;
+		int32		done;
 
-			if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3)", 3, at, av, NULL, false, 1)
-				!= SPI_OK_SELECT)
-				elog(ERROR, "phasevec: an ended proof could not be recorded");
-		}
-	} while (n == FLIGHTS_TAKEN);
+		if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3, $4, $5)", 5, at, av, NULL, false, 1)
+			!= SPI_OK_SELECT || SPI_processed != 1)
+			elog(ERROR, "phasevec: an ended proof could not be recorded");
+		done = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		/* recorded, or its claim is no longer there to record: the mark goes when this commits */
+		if (!isnull && done >= 0)
+			flights_settle(&taken[i]);
+	}
+	pfree(taken);
 }
 
 typedef struct Readers
@@ -1301,7 +1382,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	become(owner, &was);
 	spi_connect();
 	load_target(PG_GETARG_DATUM(0), false, &target, keep);
-	record_ended(target.watch);
+	record_ended(target.watch, caller);
 	{
 		Oid			at[4] = {INT4OID, INT4OID, INTERVALOID, OIDOID};
 		Datum		av[4] = {Int32GetDatum(target.watch), PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),
@@ -1428,7 +1509,6 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	become(owner, &was);
 	spi_connect();
 	load_target(PG_GETARG_DATUM(0), false, &target, keep);
-	record_ended(target.watch);
 	{
 		Oid			at[2] = {INT4OID, TEXTOID};
 		Datum		av[2] = {Int32GetDatum(target.watch), PG_GETARG_DATUM(1)};
@@ -1459,6 +1539,12 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 				 errmsg("phasevec: role \"%s\" cannot run a proof as its author \"%s\"",
 						GetUserNameFromId(caller, false), GetUserNameFromId(c.author, false)),
 				 errhint("Proofs run with their author's rights: verify as the author or as a role that has its privileges.")));
+	/* authorized: now the marks of the claims of this watch the caller may judge */
+	become(owner, &was);
+	spi_connect();
+	record_ended(target.watch, caller);
+	SPI_finish();
+	unbecome(&was);
 	judge_claim(&c, timeout_ms, PG_GETARG_FLOAT8(3), &target, &readers, &j);
 	v = record(owner, &target, &c, &j);
 	guard_unpin_settings(nest);
