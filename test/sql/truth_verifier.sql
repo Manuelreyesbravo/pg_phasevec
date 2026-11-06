@@ -90,3 +90,7 @@ SELECT phasevec.verify_one($w$v2$w$, $k$2$k$);
 ROLLBACK;
 RESET statement_timeout;
 SELECT phasevec.verify_one($w$v2$w$, $k$2$k$);
+
+DROP FUNCTION public.stubborn();
+DROP TABLE notes, invoices;
+DROP EXTENSION pg_phasevec;

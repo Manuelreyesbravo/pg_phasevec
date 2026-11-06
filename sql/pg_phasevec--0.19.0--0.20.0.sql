@@ -272,7 +272,7 @@ $f$;
 -- trigger on phasevec.sources set the verdict of a row whose text changed to 'unproven' as it was written, and so the
 -- write waited for every open transaction that had judged that key (a verify() for its whole budget, or longer inside
 -- a larger transaction): under load a writer went from 0.2 ms to 13-36 ms, and failed on lock_timeout.
-CREATE OR REPLACE FUNCTION phasevec._verdict(t phasevec.truth) RETURNS text
+CREATE FUNCTION phasevec._verdict_of(t phasevec.truth) RETURNS text
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT CASE WHEN t.verdict = $q$replaced$q$ THEN $q$replaced$q$
                 -- (twelfth review) Freshness is judged at the moment of reading: clock_timestamp(), not now(). now()
@@ -440,7 +440,7 @@ BEGIN
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
            AND (t.verified_at IS NULL OR t.verified_at <= coalesce(p_at, now()));
     END IF;
-    SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
+    SELECT phasevec._verdict_of(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
     RETURN v;
 END;
 $f$;
@@ -510,7 +510,7 @@ BEGIN
         UPDATE phasevec.truth t SET interrupted_at = now(), interrupted_why = p_why
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$;
     END IF;
-    SELECT phasevec._verdict(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
+    SELECT phasevec._verdict_of(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
     RETURN v;
 END;
 $f$;
@@ -716,17 +716,17 @@ DROP FUNCTION phasevec._brief_keys(text);
 CREATE FUNCTION phasevec._brief_keys(p_watch text)
 RETURNS TABLE (key text, verdict text, net_use bigint, seen timestamptz, judged bytea)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT s.key, coalesce(phasevec._verdict(t), $q$unproven$q$),
+    SELECT s.key, coalesce(phasevec._verdict_of(t), $q$unproven$q$),
            coalesce(u.helped, 0) - coalesce(u.not_helped, 0),
            coalesce(t.verified_at, t.changed_at),
-           CASE WHEN phasevec._verdict(t) = $q$verified$q$ THEN t.asserted_for END
+           CASE WHEN phasevec._verdict_of(t) = $q$verified$q$ THEN t.asserted_for END
       FROM phasevec.watches w
       JOIN phasevec.sources s ON s.watch = w.id
       LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = s.key
       LEFT JOIN phasevec.usefulness u ON u.watch = w.id AND u.key = s.key
      WHERE w.name = p_watch
-       AND coalesce(phasevec._verdict(t), $q$unproven$q$) IN ($q$verified$q$, $q$unproven$q$)
-     ORDER BY (coalesce(phasevec._verdict(t), $q$unproven$q$) = $q$verified$q$) DESC,
+       AND coalesce(phasevec._verdict_of(t), $q$unproven$q$) IN ($q$verified$q$, $q$unproven$q$)
+     ORDER BY (coalesce(phasevec._verdict_of(t), $q$unproven$q$) = $q$verified$q$) DESC,
               coalesce(u.helped, 0) - coalesce(u.not_helped, 0) DESC,
               coalesce(t.verified_at, t.changed_at) DESC NULLS LAST, s.key
 $f$;
@@ -747,13 +747,13 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     hits AS (SELECT * FROM phasevec.search(p_watch, p_question, least(p_k * 3, 1000), p_partial) x
               WHERE p_visible IS NULL OR x.key = ANY (p_visible)),
     th AS (SELECT h.key, t.topic AS tp, t.support AS sp, t.verified_at AS va,
-                  coalesce(phasevec._verdict(t), $q$unproven$q$) AS v
+                  coalesce(phasevec._verdict_of(t), $q$unproven$q$) AS v
              FROM hits h CROSS JOIN w LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = h.key),
     vivas AS (SELECT t.topic, t.key, s.text_hash FROM phasevec.truth t CROSS JOIN w
                 JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
                WHERE t.watch = w.id AND t.topic IN (SELECT th.tp FROM th WHERE th.tp IS NOT NULL)
                  AND (p_visible IS NULL OR t.key = ANY (p_visible))
-                 AND phasevec._verdict(t) IN ($q$verified$q$, $q$unproven$q$)),
+                 AND phasevec._verdict_of(t) IN ($q$verified$q$, $q$unproven$q$)),
     disp AS (SELECT a.key, array_agg(b.key ORDER BY b.key) AS keys
                FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key <> a.key AND b.text_hash <> a.text_hash
               GROUP BY a.key)
@@ -777,7 +777,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
           JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
          WHERE t.watch = (phasevec._watch(p_watch)).id AND t.topic IS NOT NULL
            AND (p_visible IS NULL OR t.key = ANY (p_visible))
-           AND phasevec._verdict(t) IN ($q$verified$q$, $q$unproven$q$))
+           AND phasevec._verdict_of(t) IN ($q$verified$q$, $q$unproven$q$))
     SELECT a.topic, a.key, b.key FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key > a.key
      WHERE a.text_hash <> b.text_hash
      ORDER BY 1, 2, 3
@@ -798,7 +798,7 @@ $f$;
 CREATE FUNCTION phasevec._door_truth_coverage(p_watch text, p_visible text[])
 RETURNS TABLE (verdict text, n bigint)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT coalesce(phasevec._verdict(t), $q$unproven$q$) AS verdict, count(*)
+    SELECT coalesce(phasevec._verdict_of(t), $q$unproven$q$) AS verdict, count(*)
       FROM phasevec.sources s
       LEFT JOIN phasevec.truth t ON t.watch = s.watch AND t.key = s.key
      WHERE s.watch = (phasevec._watch(p_watch)).id AND (p_visible IS NULL OR s.key = ANY (p_visible))
@@ -831,6 +831,19 @@ REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth
     phasevec._door_recall(text, text, int, boolean, text[]), phasevec._door_disputes(text, text[]),
     phasevec._door_replacement(text, text, text[]), phasevec._door_truth_coverage(text, text[])
   FROM PUBLIC;
+-- (fifteenth review) _verdict(t) is a door, like recall() and the rest: it shows a claim's verdict to a role that may
+-- SELECT its watch's table (and, under row-level security, see its row), and NULL to anyone else, and computes it as
+-- the owner (_verdict_of, the owner's). As SQL that ran as its caller it read phasevec.watches, phasevec.sources and
+-- _bind (closed to PUBLIC above): a reader granted phasevec.truth and the watched table got "permission denied for
+-- function _bind" as soon as verify() wrote a fresh verdict. Every reader of phasevec.truth may call it, as before.
+CREATE OR REPLACE FUNCTION phasevec._verdict(t phasevec.truth) RETURNS text
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_verdict$q$ LANGUAGE C STABLE;
+REVOKE ALL ON FUNCTION phasevec._verdict_of(phasevec.truth) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION phasevec._verdict(phasevec.truth) TO PUBLIC;
+COMMENT ON FUNCTION phasevec._verdict(phasevec.truth) IS
+    $q$The truth a claim has now (verified, refuted, unproven, expired, replaced), for SQL that reads phasevec.truth directly; NULL for a claim whose watched table (or row, under row-level security) the caller may not read (0.20.0).$q$;
+COMMENT ON FUNCTION phasevec._verdict_of(phasevec.truth) IS
+    $q$What _verdict() computes, as the owner, after it has checked who reads (0.20.0). The owner's only.$q$;
 -- 6 and 7: closed to PUBLIC. brief() calls _brief_keys() as the owner: whoever may brief is granted brief() only.
 REVOKE ALL ON FUNCTION phasevec._forget(int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION phasevec._brief_keys(text) FROM PUBLIC;
@@ -886,7 +899,7 @@ DECLARE
 BEGIN
     FOR f IN SELECT p.oid, pg_get_functiondef(p.oid) AS def FROM pg_proc p
               WHERE p.pronamespace = $q$phasevec$q$::regnamespace AND p.prosrc LIKE $q$%expires_at <= now()%$q$
-                AND p.proname <> $q$_verdict$q$
+                AND p.proname NOT IN ($q$_verdict$q$, $q$_verdict_of$q$)
               ORDER BY p.oid LOOP
         EXECUTE replace(f.def, $q$expires_at <= now()$q$, $q$expires_at <= clock_timestamp()$q$);
         n := n + 1;

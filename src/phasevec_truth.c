@@ -58,6 +58,7 @@
 #include "common/sha2.h"
 #include "commands/trigger.h"
 #include "datatype/timestamp.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -66,6 +67,8 @@
 #include "nodes/plannodes.h"
 #include "utils/plancache.h"
 #include "mb/pg_wchar.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_func.h"
 #include "parser/parser.h"
 #include "pgstat.h"
 #include "port/atomics.h"
@@ -105,6 +108,7 @@ PG_FUNCTION_INFO_V1(phasevec_observe);
 PG_FUNCTION_INFO_V1(phasevec_render);
 PG_FUNCTION_INFO_V1(phasevec_brief);
 PG_FUNCTION_INFO_V1(phasevec_door);
+PG_FUNCTION_INFO_V1(phasevec_verdict);
 PG_FUNCTION_INFO_V1(phasevec_adopt);
 
 static TimeoutId prove_timeout = MAX_TIMEOUTS;
@@ -279,9 +283,12 @@ kept_plan(SPIPlanPtr *slot, const char *sql, int nargs, Oid *types)
 
 static SPIPlanPtr target_plan[2] = {NULL, NULL};	/* TARGET_SQL by name, by id */
 
-/* The watch and how to read its rows, by name (text) or by id (int4). SPI connected, as the owner. */
-static void
-load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
+/*
+ * The watch and how to read its rows, by name (text) or by id (int4). SPI connected, as the owner. False when there
+ * is no such watch and `missing_ok`.
+ */
+static bool
+load_target_ext(Datum id, bool by_id, Target *t, MemoryContext keep, bool missing_ok)
 {
 	Oid			at[1] = {by_id ? INT4OID : TEXTOID};
 	Datum		av[1] = {id};
@@ -295,6 +302,8 @@ load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
 		elog(ERROR, "phasevec: the watch could not be read");
 	if (SPI_processed != 1)
 	{
+		if (missing_ok)
+			return false;
 		if (by_id)
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("phasevec: no watch %d", DatumGetInt32(id))));
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -327,6 +336,13 @@ load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
 	t->read_sql = psprintf(READ_SQL, t->recipe, t->src, t->key_col,
 						   t->typed ? psprintf(READ_TYPED, t->key_col) : "");
 	MemoryContextSwitchTo(o);
+	return true;
+}
+
+static void
+load_target(Datum id, bool by_id, Target *t, MemoryContext keep)
+{
+	(void) load_target_ext(id, by_id, t, keep, false);
 }
 
 /* A key as a value of the key column's type; false when it is not one (then no row has it). */
@@ -822,15 +838,130 @@ lock_waited_since(TimestampTz since)
 }
 
 /*
+ * Read a claim's row before its proof is judged, in a subtransaction always rolled back, in the guard as the table's
+ * owner, under a clock of its own (timeout_ms): its text must be the one asserted, and an author that row-level
+ * security keeps from the row (author_rls) must still see it. True when the proof may be judged (`first` is what was
+ * read); otherwise `j` says why not.
+ *
+ * (fifteenth review) This is a step of its own, in a transaction of its own, before the one that judges. Until this
+ * cut it was the first step of judge(), in the transaction whose start is the proof's now(): the recipe of the row
+ * (a function it calls reads another table) waited there for a lock another session held, and the proof then read a
+ * clock from before the wait and a snapshot from after it. A heartbeat written during the wait was in the future of
+ * that now(), and a true claim was recorded 'refuted' (the fourteenth review closed the same skew for the wait for the
+ * claim's row). Nothing phasevec reads now sits between the proof's now() and the proof; and a wait here is not on
+ * the proof's clock: its time is the read's own.
+ */
+static bool
+judge_row(const Target *target, const char *key, bool author_rls, Oid as_role, GuardMode mode, const GuardEnv *env,
+		  const bytea *asserted_for, int timeout_ms, Seen *first, Judgment *j)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	volatile int mark = guard_mark();
+	volatile Outcome out = OUT_NO_VERDICT;
+	const char *volatile err = NULL;
+	volatile bool ready = false;
+	volatile TimestampTz started = 0;
+
+	memset(first, 0, sizeof(Seen));
+	if (prove_in_progress)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("phasevec: a proof cannot run another proof")));
+	if (prove_timeout == MAX_TIMEOUTS)
+		prove_timeout = RegisterTimeout(USER_TIMEOUT, prove_timeout_handler);
+	prove_fired = false;
+	prove_fired_waiting = false;
+	prove_in_progress = true;
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcontext);
+	PG_TRY();
+	{
+		spi_connect();
+		started = GetCurrentTimestamp();
+		if (timeout_ms > 0)
+			enable_timeout_after(prove_timeout, timeout_ms);
+		read_row(target, key, first, oldcontext);
+
+		/*
+		 * A row that is gone or says something else is stale, not judged: the verdict stays bound to the text it
+		 * judged, and reads 'unproven' only while the row does not say it (_verdict). Until the sixth review
+		 * verify() wrote 'unproven' over it, and a writer that edited a row and put it back erased a refutation
+		 * until the claim was due again (p_every).
+		 */
+		if (!first->found)
+		{
+			out = OUT_STALE;
+			err = "the row is gone: there is nothing to judge";
+		}
+		else if (author_rls && !key_visible(target, as_role, mode, env, key))
+		{
+			out = OUT_UNPROVEN;
+			err = "its author cannot see the row: there is nothing to judge";
+		}
+		else if (!same_bytes(first->hash, asserted_for))
+		{
+			out = OUT_STALE;
+			err = "the row does not say what was asserted (it changed, or it was not readable then): assert it again";
+		}
+		else
+			ready = true;
+		if (timeout_ms > 0)
+			disable_timeout(prove_timeout, false);
+		SPI_finish();
+		if (prove_fired)
+		{
+			prove_fired = false;
+			QueryCancelPending = false;
+		}
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+		prove_in_progress = false;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		bool		ours = prove_fired;
+		bool		late = timeout_ms > 0 && started != 0 &&
+			TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms);
+
+		if (timeout_ms > 0)
+			disable_timeout(prove_timeout, false);
+		prove_fired = false;
+		edata = guard_catch(mark, oldcontext);
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+		prove_in_progress = false;
+		/* a real cancel that is not our timer's cancels the caller */
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED && from_interrupts(edata) && (!ours || !user_request(edata)))
+			ReThrowError(edata);
+		if (ours)
+			QueryCancelPending = false;
+		ready = false;
+		out = OUT_NO_VERDICT;
+		err = (ours || late) ? psprintf("not judged: the row took longer than %d ms to read", timeout_ms) :
+			psprintf("not judged: the row could not be read (%s)", edata->message);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	j->out = out;
+	j->err = err ? pstrdup(err) : NULL;
+	j->at = ready ? 0 : started;
+	return ready;
+}
+
+/*
  * Judge one proof, in a subtransaction always rolled back, under its own clock and cost cap. The proof runs in the
  * guard as as_role (its author; for the SQL of 0.14.2 to 0.19.0, the caller) with the author's settings. With a
- * target, the row is read before and after the proof, in the guard as the table's owner: its text must be the one
- * asserted, and it must not change while the proof runs; and an author that row-level security keeps from the row
- * (author_rls) must still see it.
+ * target, the row was read before (judge_row: `first`), and is read again after the proof, in the guard as the
+ * table's owner: it must not have changed since.
  */
 static void
 judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode mode, const GuardEnv *env,
-	  const Target *target, bool author_rls, const char *key, const bytea *asserted_for, Judgment *j)
+	  const Target *target, const char *key, const Seen *first, Judgment *j)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
@@ -838,7 +969,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 	volatile int mark = guard_mark();
 	volatile Outcome out = OUT_REFUTED;
 	const char *volatile err = NULL;
-	volatile int phase = 1;		/* 0 reading the row, 1 proving, 2 reading it again */
+	volatile int phase = 1;		/* 1 proving, 2 reading the row again */
 	volatile TimestampTz started = 0;
 
 	j->at = 0;
@@ -859,47 +990,13 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 	MemoryContextSwitchTo(oldcontext);
 	PG_TRY();
 	{
-		Seen		first = {0};
 		Seen		last;
-		bool		ready = true;
 		Guard		g;
 
 		spi_connect();
 		started = GetCurrentTimestamp();
 		if (timeout_ms > 0)
 			enable_timeout_after(prove_timeout, timeout_ms);
-		if (target)
-		{
-			phase = 0;
-			read_row(target, key, &first, oldcontext);
-			phase = 1;
-
-			/*
-			 * A row that is gone or says something else is stale, not judged: the verdict stays bound to the text it
-			 * judged, and reads 'unproven' only while the row does not say it (_verdict). Until the sixth review
-			 * verify() wrote 'unproven' over it, and a writer that edited a row and put it back erased a refutation
-			 * until the claim was due again (p_every).
-			 */
-			if (!first.found)
-			{
-				out = OUT_STALE;
-				err = "the row is gone: there is nothing to judge";
-				ready = false;
-			}
-			else if (author_rls && !key_visible(target, as_role, mode, env, key))
-			{
-				out = OUT_UNPROVEN;
-				err = "its author cannot see the row: there is nothing to judge";
-				ready = false;
-			}
-			else if (!same_bytes(first.hash, asserted_for))
-			{
-				out = OUT_STALE;
-				err = "the row does not say what was asserted (it changed, or it was not readable then): assert it again";
-				ready = false;
-			}
-		}
-		if (ready)
 		{
 			double		cost = -1;
 			SPIPlanPtr	plan;
@@ -941,8 +1038,8 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 			if (target)
 			{
 				read_row(target, key, &last, oldcontext);
-				if (!last.found || !same_bytes(last.hash, first.hash) || last.version == NULL ||
-					first.version == NULL || strcmp(last.version, first.version) != 0)
+				if (!last.found || !same_bytes(last.hash, first->hash) || last.version == NULL ||
+					first->version == NULL || strcmp(last.version, first->version) != 0)
 				{
 					out = OUT_MOVED;
 					err = "the row changed while the proof ran: nothing recorded";
@@ -1012,8 +1109,8 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		 * An error reading the row judged nothing; one in the proof refutes it only when it is the proof's own
 		 * (not_a_verdict); one reading it again records nothing.
 		 */
-		out = phase == 0 ? OUT_NO_VERDICT : phase == 1 ? OUT_REFUTED : OUT_MOVED;
-		if (phase != 0 && (waiting || from_deadlock(edata) ||
+		out = phase == 1 ? OUT_REFUTED : OUT_MOVED;
+		if ((waiting || from_deadlock(edata) ||
 						   (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE && from_interrupts(edata))))
 		{
 			/* (ninth review) a lock another session holds: not the proof's answer, and no verdict */
@@ -1024,13 +1121,13 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 				psprintf("not judged: the proof waited for a lock longer than its session's lock_timeout (%s)",
 						 edata->message);
 		}
-		else if ((ours || late) && phase != 0 && waited)
+		else if ((ours || late) && waited)
 		{
 			/* (twelfth review) its clock ended after it waited for a lock: not all of that time was its own */
 			out = OUT_NO_VERDICT;
 			err = psprintf(LOCK_WAITED_ERR, timeout_ms);
 		}
-		else if (ours && phase != 0)
+		else if (ours)
 		{
 			out = OUT_REFUTED;
 			err = psprintf("the proof took longer than %d ms", timeout_ms);
@@ -1042,15 +1139,11 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 			err = psprintf("not judged: the proof failed for a reason that is not its own (SQLSTATE %s: %s)",
 						   unpack_sql_state(edata->sqlerrcode), edata->message);
 		}
-		else if (late && phase != 0)
+		else if (late)
 		{
 			out = OUT_REFUTED;
 			err = psprintf("the proof took longer than %d ms", timeout_ms);
 		}
-		else if (ours || late)
-			err = psprintf("not judged: the row took longer than %d ms to read", timeout_ms);
-		else if (phase == 0)
-			err = psprintf("not judged: the row could not be read (%s)", edata->message);
 		else
 			err = pstrdup(edata->message);
 		FreeErrorData(edata);
@@ -1077,7 +1170,7 @@ phasevec_prove(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 	/* no setting pinned: the SQL of 0.14.2 to 0.19.0 ran proofs in the caller's settings */
 	judge(text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_INT32(1), PG_GETARG_FLOAT8(2), GetUserId(), GUARD_ASIS,
-		  NULL, NULL, false, NULL, NULL, &j);
+		  NULL, NULL, NULL, NULL, &j);
 	values[0] = BoolGetDatum(j.out == OUT_VERIFIED);
 	if (j.err)
 		values[1] = CStringGetTextDatum(j.err);
@@ -1400,7 +1493,7 @@ bytes32(const uint8 *b)
 }
 
 #define VERDICT_SQL \
-	"SELECT phasevec._verdict(t) FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 " \
+	"SELECT phasevec._verdict_of(t) FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 " \
 	"AND t.key OPERATOR(pg_catalog.=) $2"
 
 /* The verdict of a key as it reads now (after this transaction's own writes). SPI connected, as the owner. */
@@ -1798,6 +1891,8 @@ phasevec_proof_main(Datum arg)
 		Judgment	j;
 		ProofAnswer what = ANSWER_DONE;
 		char	   *v = NULL;
+		bool		ready = false;
+		Seen		first = {0};
 
 		MemoryContextReset(per);
 		MemoryContextSwitchTo(per);
@@ -1905,11 +2000,29 @@ phasevec_proof_main(Datum arg)
 			/*
 			 * (fourteenth review) The claim is taken in the transaction that judges it without a wait in between:
 			 * the proof's now() (this transaction's start), its snapshot and its verified_at are one instant.
+			 * (fifteenth review) Nothing phasevec reads sits between them: the claim's row is read before, in a
+			 * transaction of its own (judge_row), and a take that waited for a lock (phasevec.truth held by a
+			 * LOCK or an ALTER) is let go and tried again in a new transaction.
 			 */
 			for (bool gone = false;;)
 			{
 				bool		taken;
 
+				if (kind == MSG_JUDGE)
+				{
+					SetCurrentStatementStartTimestamp();
+					StartTransactionCommand();
+					XactIsoLevel = XACT_READ_COMMITTED;
+					XactReadOnly = true;
+					PushActiveSnapshot(GetTransactionSnapshot());
+					MemoryContextSwitchTo(per);
+					pgstat_report_activity(STATE_RUNNING, "phasevec: reading the row of a claim");
+					ready = judge_row(&target, c.key, rls, sh->author, GUARD_AUTHOR, c.env, c.asserted_for, timeout_ms,
+									  &first, &j);
+					PopActiveSnapshot();
+					CommitTransactionCommand();
+					MemoryContextSwitchTo(per);
+				}
 				SetCurrentStatementStartTimestamp();
 				StartTransactionCommand();
 				/* each statement in a new snapshot, whatever default_transaction_isolation says; it records, so read-write */
@@ -1919,6 +2032,13 @@ phasevec_proof_main(Datum arg)
 				MemoryContextSwitchTo(per);
 				pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
 				taken = claim_taken(sh->owner, every ? worker_lock_plan : worker_try_plan, &target, &c, every);
+				if (taken && lock_waited_since(GetCurrentTransactionStartTimestamp()))
+				{
+					PopActiveSnapshot();
+					CommitTransactionCommand();
+					MemoryContextSwitchTo(per);
+					continue;
+				}
 				if (taken || every != NULL || gone)
 				{
 					if (!taken)
@@ -1944,12 +2064,15 @@ phasevec_proof_main(Datum arg)
 			{
 				if (kind == MSG_JUDGE)
 				{
-					sh->started = GetCurrentTimestamp();
-					pg_write_barrier();
-					pg_atomic_write_u32(&sh->judging, 1);
-					judge(c.proof, timeout_ms, max_cost, sh->author, GUARD_AUTHOR, c.env, &target, rls, c.key,
-						  c.asserted_for, &j);
-					pg_atomic_write_u32(&sh->judging, 0);
+					if (ready)
+					{
+						sh->started = GetCurrentTimestamp();
+						pg_write_barrier();
+						pg_atomic_write_u32(&sh->judging, 1);
+						judge(c.proof, timeout_ms, max_cost, sh->author, GUARD_AUTHOR, c.env, &target, c.key, &first,
+							  &j);
+						pg_atomic_write_u32(&sh->judging, 0);
+					}
 					/* stamped with the proof's own now(): a verdict is never fresher than the clock it read */
 					if (j.at != 0)
 						j.at = GetCurrentTransactionStartTimestamp();
@@ -2036,11 +2159,21 @@ proof_start(Oid owner, int32 watch, Oid author, char **why)
 	ProofSession *ps = MemoryContextAllocZero(TopMemoryContext, sizeof(ProofSession));
 	BackgroundWorker w;
 	shm_mq	   *mq;
-	MemoryContext o = MemoryContextSwitchTo(TopMemoryContext);
+	MemoryContext o;
+	MemoryContext scratch;
 	bool		started;
 
+	/*
+	 * (fifteenth review) What a session keeps (the segment, its queues, the worker's handle) is in TopMemoryContext;
+	 * what only starts it is not. dsm_create() with dynamic_shared_memory_type = mmap allocates a zeroed buffer
+	 * of 8 kB in the current context and never frees it, and the worker's name is looked up into a new string: done in
+	 * TopMemoryContext, every verify_one() left 8 kB (mmap) or 24 bytes behind, for as long as the session lived.
+	 */
+	scratch = AllocSetContextCreate(CurrentMemoryContext, "phasevec proof start", ALLOCSET_SMALL_SIZES);
+	o = MemoryContextSwitchTo(scratch);
 	ps->author = author;
 	ps->seg = dsm_create(PROOF_SIZE, 0);
+	MemoryContextSwitchTo(TopMemoryContext);
 	ps->sh = dsm_segment_address(ps->seg);
 	memset(ps->sh, 0, sizeof(ProofShared));
 	ps->sh->magic = PROOF_MAGIC;
@@ -2064,15 +2197,19 @@ proof_start(Oid owner, int32 watch, Oid author, char **why)
 	strlcpy(w.bgw_library_name, library_path(), sizeof(w.bgw_library_name));
 	strlcpy(w.bgw_function_name, "phasevec_proof_main", BGW_MAXLEN);
 	{
-		char	   *name = GetUserNameFromId(author, true);
+		char	   *name;
 
+		MemoryContextSwitchTo(scratch);
+		name = GetUserNameFromId(author, true);
 		snprintf(w.bgw_name, BGW_MAXLEN, "pg_phasevec proof as %s", name ? name : "a role that is gone");
+		MemoryContextSwitchTo(TopMemoryContext);
 	}
 	strlcpy(w.bgw_type, "pg_phasevec proof", BGW_MAXLEN);
 	w.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(ps->seg));
 	w.bgw_notify_pid = MyProcPid;
 	started = RegisterDynamicBackgroundWorker(&w, &ps->handle);
 	MemoryContextSwitchTo(o);
+	MemoryContextDelete(scratch);
 	if (!started)
 	{
 		shm_mq_detach(ps->req);
@@ -4055,4 +4192,129 @@ phasevec_door(PG_FUNCTION_ARGS)
 	}
 	SPI_finish();
 	return (Datum) 0;
+}
+
+/* --------------------------------------------------------------------------------- the verdict of a row -- */
+
+/*
+ * phasevec._verdict(t phasevec.truth), for SQL that reads phasevec.truth directly: the truth a claim has now. (fifteenth
+ * review) Until this cut it was SQL that ran as its caller: it read phasevec.watches and phasevec.sources and called
+ * phasevec._bind, which 0.20.0 closes to PUBLIC, so a role granted phasevec.truth and the watched table (yggdrasil's
+ * read-only reader) got "permission denied for function _bind" as soon as verify() wrote a fresh verdict, and one not
+ * granted the extension's tables got "permission denied for table watches". It is a door now, with the rule of the
+ * others: a claim's verdict is shown to a role that may SELECT its watch's table (and, when row-level security filters
+ * that table for the role, see the claim's row), and NULL to anyone else; then it is computed (phasevec._verdict_of,
+ * the owner's) as the extension's owner. Its argument is whatever row the caller gives it: one made up for a table the
+ * caller may not read gets NULL, so it is no way to test what a hidden row says.
+ */
+#define VERDICT_SEEN 16
+
+typedef struct VerdictWatch
+{
+	int32		watch;
+	Oid			caller;
+	bool		shown;			/* the caller may SELECT the watch's table */
+	bool		rls;			/* row-level security filters it for the caller */
+	Target		t;				/* loaded when rls */
+} VerdictWatch;
+
+typedef struct VerdictCache
+{
+	Oid			owner;
+	Oid			rowtype;
+	FmgrInfo	of;				/* phasevec._verdict_of */
+	int			n;
+	int			next;
+	VerdictWatch w[VERDICT_SEEN];
+} VerdictCache;
+
+Datum
+phasevec_verdict(PG_FUNCTION_ARGS)
+{
+	VerdictCache *vc = (VerdictCache *) fcinfo->flinfo->fn_extra;
+	MemoryContext mcxt = fcinfo->flinfo->fn_mcxt;
+	Oid			caller = GetUserId();
+	HeapTupleHeader th;
+	bool		isnull;
+	int32		watch;
+	Datum		keyd;
+	VerdictWatch *vw = NULL;
+	Who			was;
+	Datum		res;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	th = PG_GETARG_HEAPTUPLEHEADER(0);
+	watch = DatumGetInt32(GetAttributeByName(th, "watch", &isnull));
+	if (isnull)
+		PG_RETURN_NULL();
+	keyd = GetAttributeByName(th, "key", &isnull);
+	if (isnull)
+		PG_RETURN_NULL();
+
+	if (vc == NULL)
+	{
+		vc = MemoryContextAllocZero(mcxt, sizeof(VerdictCache));
+		vc->owner = function_owner(fcinfo);
+		fcinfo->flinfo->fn_extra = vc;
+	}
+	if (vc->rowtype != HeapTupleHeaderGetTypeId(th))
+	{
+		Oid			argt = HeapTupleHeaderGetTypeId(th);
+		Oid			of = LookupFuncName(list_make2(makeString(pstrdup("phasevec")), makeString(pstrdup("_verdict_of"))),
+										1, &argt, false);
+
+		fmgr_info_cxt(of, &vc->of, mcxt);
+		vc->rowtype = argt;
+	}
+
+	/* who may see this watch: once per query for each (watch, role) */
+	for (int i = 0; i < vc->n && vw == NULL; i++)
+		if (vc->w[i].watch == watch && vc->w[i].caller == caller)
+			vw = &vc->w[i];
+	if (vw == NULL)
+	{
+		Target		t;
+		bool		known;
+
+		become(vc->owner, &was);
+		spi_connect();
+		known = load_target_ext(Int32GetDatum(watch), true, &t, mcxt, true);
+		SPI_finish();
+		unbecome(&was);
+		if (vc->n < VERDICT_SEEN)
+			vw = &vc->w[vc->n++];
+		else
+		{
+			vw = &vc->w[vc->next];
+			vc->next = (vc->next + 1) % VERDICT_SEEN;
+		}
+		memset(vw, 0, sizeof(VerdictWatch));
+		vw->watch = watch;
+		vw->caller = caller;
+		vw->shown = known && may_read(&t, caller);
+		vw->rls = vw->shown && rls_for(&t, caller);
+		if (known)
+			vw->t = t;
+	}
+	if (!vw->shown)
+		PG_RETURN_NULL();
+	/* a key is a row too: one row-level security hides from the caller gets nothing */
+	if (vw->rls && !key_visible_out(&vw->t, caller, TextDatumGetCString(keyd)))
+		PG_RETURN_NULL();
+
+	become(vc->owner, &was);
+	{
+		LOCAL_FCINFO(inner, 1);
+
+		InitFunctionCallInfoData(*inner, &vc->of, 1, InvalidOid, NULL, NULL);
+		inner->args[0].value = PG_GETARG_DATUM(0);
+		inner->args[0].isnull = false;
+		res = FunctionCallInvoke(inner);
+		isnull = inner->isnull;
+	}
+	unbecome(&was);
+	if (isnull)
+		PG_RETURN_NULL();
+	PG_RETURN_DATUM(res);
 }

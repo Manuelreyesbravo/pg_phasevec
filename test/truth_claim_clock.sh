@@ -106,6 +106,89 @@ saw=$(grep -o "pv_clock_now=[^\"]*" "$DATA/server.log" | tail -1 | cut -d= -f2)
 stamp=$(q -c "SELECT t.verified_at = '$saw'::timestamptz FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch WHERE w.name = 'w' AND t.key = '3'")
 echo "claim 3: the proof's now() $saw; verified_at is it: $stamp"
 [ "$stamp" = "t" ] && echo "ok - verified_at is the proof's own now()" || { echo "not ok - verified_at is not the clock the proof read"; fallas=1; }
+# 4. (fifteenth review) A wait in phasevec's own read of the claim's row: the recipe calls a function that reads a
+#    lookup table another session holds. In the fourteenth cut that read was the first step of the transaction that
+#    judged: a heartbeat written while it waited was in the future of the proof's now(), and the true claim was
+#    recorded 'refuted'. Now the row is read in a transaction of its own, before the one whose start is the proof's now().
+q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE tags (id int, tag text); INSERT INTO tags VALUES (4, ' [ops]');
+CREATE FUNCTION public.tag(int) RETURNS text LANGUAGE plpgsql STABLE AS
+ $f$ BEGIN RETURN (SELECT string_agg(t.tag, ',') FROM public.tags t WHERE t.id = $1); END $f$;
+CREATE TABLE notes2 (id int PRIMARY KEY, body text);
+INSERT INTO notes2 VALUES (4, 'no heartbeat is stamped in the future');
+GRANT SELECT ON notes2 TO pv_cc_a, pv_cc_v;
+GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, float8) TO pv_cc_v;
+SELECT phasevec.watch('w2', 'notes2'::regclass, 'id', $r$r.body || coalesce(public.tag(r.id), '')$r$, 'r1');
+SET ROLE pv_cc_a;
+SELECT phasevec.assert('w2', '4', 'public.no_future_beat()');
+RESET ROLE;
+SQL
+for how in "SELECT phasevec.verify_one('w2', '4', 10000)" \
+           "SELECT count(*) FROM phasevec.verify('w2', p_every => '0', p_timeout_ms => 10000)"; do
+    q -c "SET ROLE pv_cc_v" -c "SELECT phasevec.verify_one('w2', '4', 10000)" >/dev/null
+    q -c "BEGIN" -c "LOCK TABLE tags IN ACCESS EXCLUSIVE MODE" -c "SELECT pg_sleep(1.5)" -c "COMMIT" >/dev/null &
+    lk=$!
+    for _ in $(seq 1 200); do
+        [ "$(q -c "SELECT count(*) FROM pg_locks WHERE relation = 'tags'::regclass AND mode = 'AccessExclusiveLock' AND granted")" -gt 0 ] && break
+        pause 0.02
+    done
+    "$PG/psql" "${P[@]}" -U pv_cc_v -c "$how" >/dev/null 2>&1 &
+    vf=$!
+    for _ in $(seq 1 200); do
+        [ "$(q -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof' AND wait_event_type = 'Lock'")" -gt 0 ] && break
+        pause 0.02
+    done
+    beat=$(q -c "INSERT INTO beats VALUES (clock_timestamp()) RETURNING at")
+    wait $lk; wait $vf
+    row=$(q -c "SELECT phasevec._verdict(t) || ' ' || (t.verified_at > '$beat'::timestamptz) FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch WHERE w.name = 'w2' AND t.key = '4'")
+    now=$(q -c "SET ROLE pv_cc_a" -c "SELECT public.no_future_beat()")
+    case "$how" in *verify_one*) label=verify_one ;; *) label=verify ;; esac
+    echo "claim 4 ($label): recorded '$row' (verdict, stamped after the beat), the proof now: $now"
+    case "$row" in
+        "verified true") echo "ok - a wait in phasevec's read of the claim's row is not inside the proof's instant" ;;
+        *) echo "not ok - a true claim is recorded '$row' after a wait in phasevec's own read of its row"; fallas=1 ;;
+    esac
+done
+# 5. (fifteenth review) A wait as the claim is taken: phasevec.truth held (a LOCK, an ALTER) when the worker takes the
+#    claim in the transaction that judges it. Here the claim's row is slow to read (its recipe naps), and the table is
+#    locked during the nap: the take waits for it. The take is let go and tried again in a new transaction.
+q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE FUNCTION public.nap() RETURNS text LANGUAGE plpgsql STABLE AS
+ $f$ BEGIN PERFORM pg_sleep((SELECT c.s FROM public.ctl c)); RETURN ''; END $f$;
+CREATE TABLE notes3 (id int PRIMARY KEY, body text);
+INSERT INTO notes3 VALUES (5, 'no heartbeat is stamped in the future');
+GRANT SELECT ON notes3 TO pv_cc_a, pv_cc_v;
+SELECT phasevec.watch('w3', 'notes3'::regclass, 'id', $r$r.body || public.nap()$r$, 'r1');
+SET ROLE pv_cc_a;
+SELECT phasevec.assert('w3', '5', 'public.no_future_beat()');
+RESET ROLE;
+SQL
+q -c "SET ROLE pv_cc_v" -c "SELECT phasevec.verify_one('w3', '5', 10000)" >/dev/null
+q -c "UPDATE ctl SET s = 1"
+"$PG/psql" "${P[@]}" -U pv_cc_v -c "SELECT phasevec.verify_one('w3', '5', 10000)" >"$DATA/clock_b.out" 2>&1 &
+vf=$!
+for _ in $(seq 1 200); do
+    [ "$(q -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof' AND wait_event = 'PgSleep'")" -gt 0 ] && break
+    pause 0.02
+done
+q -c "UPDATE ctl SET s = 0"
+q -c "BEGIN" -c "LOCK TABLE phasevec.truth IN EXCLUSIVE MODE" -c "SELECT pg_sleep(2)" -c "COMMIT" >/dev/null &
+lk=$!
+for _ in $(seq 1 200); do
+    [ "$(q -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof' AND wait_event_type = 'Lock'")" -gt 0 ] && break
+    pause 0.02
+done
+waiting=$(q -c "SELECT string_agg(query, ', ') FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof' AND wait_event_type = 'Lock'")
+beat=$(q -c "INSERT INTO beats VALUES (clock_timestamp()) RETURNING at")
+wait $lk; wait $vf
+row=$(q -c "SELECT phasevec._verdict(t) || ' ' || (t.verified_at > '$beat'::timestamptz) FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch WHERE w.name = 'w3' AND t.key = '5'")
+echo "claim 5 (phasevec.truth held; the worker waited in '$waiting'): verify_one() $(tr '\n' ' ' < "$DATA/clock_b.out"); recorded '$row'"
+rm -f "$DATA/clock_b.out"
+[ -n "$waiting" ] || { echo "not ok - the test missed its window: the worker did not wait as it took the claim"; fallas=1; }
+case "$row" in
+    "verified true") echo "ok - a wait as the claim is taken is not inside the proof's instant" ;;
+    *) echo "not ok - a true claim is recorded '$row' after a wait as its claim was taken"; fallas=1 ;;
+esac
 left=$(q -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_phasevec proof'")
 [ "$left" = "0" ] || { echo "not ok - $left proof workers are left"; fallas=1; }
 exit $fallas

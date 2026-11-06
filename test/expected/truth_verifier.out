@@ -185,3 +185,6 @@ SELECT phasevec.verify_one($w$v2$w$, $k$2$k$);
  verified
 (1 row)
 
+DROP FUNCTION public.stubborn();
+DROP TABLE notes, invoices;
+DROP EXTENSION pg_phasevec;

@@ -1,0 +1,120 @@
+-- 0.20.0 (fifteenth review): every documented read path works for a role that may read the watched table and
+-- phasevec.truth, with no other grant, in a read-only session. In the fourteenth cut _verdict(t) was SQL that ran as its
+-- caller and called _bind(), which 0.20.0 closes to PUBLIC: yggdrasil's read-only reader (NOLOGIN, pg_read_all_data)
+-- got "permission denied for function _bind" as soon as verify() wrote a fresh verdict, and a reader granted only the
+-- table and phasevec.truth got it too (and, past it, "permission denied for table sources"). _verdict is a door now:
+-- the verdict to a role that may SELECT the watch's table (and see the row, under row-level security), NULL to others.
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes VALUES (1, $t$a true claim$t$), (2, $t$a false claim$t$);
+CREATE TABLE rnotes (id int PRIMARY KEY, body text);
+INSERT INTO rnotes VALUES (1, $t$seen$t$), (2, $t$hidden by a policy$t$);
+ALTER TABLE rnotes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY rnotes_seen ON rnotes FOR SELECT USING (id <> 2 OR current_user = $r$pv_rp_author$r$);
+SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+SELECT phasevec.watch($w$rnotes$w$, $w$rnotes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+SELECT count(phasevec.record(x.w, x.key, $n$r1$n$, x.text_hash, 7, ARRAY[1, 2, 3, 4]::smallint[]))
+  FROM (SELECT $w$notes$w$ AS w, n.* FROM phasevec.next($w$notes$w$) n
+        UNION ALL SELECT $w$rnotes$w$, n.* FROM phasevec.next($w$rnotes$w$) n) x;
+CREATE ROLE pv_rp_author;
+CREATE ROLE pv_rp_lector NOLOGIN;            -- yggdrasil's reader: pg_read_all_data, nothing else
+GRANT pg_read_all_data TO pv_rp_lector;
+CREATE ROLE pv_rp_plain NOLOGIN;             -- the watched table and phasevec.truth, nothing else
+GRANT USAGE ON SCHEMA phasevec TO pv_rp_author, pv_rp_plain;
+GRANT SELECT ON notes TO pv_rp_plain;
+GRANT SELECT ON notes, rnotes TO pv_rp_author;
+GRANT SELECT ON phasevec.truth TO pv_rp_plain;
+CREATE ROLE pv_rp_none NOLOGIN;              -- phasevec.truth only
+GRANT USAGE ON SCHEMA phasevec TO pv_rp_none;
+GRANT SELECT ON phasevec.truth TO pv_rp_none;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_rp_author;
+SET ROLE pv_rp_author;
+SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$true$p$, $t$a$t$);
+SELECT phasevec.assert($w$notes$w$, $k$2$k$, $p$false$p$, $t$b$t$);
+SELECT phasevec.assert($w$rnotes$w$, $k$1$k$, $p$true$p$, $t$a$t$);
+SELECT phasevec.assert($w$rnotes$w$, $k$2$k$, $p$true$p$, $t$b$t$);
+RESET ROLE;
+SELECT w.name, v.key, v.verdict FROM phasevec.watches w, phasevec.verify(w.name, 5000) v ORDER BY 1, 2;
+
+-- (a) _verdict as each reader, in a read-only transaction
+BEGIN READ ONLY;
+SET LOCAL ROLE pv_rp_lector;
+SELECT w.name, t.key, phasevec._verdict(t) FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch ORDER BY 1, 2;
+COMMIT;
+BEGIN READ ONLY;
+SET LOCAL ROLE pv_rp_plain;
+SELECT t.watch, t.key, phasevec._verdict(t) FROM phasevec.truth t ORDER BY 1, 2;
+COMMIT;
+BEGIN READ ONLY;
+SET LOCAL ROLE pv_rp_none;
+SELECT t.watch, t.key, phasevec._verdict(t) FROM phasevec.truth t ORDER BY 1, 2;
+-- a row made up for a table the caller may not read tests nothing: what the hidden row says is not shown
+SELECT phasevec._verdict(t) AS made_up
+  FROM (SELECT (x).* FROM (SELECT t AS x FROM phasevec.truth t WHERE t.key = $k$1$k$ ORDER BY t.watch LIMIT 1) y) t;
+COMMIT;
+-- the owner reads the same verdicts it always did
+SELECT w.name, t.key, phasevec._verdict(t) FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch ORDER BY 1, 2;
+
+-- (b) every function the README gives a reader, as each reader, read-only: what is open to PUBLIC, and what the
+-- README says to grant (brief, alike, find_hybrid, recall_check, the audit functions). A refusal of rights is a
+-- failure; NULL arguments and empty answers are not.
+GRANT EXECUTE ON FUNCTION phasevec.brief(text, int), phasevec.alike(text, text, int, boolean),
+    phasevec.find_hybrid(text, text, bigint, smallint[], int, boolean, int, bit, int), phasevec.recall_check(text),
+    phasevec.coverage(text), phasevec.coverage_check(text), phasevec.truncations(text),
+    phasevec.dupes(text, double precision)
+  TO pv_rp_lector, pv_rp_plain;
+CREATE FUNCTION pg_temp.read_paths() RETURNS TABLE (path text, outcome text) LANGUAGE plpgsql AS $f$
+DECLARE
+    q text;
+    n bigint;
+BEGIN
+    FOREACH q IN ARRAY ARRAY[
+        $q$SELECT count(*) FROM phasevec.truth t WHERE phasevec._verdict(t) IS NOT NULL$q$,
+        $q$SELECT count(*) FROM phasevec.brief('notes')$q$,
+        $q$SELECT count(*) FROM phasevec.recall('notes', NULL, 10, false)$q$,
+        $q$SELECT count(*) FROM phasevec.disputes('notes')$q$,
+        $q$SELECT count(*) FROM phasevec.replacement('notes', '1')$q$,
+        $q$SELECT count(*) FROM phasevec.truth_coverage('notes')$q$,
+        $q$SELECT count(*) FROM phasevec.find('notes', 7, ARRAY[1, 2, 3, 4]::smallint[], 10)$q$,
+        $q$SELECT count(*) FROM phasevec.find_ivf('notes', 7, ARRAY[1, 2, 3, 4]::smallint[], 10, true)$q$,
+        $q$SELECT count(*) FROM phasevec.find_npu('notes', ARRAY[1, 2, 3, 4]::smallint[], 10)$q$,
+        $q$SELECT count(*) FROM phasevec.alike('notes', '1', 5)$q$,
+        $q$SELECT count(*) FROM phasevec.find_hybrid('notes', 'claim', 7, ARRAY[1, 2, 3, 4]::smallint[], 10, true)$q$,
+        $q$SELECT count(*) FROM phasevec.coverage('notes')$q$,
+        $q$SELECT count(*) FROM phasevec.coverage_check('notes')$q$,
+        $q$SELECT count(*) FROM phasevec.truncations('notes')$q$,
+        $q$SELECT count(*) FROM phasevec.dupes('notes', 0.99)$q$,
+        $q$SELECT count(*) FROM phasevec.recall_check('notes')$q$]
+    LOOP
+        path := substring(q FROM 'phasevec\.([a-z_]+)\(');
+        BEGIN
+            EXECUTE q INTO n;
+            outcome := 'ok';
+        EXCEPTION WHEN insufficient_privilege THEN
+            outcome := 'REFUSED: ' || SQLERRM;
+        WHEN OTHERS THEN
+            outcome := 'ok (' || SQLSTATE || ': ' || SQLERRM || ')';
+        END;
+        RETURN NEXT;
+    END LOOP;
+END
+$f$;
+BEGIN READ ONLY;
+SET LOCAL ROLE pv_rp_lector;
+SELECT * FROM pg_temp.read_paths();
+COMMIT;
+BEGIN READ ONLY;
+SET LOCAL ROLE pv_rp_plain;
+SELECT * FROM pg_temp.read_paths();
+COMMIT;
+
+DROP TABLE notes, rnotes;
+DROP EXTENSION pg_phasevec;
+DROP OWNED BY pv_rp_author, pv_rp_lector, pv_rp_plain, pv_rp_none;
+DROP ROLE pv_rp_author;
+DROP ROLE pv_rp_lector;
+DROP ROLE pv_rp_plain;
+DROP ROLE pv_rp_none;
