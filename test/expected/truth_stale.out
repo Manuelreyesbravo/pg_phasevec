@@ -1,0 +1,124 @@
+-- 0.20.0 (sixth review): a row edited and put back. verify() wrote 'unproven' over the verdict of a claim whose row
+-- said something else when it looked, and that verdict stayed when the row was put back: a writer that edited a row
+-- for a moment, while a routine verify() ran, erased a refutation (or a verification) until the claim was due again
+-- (p_every). The lazy read (_verdict) said 'refuted' again as soon as the text was back. Now verify() leaves the
+-- verdict bound to the text it judged, records that it looked (looked_at), and the claim is not due again for that
+-- same text until p_every: both reads agree.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+CREATE TABLE notes (id int PRIMARY KEY, body text);
+INSERT INTO notes SELECT g, $t$claim $t$ || g FROM generate_series(1, 5) g;
+SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+SELECT phasevec.assert($w$notes$w$, $k$3$k$, $p$false$p$), phasevec.assert($w$notes$w$, $k$4$k$, $p$false$p$),
+       phasevec.assert($w$notes$w$, $k$5$k$, $p$true$p$);
+ assert | assert | assert 
+--------+--------+--------
+        |        | 
+(1 row)
+
+SELECT key, verdict FROM phasevec.verify($w$notes$w$, 10, interval '0') ORDER BY key;
+ key | verdict  
+-----+----------
+ 3   | refuted
+ 4   | refuted
+ 5   | verified
+(3 rows)
+
+-- a writer edits the rows; a routine verify() (every day) runs meanwhile
+UPDATE notes SET body = body || $t$ (edited)$t$ WHERE id IN (3, 4, 5);
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, 10, interval '1 day') ORDER BY key;
+ key | verdict  |                                               error                                               
+-----+----------+---------------------------------------------------------------------------------------------------
+ 3   | unproven | the row does not say what was asserted (it changed, or it was not readable then): assert it again
+ 4   | unproven | the row does not say what was asserted (it changed, or it was not readable then): assert it again
+ 5   | unproven | the row does not say what was asserted (it changed, or it was not readable then): assert it again
+(3 rows)
+
+SELECT key, verdict, phasevec._verdict(t), looked_at IS NOT NULL AS looked FROM phasevec.truth t ORDER BY key;
+ key | verdict  | _verdict | looked 
+-----+----------+----------+--------
+ 3   | refuted  | unproven | t
+ 4   | refuted  | unproven | t
+ 5   | verified | unproven | t
+(3 rows)
+
+-- looked at once for that text: not due again for it
+SELECT count(*) AS due FROM phasevec.verify($w$notes$w$, 10, interval '1 day');
+ due 
+-----
+   0
+(1 row)
+
+-- edited again: due again
+UPDATE notes SET body = body || $t$+$t$ WHERE id = 5;
+SELECT key, verdict FROM phasevec.verify($w$notes$w$, 10, interval '1 day') ORDER BY key;
+ key | verdict  
+-----+----------
+ 5   | unproven
+(1 row)
+
+-- put back: the verdicts read as they were, written and read alike, and none is due
+UPDATE notes SET body = replace(replace(body, $t$ (edited)+$t$, $t$$t$), $t$ (edited)$t$, $t$$t$) WHERE id IN (3, 4, 5);
+SELECT key, verdict, phasevec._verdict(t) FROM phasevec.truth t ORDER BY key;
+ key | verdict  | _verdict 
+-----+----------+----------
+ 3   | refuted  | refuted
+ 4   | refuted  | refuted
+ 5   | verified | verified
+(3 rows)
+
+SELECT count(*) AS due FROM phasevec.verify($w$notes$w$, 10, interval '1 day');
+ due 
+-----
+   0
+(1 row)
+
+SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key;
+ key | verdict  
+-----+----------
+ 1   | unproven
+ 2   | unproven
+ 5   | verified
+(3 rows)
+
+-- the row gone: the same; back, the same verdict
+DELETE FROM notes WHERE id = 3;
+SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, 10, interval '1 day') ORDER BY key;
+ key | verdict  |                   error                    
+-----+----------+--------------------------------------------
+ 3   | unproven | the row is gone: there is nothing to judge
+(1 row)
+
+INSERT INTO notes VALUES (3, $t$claim 3$t$);
+SELECT key, verdict, phasevec._verdict(t) FROM phasevec.truth t WHERE key = $k$3$k$;
+ key | verdict | _verdict 
+-----+---------+----------
+ 3   | refuted | refuted
+(1 row)
+
+-- asserted again: due, and judged
+SELECT phasevec.assert($w$notes$w$, $k$4$k$, $p$true$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SELECT key, verdict FROM phasevec.verify($w$notes$w$, 10, interval '1 day') ORDER BY key;
+ key | verdict  
+-----+----------
+ 4   | verified
+(1 row)
+
+DROP TABLE notes;
+DROP EXTENSION pg_phasevec;

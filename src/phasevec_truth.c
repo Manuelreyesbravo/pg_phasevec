@@ -859,11 +859,12 @@ typedef enum Outcome
 {
 	OUT_VERIFIED,
 	OUT_REFUTED,
-	OUT_UNPROVEN,				/* nothing judged: no row, not the asserted text, author gone */
+	OUT_UNPROVEN,				/* nothing judged: the author gone, or kept from the row */
+	OUT_STALE,					/* nothing judged: the row is gone, or does not say what was asserted */
 	OUT_MOVED					/* the row changed while the proof ran: nothing recorded */
 } Outcome;
 
-static const char *const outcome_name[] = {"verified", "refuted", "unproven", NULL};
+static const char *const outcome_name[] = {"verified", "refuted", "unproven", "stale", NULL};
 
 typedef struct Judgment
 {
@@ -972,18 +973,29 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		{
 			phase = 0;
 			read_row(target, key, &first, oldcontext);
-			if (first.found && author_rls && !key_visible(target, as_role, mode, env, key))
-				first.found = false;
 			phase = 1;
+
+			/*
+			 * A row that is gone or says something else is stale, not judged: the verdict stays bound to the text it
+			 * judged, and reads 'unproven' only while the row does not say it (_verdict). Until the sixth review
+			 * verify() wrote 'unproven' over it, and a writer that edited a row and put it back erased a refutation
+			 * until the claim was due again (p_every).
+			 */
 			if (!first.found)
 			{
+				out = OUT_STALE;
+				err = "the row is gone: there is nothing to judge";
+				ready = false;
+			}
+			else if (author_rls && !key_visible(target, as_role, mode, env, key))
+			{
 				out = OUT_UNPROVEN;
-				err = "the row is gone, or its author cannot see it: there is nothing to judge";
+				err = "its author cannot see the row: there is nothing to judge";
 				ready = false;
 			}
 			else if (!same_bytes(first.hash, asserted_for))
 			{
-				out = OUT_UNPROVEN;
+				out = OUT_STALE;
 				err = "the row does not say what was asserted (it changed, or it was not readable then): assert it again";
 				ready = false;
 			}
@@ -1306,16 +1318,23 @@ judge_claim(const Claim *c, int timeout_ms, double max_cost, const Target *t, Re
 }
 
 /*
- * Take the claim's row before judging it, or leave it: another verify() (or an assert()) holds it. Without this, two
+ * Take the claim's row before judging it, or leave it: another verify() (or an assert()) holds it. It must still be
+ * due, by the rule of phasevec._truth_due (a stale claim once for each text it reads; one whose verdict and last
+ * look are both older than p_every is due either way, and the row's text is not read for it). Without this, two
  * verify() calls of one watch locked the rows of their due lists in different orders when the table took writes
  * (in the fifth cut the watch trigger wrote verdict rows too) and deadlocked: 54-70% of the calls failed, and an
  * aborted call lost every verdict it had reached. With it no verify() waits on a verdict row, so none deadlocks on
  * one, and none judges a claim another is judging, or judged since its due list was read (it is no longer due).
  */
+#define LOCK_OLD(c) "t." c " IS NULL OR t." c " OPERATOR(pg_catalog.<) (pg_catalog.now() OPERATOR(pg_catalog.-) $3)"
 #define CLAIM_LOCK_SQL \
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND NOT t.halted AND (t.verified_at IS NULL OR t.verified_at OPERATOR(pg_catalog.<) " \
-	"(pg_catalog.now() OPERATOR(pg_catalog.-) $3) OR phasevec._truth_stale(t)) FOR NO KEY UPDATE SKIP LOCKED"
+	"AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
+	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
+	"AND t.asserted_for IS DISTINCT FROM h THEN " LOCK_OLD("looked_at") " OR t.looked_for IS DISTINCT FROM h " \
+	"ELSE " LOCK_OLD("verified_at") " END " \
+	"FROM (SELECT (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch OPERATOR(pg_catalog.=) t.watch " \
+	"AND s.key OPERATOR(pg_catalog.=) t.key) AS h) s)) FOR NO KEY UPDATE SKIP LOCKED"
 
 static bool
 claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, Datum every)

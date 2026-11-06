@@ -105,7 +105,8 @@
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
-                           ADD COLUMN proof_env text[], ADD COLUMN halted boolean NOT NULL DEFAULT false;
+                           ADD COLUMN proof_env text[], ADD COLUMN halted boolean NOT NULL DEFAULT false,
+                           ADD COLUMN looked_at timestamptz, ADD COLUMN looked_for bytea;
 COMMENT ON COLUMN phasevec.truth.asserted_by IS
     $q$The name of the role that asserted the proof, when it did (0.20.0). With asserted_by_oid: the proof runs as that role only while the OID still has this name.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by_oid IS
@@ -114,6 +115,10 @@ COMMENT ON COLUMN phasevec.truth.asserted_for IS
     $q$What the author vouched for (0.20.0): sha256 of the row's text as the recipe renders it (as the table's owner, in pinned settings) when it asserted. NULL when there was no row it could see.$q$;
 COMMENT ON COLUMN phasevec.truth.verified_for IS
     $q$What the verdict judged (0.20.0): phasevec._bind of the claim (asserted_for, proof, author, proof_env). A 'verified' that does not match the claim, or whose text is not the row's, reads 'unproven'.$q$;
+COMMENT ON COLUMN phasevec.truth.looked_at IS
+    $q$When verify() last found the row gone or saying something else than what was asserted (0.20.0): the verdict is left bound to the text it judged, and the claim is not due again for that text until p_every has passed.$q$;
+COMMENT ON COLUMN phasevec.truth.looked_for IS
+    $q$The row's text hash (phasevec.sources) when verify() found it stale (looked_at); NULL when the row was gone (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.proof_env IS
     $q$The author's settings when it asserted ("name=value": DateStyle, TimeZone, search_path, ...): the proof runs with them (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.halted IS
@@ -168,7 +173,8 @@ BEGIN
            asserted_by_oid = EXCLUDED.asserted_by_oid, asserted_for = EXCLUDED.asserted_for,
            proof_env = EXCLUDED.proof_env, halted = false,
            verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$unproven$q$ END,
-           verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now();
+           verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now(),
+           looked_at = NULL, looked_for = NULL;
 END;
 $f$;
 CREATE OR REPLACE FUNCTION phasevec.assert(p_watch text, p_key text, p_proof text DEFAULT NULL, p_topic text DEFAULT NULL,
@@ -216,10 +222,17 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
            phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env)
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
-     CROSS JOIN LATERAL (SELECT phasevec._truth_stale(t) AS stale) x
+     CROSS JOIN LATERAL (SELECT (SELECT s.text_hash FROM phasevec.sources s
+                                  WHERE s.watch = t.watch AND s.key = t.key) AS text_hash) s
+     CROSS JOIN LATERAL (SELECT t.verdict IN ($q$verified$q$, $q$refuted$q$)
+                                AND t.asserted_for IS DISTINCT FROM s.text_hash AS stale) x
      WHERE t.watch = p_watch AND t.proof IS NOT NULL AND t.verdict <> $q$replaced$q$
        AND t.asserted_by_oid IS NOT NULL AND NOT t.halted
-       AND (t.verified_at IS NULL OR t.verified_at < now() - p_every OR x.stale)
+       -- a stale claim is due once for each text it reads (verify() records that it looked: looked_at,
+       -- looked_for), and again for the same text after p_every; any other, when its verdict is older than p_every
+       AND CASE WHEN x.stale
+                THEN t.looked_at IS NULL OR t.looked_at < now() - p_every OR t.looked_for IS DISTINCT FROM s.text_hash
+                ELSE t.verified_at IS NULL OR t.verified_at < now() - p_every END
        AND (r.oid IS NULL OR pg_catalog.pg_has_role(p_verifier, r.oid, $q$USAGE$q$))
      ORDER BY CASE WHEN x.stale THEN NULL ELSE t.verified_at END NULLS FIRST, t.key
      LIMIT p_n
@@ -247,10 +260,23 @@ CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_e
 RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE v text;
 BEGIN
+    IF p_outcome = $q$stale$q$ THEN
+        -- the row is gone or says something else, and the watch trigger saw it too (the verdict reads 'unproven'
+        -- already): the verdict is left bound to the text it judged; only that verify() looked is recorded. When
+        -- the trigger did not see it (_truth_stale is false), the row and the claim disagree: 'unproven'.
+        UPDATE phasevec.truth t
+           SET looked_at = now(),
+               looked_for = (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = t.watch AND s.key = t.key)
+         WHERE t.watch = p_watch AND t.key = p_key AND t.verdict IN ($q$verified$q$, $q$refuted$q$)
+           AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+           AND phasevec._truth_stale(t);
+        p_outcome := CASE WHEN FOUND THEN NULL ELSE $q$unproven$q$ END;
+    END IF;
     IF p_outcome IS NOT NULL THEN
         UPDATE phasevec.truth t
            SET verdict = p_outcome, verified_at = coalesce(p_at, now()), last_error = p_error, halted = false,
-               verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END
+               verified_for = CASE WHEN p_outcome IN ($q$verified$q$, $q$refuted$q$) THEN p_bind END,
+               looked_at = NULL, looked_for = NULL
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
     END IF;
