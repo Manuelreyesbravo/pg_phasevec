@@ -39,6 +39,7 @@
 #include <string.h>
 
 #include "access/htup_details.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/partition.h"
 #include "catalog/pg_authid.h"
@@ -75,6 +76,7 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
+#include "utils/typcache.h"
 
 #include "phasevec_guard.h"
 
@@ -1796,14 +1798,15 @@ note_set(int32 watch, const char *key, Datum hash, bool hash_null, const char *b
 }
 
 /*
- * The watch trigger's reading of a row, prepared once per watch and row type (a partition has its own) and kept:
- * prepared inside the guard, as the table's owner in the pinned settings, as it always runs. A watch whose recipe,
- * key column or table owner changed is prepared again, and so is one whose table's columns changed: the plan binds
- * them. "(SELECT ($2).*) r" is expanded by column number when it is parsed, and the composite parameter gives the
- * plan cache no dependency on the table, so in the fifth cut a session that wrote before a RENAME, DROP and ADD, or
- * ALTER COLUMN TYPE kept hashing the old column (a changed row stayed 'fresh'), or failed every later write with
- * "attribute N has wrong type", until it reconnected. The plan is kept with the row type it was parsed for (names,
- * types, typmods, collations, dropped columns: equalRowTypes), and parsed again when the table's is another.
+ * The watch trigger's reading of a row, prepared once per watch and row type (a partition's row is read as one of
+ * the watch's table) and kept: prepared inside the guard, as the table's owner in the pinned settings, as it always
+ * runs. A watch whose recipe, key column or table owner changed is prepared again, and so is one whose table's
+ * columns changed: the plan binds them. "(SELECT ($2).*) r" is expanded by column number when it is parsed, and the
+ * composite parameter gives the plan cache no dependency on the table, so in the fifth cut a session that wrote
+ * before a RENAME, DROP and ADD, or ALTER COLUMN TYPE kept hashing the old column (a changed row stayed 'fresh'), or
+ * failed every later write with "attribute N has wrong type", until it reconnected. The plan is kept with the row
+ * type it was parsed for (names, types, typmods, collations, dropped columns: equalRowTypes), and parsed again when
+ * the table's is another.
  */
 typedef struct ObserveKey
 {
@@ -1934,6 +1937,29 @@ phasevec_observe(PG_FUNCTION_ARGS)
 		volatile int mark = guard_mark();
 		Oid			rowtype = RelationGetForm(rel)->reltype;
 		TupleDesc	desc = RelationGetDescr(rel);
+
+		/*
+		 * A partition's row is read as a row of the watch's table, in its columns and their order: the recipe sees
+		 * the same r here as in _render() and verify(), which read the table. Until the sixth review it saw the
+		 * partition's own row type, and a partition whose columns stood in another order (attached, or after a DROP
+		 * and ADD) noted a whole-row recipe's text (r::text, row_to_json(r)) in that order: its claims never read
+		 * as the text asserted, and its rows were indexed with that text.
+		 */
+		if (t.relid != RelationGetRelid(rel))
+		{
+			TupleDesc	tdesc = lookup_rowtype_tupdesc_copy(get_rel_type_id(t.relid), -1);
+			TupleConversionMap *map = convert_tuples_by_name(desc, tdesc);
+
+			if (map != NULL)
+			{
+				if (oldt)
+					oldt = execute_attr_map_tuple(oldt, map);
+				if (newt)
+					newt = execute_attr_map_tuple(newt, map);
+			}
+			desc = tdesc;
+			rowtype = tdesc->tdtypeid;
+		}
 
 		PG_TRY();
 		{

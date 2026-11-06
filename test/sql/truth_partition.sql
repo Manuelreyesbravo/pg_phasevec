@@ -1,0 +1,41 @@
+-- 0.20.0 (sixth review): a partition whose columns stand in another order. The watch trigger read a partition's row
+-- in the partition's own row type, and _render() and verify() read the table's: a recipe that uses the whole row
+-- (r::text, row_to_json(r)) noted another text for that partition's rows, so their claims never read as asserted
+-- (asserted again, still 'unproven') and the rows were indexed with that text. Now the trigger reads a partition's
+-- row as a row of the watch's table.
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+CREATE TABLE pn (id int PRIMARY KEY, body text, tag text) PARTITION BY RANGE (id);
+CREATE TABLE pn1 PARTITION OF pn FOR VALUES FROM (1) TO (100);
+CREATE TABLE pn2 (tag text, body text, id int NOT NULL);
+ALTER TABLE pn ATTACH PARTITION pn2 FOR VALUES FROM (100) TO (200);
+-- and one whose columns were dropped and added
+CREATE TABLE pn3 (junk int, id int NOT NULL, body text, tag text);
+ALTER TABLE pn3 DROP COLUMN junk;
+ALTER TABLE pn ATTACH PARTITION pn3 FOR VALUES FROM (200) TO (300);
+INSERT INTO pn VALUES (1, $t$one$t$, $t$a$t$), (150, $t$one-fifty$t$, $t$b$t$), (250, $t$two-fifty$t$, $t$c$t$);
+SELECT phasevec.watch($w$pn$w$, $w$pn$w$::regclass, $k$id$k$, $r$r::text$r$, $n$r1$n$) > 0 AS watch;
+SELECT phasevec.assert($w$pn$w$, k, $p$true$p$) FROM unnest(ARRAY[$k$1$k$, $k$150$k$, $k$250$k$]) k;
+SELECT key, verdict FROM phasevec.verify($w$pn$w$, 100, interval '0') ORDER BY key::int;
+-- writes through the table and straight into a partition, one that changes nothing
+UPDATE pn SET tag = tag;
+INSERT INTO pn VALUES (2, $t$two$t$, $t$c$t$), (151, $t$x$t$, $t$d$t$);
+INSERT INTO pn2 (tag, body, id) VALUES ($t$e$t$, $t$direct$t$, 152);
+UPDATE pn2 SET body = body || $t$!$t$ WHERE id = 152;
+SELECT s.key, s.text_hash = r.text_hash AS same, r.body
+  FROM phasevec.sources s JOIN phasevec._render($w$pn$w$, NULL) r USING (key)
+ WHERE s.watch = (SELECT id FROM phasevec.watches WHERE name = $w$pn$w$) ORDER BY s.key::int;
+SELECT key, phasevec._verdict(t) FROM phasevec.truth t ORDER BY key::int;
+SELECT key, verdict FROM phasevec.verify($w$pn$w$, 100, interval '0') ORDER BY key::int;
+-- a row moved to another partition, and one deleted
+UPDATE pn SET id = 160 WHERE id = 2;
+DELETE FROM pn WHERE id = 151;
+SELECT s.key, s.text_hash = r.text_hash AS same
+  FROM phasevec.sources s FULL JOIN phasevec._render($w$pn$w$, NULL) r USING (key)
+ WHERE coalesce(s.watch, (SELECT id FROM phasevec.watches WHERE name = $w$pn$w$))
+       = (SELECT id FROM phasevec.watches WHERE name = $w$pn$w$) ORDER BY 1::int;
+
+DROP TABLE pn;
+DROP EXTENSION pg_phasevec;
