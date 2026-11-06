@@ -1,0 +1,109 @@
+-- 0.20.0 (fourth review): a pinned call (_render, brief, verify, ...) reads the session's settings and cursors once,
+-- into a pin. When the call ended in an error caught by a savepoint, its pin stayed behind: pins were cleared only
+-- when a transaction aborted, never when it committed, and a pin was taken as current while a subtransaction with
+-- its id was open. Subtransaction ids start over in every transaction, so the watch trigger of a later write inside
+-- a savepoint took that pin, whose lists were in memory already freed: it read garbage and the server restarted
+-- (signal 11), or it read the old lists and rendered with the writer's own settings. A writer with INSERT on a
+-- watched table could restart the server. Against 7f37426 this file ends the backend at its first INSERT.
+\set VERBOSITY terse
+
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+CREATE TABLE pin_flag (boom boolean);
+INSERT INTO pin_flag VALUES (false);
+CREATE TABLE pin_docs (id int PRIMARY KEY, body text);
+INSERT INTO pin_docs SELECT g, $t$doc $t$ || g FROM generate_series(1, 50) g;
+-- the recipe prints a custom setting (a render runs at every setting's default: it must print nothing) and fails
+-- while the flag is up
+CREATE FUNCTION pin_rec(b text) RETURNS text LANGUAGE sql STABLE AS $f$
+    SELECT b || ' mode=' || coalesce(current_setting('app.mode', true), '')
+           || CASE WHEN (SELECT boom FROM public.pin_flag) THEN (1 / (SELECT 0))::text ELSE '' END
+$f$;
+SELECT phasevec.watch($w$pin_docs$w$, $w$pin_docs$w$::regclass, $k$id$k$, $r$public.pin_rec(r.body)$r$, $n$r1$n$) > 0
+    AS watch;
+-- what the watch noted for a key, against the text a render at the defaults gives
+CREATE FUNCTION pin_noted(k text, b text) RETURNS boolean LANGUAGE sql AS $f$
+    SELECT s.text_hash = sha256(convert_to(b || ' mode=', 'UTF8'))
+      FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch
+     WHERE w.name = 'pin_docs' AND s.key = k
+$f$;
+-- settings off their default: the pin's list of them is long, and its freed memory is soon someone else's
+SELECT count(set_config($s$app.p$s$ || g, $v$v$v$, false)) FROM generate_series(1, 200) g;
+
+-- (1) the render fails inside its pin; the savepoint catches it; the transaction commits
+UPDATE pin_flag SET boom = true;
+BEGIN;
+SAVEPOINT s;
+SELECT count(*) FROM phasevec._render($w$pin_docs$w$, NULL);
+ROLLBACK TO s;
+COMMIT;
+UPDATE pin_flag SET boom = false;
+-- a later transaction writes inside a savepoint (subtransaction id 2 again), with a setting of its own
+BEGIN;
+SET LOCAL app.mode = 'writer';
+SAVEPOINT s;
+INSERT INTO pin_docs VALUES (101, $t$after a caught render$t$);
+RELEASE s;
+COMMIT;
+SELECT pin_noted($k$101$k$, $t$after a caught render$t$) AS rendered_at_defaults;
+
+-- (2) the same, caught by a PL/pgSQL exception block
+UPDATE pin_flag SET boom = true;
+DO $d$
+BEGIN
+    PERFORM count(*) FROM phasevec._render('pin_docs', NULL);
+EXCEPTION WHEN division_by_zero THEN
+    RAISE NOTICE 'caught: %', SQLERRM;
+END $d$;
+UPDATE pin_flag SET boom = false;
+BEGIN;
+SET LOCAL app.mode = 'writer';
+SAVEPOINT a;
+SAVEPOINT b;
+UPDATE pin_docs SET body = $t$after a caught block$t$ WHERE id = 1;
+COMMIT;
+SELECT pin_noted($k$1$k$, $t$after a caught block$t$) AS rendered_at_defaults;
+
+-- (3) in the same transaction: the savepoint that caught it is gone, and the next one is not it
+UPDATE pin_flag SET boom = true;
+BEGIN;
+SAVEPOINT s;
+SELECT count(*) FROM phasevec._render($w$pin_docs$w$, NULL);
+ROLLBACK TO s;
+UPDATE pin_flag SET boom = false;
+SET LOCAL app.mode = 'writer';
+SAVEPOINT s;
+INSERT INTO pin_docs VALUES (102, $t$same transaction$t$);
+COMMIT;
+SELECT pin_noted($k$102$k$, $t$same transaction$t$) AS rendered_at_defaults;
+
+-- (4) many times over: every caught failure leaves nothing behind
+UPDATE pin_flag SET boom = true;
+DO $d$
+BEGIN
+    FOR i IN 1 .. 40 LOOP
+        BEGIN
+            PERFORM count(*) FROM phasevec._render('pin_docs', NULL);
+        EXCEPTION WHEN division_by_zero THEN NULL;
+        END;
+    END LOOP;
+END $d$;
+UPDATE pin_flag SET boom = false;
+BEGIN;
+SET LOCAL app.mode = 'writer';
+SAVEPOINT a;
+SAVEPOINT b;
+SAVEPOINT c;
+INSERT INTO pin_docs SELECT g, $t$burst $t$ || g FROM generate_series(200, 260) g;
+COMMIT;
+SELECT count(*) FILTER (WHERE pin_noted(g::text, $t$burst $t$ || g)) AS rendered_at_defaults
+  FROM generate_series(200, 260) g;
+-- and a pinned call that ends well still renders at the defaults
+SET app.mode = 'caller';
+SELECT count(*) FILTER (WHERE body LIKE '% mode=') AS at_defaults, count(*) AS rows
+  FROM phasevec._render($w$pin_docs$w$, NULL);
+RESET app.mode;
+
+DROP TABLE pin_docs, pin_flag;
+DROP FUNCTION pin_rec(text), pin_noted(text, text);
+DROP EXTENSION pg_phasevec;

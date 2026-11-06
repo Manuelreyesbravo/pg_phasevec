@@ -28,6 +28,8 @@
  *   numbers, set_config): pg_notify, the advisory locks, setseed, currval, the large-object descriptors, signalling a
  *   backend, and every volatile system function no one reviewed are refused, as are pg_cursor and
  *   pg_prepared_statement, which read the session's own statements.
+ * - Nothing it keeps outlives what it was kept for: a guard and a pin (the settings and cursors a call reads once)
+ *   end with their subtransaction and with their transaction, however they end (guard_subxact, guard_xact).
  */
 #include "postgres.h"
 
@@ -350,14 +352,24 @@ apply_pins(void)
 /*
  * A pinned call (verify, brief, _render, ...) opens many guards one after the other, and between them only
  * phasevec's own code runs: the settings off their default and the open cursors are the same at each. They are read
- * once, when the call pins its settings, and each guard opened directly in the call uses them. A pin whose
- * subtransaction is gone (its call ended in an error, caught further out) is never used again.
+ * once, when the call pins its settings, and each guard opened directly in the call uses them.
+ *
+ * A pin has an owner and a lifetime: the subtransaction it was made in, in the transaction it was made in. Its lists
+ * live in a memory context of its own under that transaction's, and it is taken off the stack when its call unpins
+ * it, when its subtransaction is rolled back (its call ended in an error a savepoint or an exception block caught:
+ * guard_subxact), and, all of them, when the transaction ends in any way (guard_xact). A subtransaction id is never
+ * trusted alone: ids start over in every transaction, so a pin also names the transaction it belongs to. Until the
+ * fourth review of 0.20.0 pins were cleared only when a transaction aborted: a pin left by a call whose error a
+ * savepoint caught outlived a COMMIT, and the watch trigger of a later write inside a savepoint (the same
+ * subtransaction id, in another transaction) took it, with its lists in freed memory: the server restarted.
  */
 typedef struct Pin
 {
 	int			nest;
+	uint64		xact;			/* the transaction it was made in (xact_count when it was made) */
 	SubTransactionId subid;		/* the subtransaction it was made in */
 	int			depth;			/* the guard depth it was made at */
+	MemoryContext cxt;			/* its lists: a child of TopTransactionContext */
 	List	   *nondefault;		/* names of the replayable settings off their default */
 	List	   *portals;		/* names of the cursors pg_cursors listed */
 } Pin;
@@ -365,14 +377,31 @@ typedef struct Pin
 static Pin	pins[GUARD_MAX];
 static int	npins = 0;
 
+/* Transactions ended in this session: a pin of an earlier one is never current. */
+static uint64 xact_count = 0;
+
 static List *nondefault_names(void);
 static List *visible_portals(void);
+
+static void
+pop_pin(void)
+{
+	Pin		   *p = &pins[--npins];
+
+	/* a pin of an ended transaction went with its memory */
+	if (p->cxt != NULL && p->xact == xact_count)
+		MemoryContextDelete(p->cxt);
+	p->cxt = NULL;
+	p->nondefault = NIL;
+	p->portals = NIL;
+}
 
 static Pin *
 current_pin(void)
 {
-	while (npins > 0 && !SubTransactionIsActive(pins[npins - 1].subid))
-		npins--;
+	while (npins > 0 &&
+		   (pins[npins - 1].xact != xact_count || !SubTransactionIsActive(pins[npins - 1].subid)))
+		pop_pin();
 	if (npins > 0 && pins[npins - 1].depth == guard_depth)
 		return &pins[npins - 1];
 	return NULL;
@@ -385,16 +414,23 @@ guard_pin_settings(void)
 	Pin		   *p;
 
 	while (npins > 0 && pins[npins - 1].nest >= nest)
-		npins--;
+		pop_pin();
 	apply_pins();
 	if (npins < GUARD_MAX)
 	{
-		p = &pins[npins++];
+		MemoryContext o;
+
+		p = &pins[npins];
+		p->cxt = AllocSetContextCreate(TopTransactionContext, "phasevec pin", ALLOCSET_SMALL_SIZES);
 		p->nest = nest;
+		p->xact = xact_count;
 		p->subid = GetCurrentSubTransactionId();
 		p->depth = guard_depth;
+		o = MemoryContextSwitchTo(p->cxt);
 		p->nondefault = nondefault_names();
 		p->portals = visible_portals();
+		MemoryContextSwitchTo(o);
+		npins++;
 	}
 	return nest;
 }
@@ -403,7 +439,7 @@ void
 guard_unpin_settings(int nest)
 {
 	while (npins > 0 && pins[npins - 1].nest >= nest)
-		npins--;
+		pop_pin();
 	AtEOXact_GUC(false, nest);
 }
 
@@ -553,12 +589,12 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 static void
 unwind_one(void)
 {
-	Level	   *L = &levels[guard_depth - 1];
+	Level	   *L = &levels[--guard_depth];
 
 	thaw_to(L->frozen_base);
+	/* off the stack first: guard_subxact sees the rollback of a guard no longer open */
 	while (IsSubTransaction() && GetCurrentSubTransactionId() >= L->subid)
 		RollbackAndReleaseCurrentSubTransaction();
-	guard_depth--;
 	SetUserIdAndSecContext(L->userid, L->sec);
 	MemoryContextSwitchTo(L->cxt);
 	CurrentResourceOwner = L->owner;
@@ -586,15 +622,49 @@ guard_catch(int mark, MemoryContext cxt)
 	return e;
 }
 
-/* The transaction ended with guards open (an error no one caught): nothing stays frozen. */
+/*
+ * The end of a transaction ends everything phasevec keeps for it, however it ends: guards (an error no one caught),
+ * frozen cursors and pins. A transaction cannot commit or prepare inside a guard (only an error leaves one open).
+ */
 static void
 guard_xact(XactEvent event, void *arg)
 {
-	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+	switch (event)
 	{
-		thaw_to(0);
-		guard_depth = 0;
-		npins = 0;
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+		case XACT_EVENT_PRE_PREPARE:
+			if (guard_depth > 0)
+				elog(ERROR, "phasevec: a transaction cannot end inside code phasevec runs");
+			break;
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			thaw_to(0);
+			guard_depth = 0;
+			npins = 0;			/* their memory goes with TopTransactionContext */
+			xact_count++;
+			break;
+	}
+}
+
+/*
+ * A subtransaction rolled back takes with it every pin made in it or in one under it (their ids are greater), and
+ * every guard opened there that phasevec did not close itself.
+ */
+static void
+guard_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId parentSubid, void *arg)
+{
+	if (event != SUBXACT_EVENT_ABORT_SUB)
+		return;
+	while (npins > 0 && pins[npins - 1].subid >= mySubid)
+		pop_pin();
+	while (guard_depth > 0 && levels[guard_depth - 1].subid >= mySubid)
+	{
+		thaw_to(levels[guard_depth - 1].frozen_base);
+		guard_depth--;
 	}
 }
 
@@ -771,7 +841,6 @@ refused_function(Oid fn)
 }
 
 static object_access_hook_type prev_object_access = NULL;
-
 static void
 guard_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId, void *arg)
 {
@@ -877,4 +946,5 @@ phasevec_guard_init(void)
 	prev_utility = ProcessUtility_hook;
 	ProcessUtility_hook = guard_utility;
 	RegisterXactCallback(guard_xact, NULL);
+	RegisterSubXactCallback(guard_subxact, NULL);
 }
