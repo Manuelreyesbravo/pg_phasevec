@@ -799,6 +799,29 @@ require_clock(int timeout_ms)
 	"not judged: the proof was still waiting for a lock another session holds when its clock of %d ms ended"
 
 /*
+ * (twelfth review) Only the proof's own work can refute it by time. A wait for a lock another session held that was
+ * granted before the clock ended counted against the proof: it then ended after its clock and was recorded refuted.
+ * A session of a role with no grants held an advisory key the proof takes, or a writer held its table, and let go at
+ * 0.85 to 1.02 s of a 1 s clock. Now a proof that waited for a lock at all, and ended after its clock, is not judged.
+ * The wait's time is not taken off the clock instead: PostgreSQL records when a wait began, not how long it lasted,
+ * and a sampled measure misses short waits, so no exact share of the time is the proof's own. PostgreSQL arms
+ * DEADLOCK_TIMEOUT for every wait for a heavyweight lock (ProcSleep: a relation, a row's transaction, an advisory
+ * key), and the time it was armed stays after the wait ends (get_timeout_start_time): a wait that began after the
+ * clock did is one the proof made. The cost: an author can keep its own slow proof from being refuted by making it
+ * wait for a lock, as it could by holding one past the clock; it is not judged, and past its horizon it reads
+ * 'unproven', never 'verified'.
+ */
+#define LOCK_WAITED_ERR \
+	"not judged: the proof waited for a lock another session held, and ended after its clock of %d ms: not all of " \
+	"its time was its own"
+
+static bool
+lock_waited_since(TimestampTz since)
+{
+	return since != 0 && get_timeout_start_time(DEADLOCK_TIMEOUT) >= since;
+}
+
+/*
  * Judge one proof, in a subtransaction always rolled back, under its own clock and cost cap. The proof runs in the
  * guard as as_role (its author; for the SQL of 0.14.2 to 0.19.0, the caller) with the author's settings. With a
  * target, the row is read before and after the proof, in the guard as the table's owner: its text must be the one
@@ -940,10 +963,13 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 			err = MemoryContextStrdup(oldcontext, psprintf(LOCK_WAIT_ERR, timeout_ms));
 		}
 		else if ((out == OUT_VERIFIED || out == OUT_REFUTED) && timeout_ms > 0 &&
-			(prove_fired || TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms)))
+				 (prove_fired || TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms)))
 		{
-			out = OUT_REFUTED;
-			err = MemoryContextStrdup(oldcontext, psprintf("the proof took longer than %d ms", timeout_ms));
+			/* (twelfth review) past its clock, after a wait for a lock: not all of that time was its own */
+			out = lock_waited_since(started) ? OUT_NO_VERDICT : OUT_REFUTED;
+			err = MemoryContextStrdup(oldcontext,
+									  out == OUT_NO_VERDICT ? psprintf(LOCK_WAITED_ERR, timeout_ms) :
+									  psprintf("the proof took longer than %d ms", timeout_ms));
 		}
 		if (prove_fired)
 		{
@@ -963,6 +989,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		bool		waiting = prove_fired && prove_fired_waiting;
 		bool		late = timeout_ms > 0 && started != 0 &&
 			TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms);
+		bool		waited = lock_waited_since(started);
 
 		if (timeout_ms > 0)
 			disable_timeout(prove_timeout, false);
@@ -996,6 +1023,12 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 												edata->message) :
 				psprintf("not judged: the proof waited for a lock longer than its session's lock_timeout (%s)",
 						 edata->message);
+		}
+		else if ((ours || late) && phase != 0 && waited)
+		{
+			/* (twelfth review) its clock ended after it waited for a lock: not all of that time was its own */
+			out = OUT_NO_VERDICT;
+			err = psprintf(LOCK_WAITED_ERR, timeout_ms);
 		}
 		else if (ours && phase != 0)
 		{
@@ -1113,9 +1146,21 @@ phasevec_prove(PG_FUNCTION_ARGS)
  *   (record_attempt, phasevec.attempts), and verify() takes the oldest turns first (phasevec._truth_due).
  * - Only the proof's own logic decides its verdict: an error the server or another session causes is not an answer
  *   (not_a_verdict); nothing is judged, and the verdict stays until its horizon.
+ *
+ * (twelfth review) A turn is spent by a session its author cannot end. In the eleventh cut the author's own session
+ * (the worker, connected as the author) spent it, as it got the claim: an author that terminated its own workers
+ * before they did (pg_terminate_backend works on a role's own sessions) kept its claims unspent at the head of the
+ * queue, and no other author's claim was tried again. Now the turns of a verify() call's claims are spent by a session
+ * of the extension's owner, the keeper (one for the call, started when a claim first needs it), in a transaction of its
+ * own committed before the claims are sent to their author's session; a claim that goes to a session of the owner
+ * (a record of what the verifier found, a claim the owner asserted) is spent by that session. Whatever the author's
+ * session then does, the claim's turn is spent. A role that may end the owner's sessions (a superuser; with
+ * pg_signal_backend, when the owner is not one) can stop a call, and nothing more: nothing is judged or recorded, the
+ * claims keep their turns, and the verdicts serve until their horizon. verify_one() names its claim, and its session
+ * spends the turn itself: ending it leaves that claim's turn where it was, and no other claim waits behind it.
  */
 #define PROOF_MAGIC		0x50565046
-#define PROOF_PROTOCOL	3
+#define PROOF_PROTOCOL	4
 #define PROOF_QUEUE		(64 * 1024)
 #define PROOF_GRACE_MS	5000
 #define PROOF_AHEAD		8		/* claims queued ahead of their answers, and no more than PROOF_QUEUE / 2 bytes */
@@ -1144,7 +1189,8 @@ typedef struct ProofShared
 typedef enum ProofKind
 {
 	MSG_JUDGE = 1,				/* take the claim (verify()), judge it, record the verdict */
-	MSG_RECORD = 2				/* take the claim (verify()), record what the verifier found (no proof runs) */
+	MSG_RECORD = 2,				/* take the claim (verify()), record what the verifier found (no proof runs) */
+	MSG_ATTEMPT = 3				/* (the keeper) spend the turns of these claims, in one transaction */
 } ProofKind;
 
 typedef enum ProofAnswer
@@ -1732,6 +1778,49 @@ phasevec_proof_main(Datum arg)
 		m.end = (const char *) data + n;
 		memset(&c, 0, sizeof(c));
 		kind = (ProofKind) get_int(&m);
+		if (kind == MSG_ATTEMPT)
+		{
+			/* (twelfth review) the keeper: spend the turns of the claims about to go to their author's session */
+			int64		nkeys = get_int(&m);
+
+			PG_TRY();
+			{
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				XactIsoLevel = XACT_READ_COMMITTED;
+				XactReadOnly = RecoveryInProgress();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				MemoryContextSwitchTo(per);
+				pgstat_report_activity(STATE_RUNNING, "phasevec: spending the turns of claims");
+				for (int64 i = 0; i < nkeys; i++)
+				{
+					memset(&c, 0, sizeof(c));
+					c.key = get_bytes(&m, NULL);
+					if (c.key == NULL)
+						elog(ERROR, "phasevec: a malformed message between a verifier and a proof's session");
+					record_attempt(sh->owner, worker_attempt_plan, &target, &c);
+				}
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+			}
+			PG_CATCH();
+			{
+				ErrorData  *e;
+
+				MemoryContextSwitchTo(per);
+				e = CopyErrorData();
+				FlushErrorState();
+				AbortCurrentTransaction();
+				MemoryContextSwitchTo(per);
+				answer(ans, ANSWER_FAILED, NULL, e->message, NULL);
+				proc_exit(0);
+			}
+			PG_END_TRY();
+			pgstat_report_activity(STATE_IDLE, NULL);
+			MemoryContextSwitchTo(per);
+			answer(ans, ANSWER_DONE, NULL, NULL, NULL);
+			continue;
+		}
 		every = (Interval *) get_bytes(&m, NULL);
 		verifier = (Oid) get_int(&m);
 		timeout_ms = (int) get_int(&m);
@@ -1766,16 +1855,23 @@ phasevec_proof_main(Datum arg)
 
 		PG_TRY();
 		{
-			/* (eleventh review) the claim's turn is spent first, in a transaction of its own (record_attempt) */
-			SetCurrentStatementStartTimestamp();
-			StartTransactionCommand();
-			XactIsoLevel = XACT_READ_COMMITTED;
-			XactReadOnly = RecoveryInProgress();
-			PushActiveSnapshot(GetTransactionSnapshot());
-			record_attempt(sh->owner, worker_attempt_plan, &target, &c);
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-			MemoryContextSwitchTo(per);
+			/*
+			 * (eleventh review) the claim's turn is spent first, in a transaction of its own (record_attempt). (twelfth
+			 * review) Here only by a session its author cannot end: a session of the owner, or verify_one()'s (it
+			 * names its claim); a verify() claim sent to its author's session was spent by the call's keeper.
+			 */
+			if (every == NULL || sh->author == sh->owner)
+			{
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				XactIsoLevel = XACT_READ_COMMITTED;
+				XactReadOnly = RecoveryInProgress();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				record_attempt(sh->owner, worker_attempt_plan, &target, &c);
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+				MemoryContextSwitchTo(per);
+			}
 
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
@@ -1832,12 +1928,18 @@ phasevec_proof_main(Datum arg)
  */
 static ProofSession *proof_cur = NULL;
 
+/* (twelfth review) The call's keeper: a session of the owner that spends its claims' turns. */
+static ProofSession *keeper_cur = NULL;
+
 static void
 proof_on_exit(int code, Datum arg)
 {
 	if (proof_cur != NULL)
 		TerminateBackgroundWorker(proof_cur->handle);
 	proof_cur = NULL;
+	if (keeper_cur != NULL)
+		TerminateBackgroundWorker(keeper_cur->handle);
+	keeper_cur = NULL;
 }
 
 /* The library this verifier runs: the worker loads the very same file. */
@@ -2010,6 +2112,8 @@ typedef struct Sent
 	bool		rls;
 	Judgment	rec;			/* MSG_RECORD: what to record */
 	int			tries;
+	bool		spent;			/* its turn is spent by a session its author cannot end (twelfth review) */
+	bool		spending;		/* in the keeper's batch, not answered yet */
 	StringInfoData msg;
 } Sent;
 
@@ -2031,6 +2135,12 @@ typedef struct Line
 	TimestampTz looked;			/* the lock waits were last walked */
 	Oid			unjudgeable;	/* an author no session of which could start in this call (tenth review) */
 	char	   *unjudgeable_why;
+	/* (twelfth review) the keeper's batch: the turns it is spending, since when, and how often it failed */
+	StringInfoData spend_msg;
+	int			spend_n;
+	bool		spend_sent;
+	TimestampTz spend_since;
+	int			keeper_tries;
 	MemoryContext cx;
 } Line;
 
@@ -2188,6 +2298,135 @@ line_unjudged(Line *l, const char *why, bool author_wide)
 	}
 }
 
+/* Done with the call's keeper: detached (it ends by itself), or ended now. */
+static void
+keeper_stop(bool end_it)
+{
+	proof_stop(keeper_cur, end_it, false);
+	keeper_cur = NULL;
+}
+
+/*
+ * (twelfth review) Spend, through the keeper, the turns of the claims queued for their author's session, without
+ * waiting: a batch at a time (every queued claim not spent yet), sent, then its answer read on later rounds. A claim is
+ * sent to its author's session only once its turn is spent. Returns NULL, or why the head's turn cannot be spent (no
+ * worker free for the keeper; the keeper ended, or did not answer within PROOF_GRACE_MS, twice): then the head is not
+ * tried, nothing is recorded, it keeps its turn, and with `*stop` the call stops (a role that may end the owner's
+ * sessions ends them).
+ */
+static const char *
+line_spend(Line *l, bool *stop)
+{
+	Sent	   *h = &l->q[l->qh];
+	shm_mq_result r;
+	Size		n;
+	void	   *data;
+	int			batch = 0;
+
+	*stop = false;
+	if (l->spend_n == 0)
+	{
+		int			ready = 0;
+
+		for (int i = 0; i < l->qn; i++)
+		{
+			Sent	   *s = &l->q[(l->qh + i) % PROOF_AHEAD];
+
+			batch += !s->spent;
+			ready += s->spent;
+		}
+		/*
+		 * A batch when the worker is about to run out of spent claims, or half a queue is waiting: one transaction
+		 * of the keeper for several claims, and the worker never idle for it.
+		 */
+		if (batch == 0 || (ready > 2 && batch < PROOF_AHEAD / 2))
+			return NULL;
+		if (keeper_cur == NULL)
+		{
+			char	   *why = NULL;
+
+			keeper_cur = proof_start(l->owner, l->t->watch, l->owner, &why);
+			if (keeper_cur == NULL)
+				return h->spent ? NULL : why;
+		}
+		{
+			MemoryContext o = MemoryContextSwitchTo(l->cx);
+
+			initStringInfo(&l->spend_msg);
+			put_int(&l->spend_msg, MSG_ATTEMPT);
+			put_int(&l->spend_msg, batch);
+			for (int i = 0; i < l->qn; i++)
+			{
+				Sent	   *s = &l->q[(l->qh + i) % PROOF_AHEAD];
+
+				if (s->spent)
+					continue;
+				put_str(&l->spend_msg, s->c->key);
+				s->spending = true;
+			}
+			MemoryContextSwitchTo(o);
+		}
+		l->spend_n = batch;
+		l->spend_sent = false;
+		l->spend_since = GetCurrentTimestamp();
+	}
+	if (!l->spend_sent)
+	{
+		r = shm_mq_send(keeper_cur->req, l->spend_msg.len, l->spend_msg.data, true, true);
+		if (r == SHM_MQ_DETACHED)
+			goto failed;
+		l->spend_sent = r == SHM_MQ_SUCCESS;
+	}
+	if (l->spend_sent)
+	{
+		r = shm_mq_receive(keeper_cur->ans, &n, &data, true);
+		if (r == SHM_MQ_DETACHED)
+			goto failed;
+		if (r == SHM_MQ_SUCCESS)
+		{
+			Msg			m;
+
+			m.p = data;
+			m.end = (const char *) data + n;
+			if ((ProofAnswer) get_int(&m) != ANSWER_DONE)
+				goto failed;
+			for (int i = 0; i < l->qn; i++)
+			{
+				Sent	   *s = &l->q[(l->qh + i) % PROOF_AHEAD];
+
+				if (s->spending)
+					s->spent = true;
+				s->spending = false;
+			}
+			l->spend_n = 0;
+			l->keeper_tries = 0;
+			pfree(l->spend_msg.data);
+			l->spend_msg.data = NULL;
+			return NULL;
+		}
+	}
+	if (!TimestampDifferenceExceeds(l->spend_since, GetCurrentTimestamp(), PROOF_GRACE_MS))
+		return NULL;
+
+failed:
+	/* what it was spending is spent again by a new keeper (an attempt it did commit is only spent twice) */
+	for (int i = 0; i < l->qn; i++)
+		l->q[(l->qh + i) % PROOF_AHEAD].spending = false;
+	l->spend_n = 0;
+	if (l->spend_msg.data)
+		pfree(l->spend_msg.data);
+	l->spend_msg.data = NULL;
+	keeper_stop(true);
+	if (++l->keeper_tries > 1 && !h->spent)
+	{
+		*stop = true;
+		return psprintf("not judged: phasevec's own session that spends the claims' turns ended, or did not answer "
+						"within %d ms, before this claim's was spent: nothing is recorded, and it keeps its turn",
+						PROOF_GRACE_MS);
+	}
+	return NULL;
+}
+
 static void
 line_done(Line *l, Done *d, Outcome out, const char *err)
 {
@@ -2224,6 +2463,12 @@ line_next(Line *l, Done *d)
 		Size		n;
 		void	   *data;
 		TimestampTz now;
+		/*
+		 * (twelfth review) verify()'s claims for an author's session (the author of the proofs queued, or the session
+		 * at hand when only records are): spent first, by the keeper
+		 */
+		bool		keeps = l->every != NULL &&
+			(OidIsValid(author) ? author != l->owner : proof_cur != NULL && proof_cur->author != l->owner);
 
 		/* a worker for what is queued: the author of its proofs, or (records only) any, or a session of the owner */
 		if (proof_cur != NULL && OidIsValid(author) && proof_cur->author != author)
@@ -2231,6 +2476,26 @@ line_next(Line *l, Done *d)
 			if (l->nsent > 0)
 				elog(ERROR, "phasevec: claims of two authors were sent to one session");
 			line_restart(l, false);
+		}
+		if (keeps)
+		{
+			bool		stop;
+			const char *why = line_spend(l, &stop);
+
+			if (why != NULL)
+			{
+				line_done(l, d, OUT_NOT_JUDGED, why);
+				d->stuck = stop;
+				return;
+			}
+			/* its author's session starts once the head's turn is spent: nothing it can end comes first */
+			if (!h->spent && proof_cur == NULL)
+			{
+				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, wait_event);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
 		}
 		if (proof_cur == NULL)
 		{
@@ -2264,6 +2529,8 @@ line_next(Line *l, Done *d)
 		{
 			Sent	   *s = &l->q[(l->qh + l->nsent) % PROOF_AHEAD];
 
+			if (keeps && !s->spent)
+				break;			/* (twelfth review) not before its turn is spent */
 			r = shm_mq_send(proof_cur->req, s->msg.len, s->msg.data, true, true);
 			if (r != SHM_MQ_SUCCESS)
 				break;			/* WOULD_BLOCK: later; DETACHED: seen on the answers' queue */
@@ -2361,6 +2628,15 @@ line_next(Line *l, Done *d)
 				line_to_record(l, &j);
 				continue;
 			}
+			/*
+			 * (twelfth review) Nothing sent to it, the head's turn not spent yet: the keeper decides that, not a
+			 * session its author can end. A new one starts once it is spent.
+			 */
+			if (keeps && !h->spent)
+			{
+				line_restart(l, true);
+				continue;
+			}
 			/* gone before it began, or between claims: nothing judged; once more in a new worker */
 			h->tries++;
 			{
@@ -2380,7 +2656,9 @@ line_next(Line *l, Done *d)
 									  "log): its verdict stays as it was, and serves only until its horizon", true);
 						continue;
 					}
-					line_done(l, d, OUT_NOT_JUDGED,
+					line_done(l, d, OUT_NOT_JUDGED, h->spent ?
+							  "not judged: the proof's own session was ended before it began: nothing is judged, its turn "
+							  "is spent (twelfth review), and its verdict stays as it was until its horizon" :
 							  "not judged: the proof's own session ended before it began (see the server log): nothing is "
 							  "recorded, and it stays due");
 					return;
@@ -2393,7 +2671,7 @@ line_next(Line *l, Done *d)
 		if (l->nsent > 0 && h->kind == MSG_JUDGE && pg_atomic_read_u32(&proof_cur->sh->judging) != 0)
 		{
 			pg_read_barrier();
-			if (TimestampDifferenceExceeds(proof_cur->sh->started, now, l->timeout_ms + PROOF_GRACE_MS))
+			if (now - proof_cur->sh->started >= ((int64) l->timeout_ms + PROOF_GRACE_MS) * 1000)
 			{
 				Judgment	j;
 
@@ -2406,13 +2684,13 @@ line_next(Line *l, Done *d)
 				continue;
 			}
 		}
-		else if (TimestampDifferenceExceeds(l->since, now, l->timeout_ms + PROOF_GRACE_MS))
+		else if (now - l->since >= ((int64) l->timeout_ms + PROOF_GRACE_MS) * 1000)
 		{
 			/* a session that does not take what it is sent (it waits for a lock as it starts, or to record) */
 			line_restart(l, true);
 			line_done(l, d, OUT_NOT_JUDGED,
-					  psprintf("not judged: the proof's own session did not take it within %d ms: nothing is "
-							   "recorded, and it stays due", l->timeout_ms + PROOF_GRACE_MS));
+					  psprintf("not judged: the proof's own session did not take it within %lld ms: nothing is "
+							   "recorded, and it stays due", (long long) l->timeout_ms + PROOF_GRACE_MS));
 			d->stuck = true;
 			return;
 		}
@@ -2774,11 +3052,13 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	{
 		proof_stop(proof_cur, true, false);
 		proof_cur = NULL;
+		keeper_stop(true);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	proof_stop(proof_cur, false, false);
 	proof_cur = NULL;
+	keeper_stop(false);
 	MemoryContextDelete(l.cx);
 	MemoryContextDelete(per);
 	return (Datum) 0;

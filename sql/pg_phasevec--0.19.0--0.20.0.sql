@@ -185,6 +185,18 @@
 --    table is in src/phasevec_truth.c, not_a_verdict). In the tenth cut a role with no grants filled the shared lock
 --    table with advisory locks, a proof failed 'out of shared memory', and a true claim was recorded refuted. A lock
 --    wait, a deadlock and a lock_timeout (ninth review) are the same: nothing judged (they recorded 'unproven').
+--
+-- Then a twelfth adversarial review ran attacks against the eleventh cut (4f966eb, never released), and found each
+-- of those rules broken by something that was not the claim's:
+--
+-- 40. Only the proof's own work can refute it by time. A lock another session held, let go just before the clock
+--    ended, left the proof to finish after it, and a true claim was recorded refuted. Now a proof that waited for a
+--    lock and ended after its clock is not judged (src/phasevec_truth.c, lock_waited_since).
+-- 41. A turn is spent by a session its author cannot end. The proof's session, the author's own, spent it: an author
+--    that terminated its own sessions before they did kept its claims at the head of the queue. Now verify()'s
+--    keeper, a session of the extension's owner, spends the turns before the claims go to their author's session.
+-- 42. Freshness is judged at the moment of reading: _verdict() and every read path compare max_age and expires_at
+--    with clock_timestamp(), not now() (the start of the reader's transaction).
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -217,9 +229,10 @@ ALTER TABLE phasevec.watches ADD COLUMN max_age interval NOT NULL DEFAULT interv
 COMMENT ON COLUMN phasevec.watches.max_age IS
     $q$How long a verdict of this watch serves after it was judged (0.20.0, eleventh review): past verified_at + max_age a 'verified' or 'refuted' reads 'unproven', whatever kept it from being judged again. Longer than verify() takes to come round every claim (ceil(claims / p_n) calls, p_every or the cron's interval apart, twice). The owner sets it: UPDATE phasevec.watches SET max_age = ... WHERE name = ...$q$;
 
--- 38. Whose turn it is. Written only by the proofs' own sessions (src/phasevec_truth.c, record_attempt), each attempt
--- in a transaction of its own committed at once: no other session writes or holds these rows. Unlogged: after a crash
--- the rotation starts again from when each claim was asserted, and nothing about a verdict is lost.
+-- 38. Whose turn it is. Written only by phasevec's own sessions (src/phasevec_truth.c, record_attempt): since the
+-- twelfth review (41) verify()'s keeper, a session of the owner, before a claim goes to its author's session; each
+-- attempt in a transaction of its own committed at once: no other session writes or holds these rows. Unlogged:
+-- after a crash the rotation starts again from when each claim was asserted, and nothing about a verdict is lost.
 CREATE UNLOGGED TABLE phasevec.attempts (
     watch         int  NOT NULL REFERENCES phasevec.watches(id) ON DELETE CASCADE,
     key           text NOT NULL,
@@ -253,13 +266,18 @@ $f$;
 CREATE OR REPLACE FUNCTION phasevec._verdict(t phasevec.truth) RETURNS text
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT CASE WHEN t.verdict = $q$replaced$q$ THEN $q$replaced$q$
-                WHEN t.expires_at IS NOT NULL AND t.expires_at <= now() THEN $q$expired$q$
+                -- (twelfth review) Freshness is judged at the moment of reading: clock_timestamp(), not now(). now()
+                -- is when the reader's transaction began: in a long READ COMMITTED transaction brief() and
+                -- truth_coverage() served 'verified' past max_age (and past expires_at) for as long as it stayed
+                -- open, after it could itself see the claim was false. Not statement_timestamp() either: one long
+                -- statement (a DO block, a function looping over brief()) is a reader of its own.
+                WHEN t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp() THEN $q$expired$q$
                 -- (eleventh review, 37) a verdict of a proof serves while it is fresh: judged within the watch's
                 -- max_age. Not a halted claim's (its proof ended its session: not run again) nor a refute() with
                 -- no proof (nothing judges it again).
                 WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.proof IS NOT NULL AND NOT t.halted
                  AND coalesce(t.verified_at + (SELECT w.max_age FROM phasevec.watches w WHERE w.id = t.watch)
-                              > now(), false)
+                              > clock_timestamp(), false)
                      IS NOT TRUE
                 THEN $q$unproven$q$
                 WHEN t.verdict = $q$verified$q$
@@ -456,8 +474,9 @@ BEGIN
 END;
 $f$;
 
--- (eleventh review, 38) A proof's session got the claim: its turn is spent, whatever becomes of it. Called only by
--- that session, in a transaction of its own that commits at once (src/phasevec_truth.c, record_attempt).
+-- (eleventh review, 38) A claim is about to be tried: its turn is spent, whatever becomes of it. Called only by
+-- phasevec's own sessions, in a transaction of their own that commits at once (src/phasevec_truth.c, record_attempt):
+-- since the twelfth review (41) by verify()'s keeper, a session its author cannot end, before the author's gets it.
 CREATE FUNCTION phasevec._truth_attempt(p_watch int, p_key text)
 RETURNS void LANGUAGE sql SET search_path = pg_catalog, pg_temp AS $f$
     INSERT INTO phasevec.attempts AS a (watch, key, attempted_at) VALUES (p_watch, p_key, clock_timestamp())
@@ -843,5 +862,28 @@ BEGIN
         RAISE WARNING 'phasevec: watch % reads % by %, which is not unique there', w.name, w.source, w.key_col
             USING HINT = 'Add a UNIQUE constraint on that column alone: two rows under one key share one verdict.';
     END LOOP;
+END
+$d$;
+
+-- (twelfth review) Freshness is judged at the moment of reading, in every read path: what hides an expired claim
+-- from find(), find_hybrid(), find_npu(), find_ivf(), the replacement chain and the recall measure compared
+-- expires_at with now(), the start of the reader's transaction (_verdict() above, and the library's own filter in
+-- src/phasevec_ivf.c, read clock_timestamp() too). Each of these functions is defined again here with only that
+-- comparison changed; nothing else in them is touched.
+DO $d$
+DECLARE
+    f record;
+    n int := 0;
+BEGIN
+    FOR f IN SELECT p.oid, pg_get_functiondef(p.oid) AS def FROM pg_proc p
+              WHERE p.pronamespace = $q$phasevec$q$::regnamespace AND p.prosrc LIKE $q$%expires_at <= now()%$q$
+                AND p.proname <> $q$_verdict$q$
+              ORDER BY p.oid LOOP
+        EXECUTE replace(f.def, $q$expires_at <= now()$q$, $q$expires_at <= clock_timestamp()$q$);
+        n := n + 1;
+    END LOOP;
+    IF n <> 7 THEN
+        RAISE EXCEPTION $q$phasevec: % read paths compare expires_at with now(), 7 were expected$q$, n;
+    END IF;
 END
 $d$;

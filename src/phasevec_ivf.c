@@ -2475,7 +2475,8 @@ found_cmp(const void *x, const void *y)
 static SPIPlanPtr g_validate = NULL;
 
 /*
- * 0.14.0: a replaced, expired or refuted key is never served. The same library serves databases still on 0.12 or
+ * 0.14.0: a replaced, expired or refuted key is never served (expired at the moment of reading, clock_timestamp():
+ * twelfth review; now() is when the reader's transaction began). The same library serves databases still on 0.12 or
  * 0.13 (no phasevec.truth): the truth filter goes in only where the table exists, and the plan is prepared again
  * when that changes (an ALTER EXTENSION ... UPDATE seen by a live backend).
  */
@@ -2488,7 +2489,7 @@ static bool g_validate_truth = false;
 	"JOIN phasevec.sources s ON s.watch = $1 AND s.key = c.key AND s.text_hash = c.h"
 #define VALIDATE_TRUTH \
 	" WHERE NOT EXISTS (SELECT 1 FROM phasevec.truth tr WHERE tr.watch = $1 AND tr.key = c.key " \
-	"  AND (tr.verdict IN ($q$replaced$q$, $q$refuted$q$) OR tr.expires_at <= now()))"
+	"  AND (tr.verdict IN ($q$replaced$q$, $q$refuted$q$) OR tr.expires_at <= clock_timestamp()))"
 
 /*
  * The k best valid answers among the sweep's kk best and the delta's kk best, as find_ivf returns them.
