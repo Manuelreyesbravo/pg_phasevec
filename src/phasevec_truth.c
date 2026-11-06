@@ -861,10 +861,28 @@ typedef enum Outcome
 	OUT_REFUTED,
 	OUT_UNPROVEN,				/* nothing judged: the author gone, or kept from the row */
 	OUT_STALE,					/* nothing judged: the row is gone, or does not say what was asserted */
-	OUT_MOVED					/* the row changed while the proof ran: nothing recorded */
+	OUT_MOVED,					/* the row changed while the proof ran: nothing recorded */
+	OUT_ELSEWHERE				/* not judged in this session (its custom placeholders): nothing recorded */
 } Outcome;
 
-static const char *const outcome_name[] = {"verified", "refuted", "unproven", "stale", NULL};
+static const char *const outcome_name[] = {"verified", "refuted", "unproven", "stale", NULL, NULL};
+
+/*
+ * A session that has a custom placeholder the author's did not (guard_env_misfit) does not judge the claim: the proof,
+ * and every row-level security policy it runs under, would read '' where its author read NULL, and nothing can take
+ * the placeholder away. Until the seventh review an earlier proof in the same verify() that called set_config, or a
+ * SET LOCAL the verifier's pooled connection ran once, decided later authors' verdicts. NULL: it may be judged here.
+ */
+static char *
+elsewhere(GuardMode mode, const GuardEnv *env)
+{
+	const char *misfit = mode == GUARD_AUTHOR ? guard_env_misfit(env) : NULL;
+
+	if (misfit == NULL)
+		return NULL;
+	return psprintf("not judged in this session: it has the custom setting \"%s\" (set in it, or once set and rolled "
+					"back), which its author's session did not have; judge it in a new session", misfit);
+}
 
 typedef struct Judgment
 {
@@ -942,6 +960,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 	const char *volatile err = NULL;
 	volatile int phase = 1;		/* 0 reading the row, 1 proving, 2 reading it again */
 	volatile TimestampTz started = 0;
+	char	   *misfit;
 
 	j->at = 0;
 	if (prove_in_progress)
@@ -989,8 +1008,17 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 			}
 			else if (author_rls && !key_visible(target, as_role, mode, env, key))
 			{
-				out = OUT_UNPROVEN;
-				err = "its author cannot see the row: there is nothing to judge";
+				/* a policy that reads a placeholder the author did not have hid it: nothing is recorded */
+				if ((misfit = elsewhere(mode, env)) != NULL)
+				{
+					out = OUT_ELSEWHERE;
+					err = MemoryContextStrdup(oldcontext, misfit);
+				}
+				else
+				{
+					out = OUT_UNPROVEN;
+					err = "its author cannot see the row: there is nothing to judge";
+				}
 				ready = false;
 			}
 			else if (!same_bytes(first.hash, asserted_for))
@@ -999,6 +1027,13 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 				err = "the row does not say what was asserted (it changed, or it was not readable then): assert it again";
 				ready = false;
 			}
+		}
+		/* as it is about to run: the row's recipe or a policy may have made one meanwhile */
+		if (ready && (misfit = elsewhere(mode, env)) != NULL)
+		{
+			out = OUT_ELSEWHERE;
+			err = MemoryContextStrdup(oldcontext, misfit);
+			ready = false;
 		}
 		if (ready)
 		{
@@ -1387,6 +1422,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	Readers		readers = {0};
 	int			nest;
 	SPIPlanPtr	lock_plan = NULL;
+	bool	   *later;
 
 	for (int i = 0; i < 6; i++)
 		if (PG_ARGISNULL(i))
@@ -1445,10 +1481,18 @@ phasevec_verify(PG_FUNCTION_ARGS)
 		unbecome(&was);
 		SPI_finish();
 	}
+	/*
+	 * Two passes: first the claims whose author's custom placeholders this session has, then those for which the
+	 * guard makes one (it stays in the session, and a claim whose author did not have it is not judged after it).
+	 */
+	later = MemoryContextAllocZero(keep, sizeof(bool) * Max(nclaims, 1));
+	for (uint64 i = 0; i < nclaims; i++)
+		later[i] = guard_env_creates(claims[i].env);
 	PG_TRY();
 	{
-		for (uint64 i = 0; i < nclaims; i++)
+		for (uint64 k = 0; k < 2 * nclaims; k++)
 		{
+			uint64		i = k % Max(nclaims, 1);
 			const Claim *c = &claims[i];
 			Judgment	j;
 			char	   *v;
@@ -1456,6 +1500,8 @@ phasevec_verify(PG_FUNCTION_ARGS)
 			bool		nulls[3] = {false, false, false};
 			MemoryContext o;
 
+			if (later[i] != (k >= nclaims))
+				continue;
 			if (GetCurrentTimestamp() - t0 >= budget_us)
 				break;
 			/* _truth_due already left out the authors the caller may not act as; checked again where it matters */
@@ -1567,6 +1613,13 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	SPI_finish();
 	unbecome(&was);
 	judge_claim(&c, timeout_ms, PG_GETARG_FLOAT8(3), &target, &readers, &j);
+	if (j.out == OUT_ELSEWHERE)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("phasevec: verify_one() does not judge key %s in this session", c.key),
+				 errdetail("%s.", j.err),
+				 errhint("A custom setting, once a session has it, stays in it: verify from a new session, or from "
+						 "one that never set a custom setting the author's session did not have.")));
 	v = record(owner, &target, &c, &j);
 	guard_unpin_settings(nest);
 	if (v == NULL)

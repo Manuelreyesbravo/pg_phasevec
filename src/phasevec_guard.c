@@ -15,9 +15,12 @@
  *   reads, prints or computes at its default, and DateStyle ISO, TimeZone UTC, search_path pg_catalog, ... pinned on top:
  *   the same text whoever calls it from whatever session. A proof runs with every such setting at its default and its
  *   author's own on top, as recorded when it was asserted (guard_env_now): it means what it meant to its author, and the
- *   verifier's settings (its text search configuration, its timezone abbreviations, a custom setting a row-level
- *   security policy reads) decide nothing. Until the third cut a claim recorded twelve named settings and every other one
- *   came from the verifier.
+ *   values of the verifier's settings (its text search configuration, its timezone abbreviations, a custom setting a
+ *   row-level security policy reads) decide nothing. Until the third cut a claim recorded twelve named settings and
+ *   every other one came from the verifier. Whether a custom placeholder exists at all is not a value a guard can set:
+ *   nothing removes one from a session. A claim records which ones its author's session had, and a session that has
+ *   one more does not judge it (guard_env_misfit); until the seventh review an earlier proof's set_config, or a SET
+ *   LOCAL the verifier's pooled connection once ran, decided what a later proof's row-level security policy read.
  * - Nothing that existed before it is in reach. The session's open cursors: those pg_cursors lists are frozen while it
  *   runs, a query begun before it cannot be run inside it, and FETCH, MOVE and CLOSE take only cursors opened inside
  *   it (a recipe read a superuser's open cursor over a table its owner could not read, and NOTIFYed the rows out). The
@@ -195,7 +198,24 @@ replayable(const struct config_generic *g)
 	return true;
 }
 
-/* A setting's value as text, current or default (NULL: a string default that is NULL). buf: 64 bytes. */
+/*
+ * A custom placeholder (app.tenant: a custom setting no loaded library defines) exists once anything in the session
+ * named it in SET, set_config or RESET, or the configuration did, and nothing removes it: a rollback takes back its
+ * value, not it. current_setting(name, true) reads NULL while it does not exist and its value ('' while it has none)
+ * once it does, so whether it exists is part of what a proof (or a row-level security policy it runs under) reads.
+ */
+static bool
+placeholder(const struct config_generic *g)
+{
+	return (g->flags & GUC_CUSTOM_PLACEHOLDER) != 0 && replayable(g);
+}
+
+/*
+ * A setting's value as text, current or default; NULL for a string that is NULL (a placeholder's value until it is
+ * given one, and its default). Until the seventh review a NULL placeholder read as '' here, as current_setting shows
+ * it: one that existed read as at its default, and nothing told a placeholder that exists from one that does not.
+ * buf: 64 bytes.
+ */
 static const char *
 value_of(const struct config_generic *g, bool boot, char *buf)
 {
@@ -212,14 +232,7 @@ value_of(const struct config_generic *g, bool boot, char *buf)
 			snprintf(buf, 64, "%.17g", boot ? G_REAL(gg)->boot_val : *G_REAL(gg)->variable);
 			return buf;
 		case PGC_STRING:
-			{
-				const char *s = boot ? G_STR(gg)->boot_val : *G_STR(gg)->variable;
-
-				/* a placeholder starts NULL and reads as '' (current_setting) */
-				if (s == NULL && (g->flags & GUC_CUSTOM_PLACEHOLDER))
-					return "";
-				return s;
-			}
+			return boot ? G_STR(gg)->boot_val : *G_STR(gg)->variable;
 		case PGC_ENUM:
 			return ENUM_NAME(gg, boot ? G_ENUM(gg)->boot_val : *G_ENUM(gg)->variable);
 	}
@@ -299,6 +312,9 @@ to_defaults(List *nondefault, const char *const *keep, int nkeep)
 		if (g == NULL || !replayable(g) || at_default(g))
 			continue;
 		dflt = value_of(g, true, buf);
+		/* a placeholder cannot be made not to exist: '' reads as its NULL does (current_setting) */
+		if (dflt == NULL && placeholder(g))
+			dflt = "";
 		if (dflt != NULL)
 			set_one(g->name, dflt);
 	}
@@ -324,7 +340,8 @@ guard_env_now(void)
 		char		buf[64];
 		const char *v;
 
-		if (!replayable(vars[i]) || at_default(vars[i]))
+		/* every placeholder the session has, with a value or not ("app.tenant="): that it exists is recorded */
+		if (!replayable(vars[i]) || (at_default(vars[i]) && !placeholder(vars[i])))
 			continue;
 		v = value_of(vars[i], false, buf);
 		items[m++] = psprintf("%s=%s", vars[i]->name, v ? v : "");
@@ -367,6 +384,37 @@ guard_env_from(ArrayType *arr)
 		e->n++;
 	}
 	return e;
+}
+
+/*
+ * A verdict is judged only in a session whose custom placeholders are the author's (the seventh review): one the
+ * session has and the author's did not would read '' to the proof where it read NULL to its author, and nothing can
+ * take it away. The first such one (NULL: none). Those the author had and the session has not, the guard makes,
+ * which is what the author's session had; they stay in the session after it (guard_env_creates).
+ */
+const char *
+guard_env_misfit(const GuardEnv *env)
+{
+	int			n;
+	struct config_generic **vars = get_guc_variables(&n);
+	const char *misfit = NULL;
+
+	for (int i = 0; i < n && misfit == NULL; i++)
+		if (placeholder(vars[i]) &&
+			!named_in(vars[i]->name, env ? (const char *const *) env->name : NULL, env ? env->n : 0))
+			misfit = pstrdup(vars[i]->name);
+	pfree(vars);
+	return misfit;
+}
+
+/* Would the guard make a placeholder for this recorded state (one the author had and this session has not)? */
+bool
+guard_env_creates(const GuardEnv *env)
+{
+	for (int i = 0; env && i < env->n; i++)
+		if (strchr(env->name[i], '.') != NULL && find_option(env->name[i], false, true, 0) == NULL)
+			return true;
+	return false;
 }
 
 static void
@@ -1430,6 +1478,8 @@ guard_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree, Pr
 /*
  * Volatile system functions reviewed as safe in a guard: they leave nothing past its rollback (a setting goes back
  * with it, a transaction-level advisory lock is released with it) and read nothing of the session but the clock.
+ * set_config of a custom name the session does not have leaves the placeholder behind (no rollback removes one): a
+ * claim whose author's session did not have it is not judged in that session after it (guard_env_misfit).
  * (random() draws from the session's generator, which a guard cannot seed: setseed is refused.)
  */
 static const char *const volatile_allowed[] = {

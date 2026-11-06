@@ -118,6 +118,17 @@
 -- 28. verify() wrote 'unproven' over the verdict of a claim whose row said something else when it looked, and the
 --    verdict stayed when the text came back. It leaves the verdict and records that it looked (truth.looked_at,
 --    looked_for).
+--
+-- Then a seventh adversarial review ran attacks against the seventh cut (2ecf398, never released):
+--
+-- 29. A custom placeholder (app.tenant) stays in a session once anything named it, and a rollback does not take it
+--    away: current_setting('app.tenant', true) then reads '' where it read NULL, and the guard could not tell one
+--    that exists from one that does not. A proof that only called set_config, judged first in a verify(), decided a
+--    later author's verdict through the row-level security policy it ran under; a pooled verifier connection that
+--    once ran SET LOCAL app.tenant recorded verdicts the persistent state refutes. A claim records every placeholder
+--    its author's session had (truth.proof_env, "app.tenant=" for one with no value), and is judged only in a
+--    session whose placeholders are those (src/phasevec_guard.c, guard_env_misfit). A claim recorded before names
+--    only the placeholders that had a value then: it reads as if its author's session had no other.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -136,7 +147,7 @@ COMMENT ON COLUMN phasevec.truth.looked_at IS
 COMMENT ON COLUMN phasevec.truth.looked_for IS
     $q$The row's text hash (phasevec.sources) when verify() found it stale (looked_at); NULL when the row was gone (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.proof_env IS
-    $q$The author's settings when it asserted ("name=value": DateStyle, TimeZone, search_path, ...): the proof runs with them (0.20.0).$q$;
+    $q$The author's settings when it asserted ("name=value": DateStyle, TimeZone, search_path, ...), and every custom placeholder its session had ("app.tenant=" for one with no value): the proof runs with them, and only in a session whose custom placeholders are those (0.20.0).$q$;
 COMMENT ON COLUMN phasevec.truth.halted IS
     $q$The verifier's session ended while this proof ran (0.20.0): it is refuted and not run by verify() again until asserted again.$q$;
 

@@ -58,7 +58,17 @@ extern bool guard_active(void);
 /* A verdict is judged only in a session with no temporary object (see phasevec_guard.c): ERROR otherwise. */
 extern void guard_require_no_temp(const char *what);
 
-/* The settings state of this session that a proof runs with: every replayable setting off its default. */
+/*
+ * A verdict is judged only in a session whose custom placeholders are the author's: the first placeholder this
+ * session has that the recorded state does not name (NULL: none). And whether the guard would make one it names.
+ */
+extern const char *guard_env_misfit(const GuardEnv *env);
+extern bool guard_env_creates(const GuardEnv *env);
+
+/*
+ * The settings state of this session that a proof runs with: every replayable setting off its default, and every
+ * custom placeholder the session has (with its value, '' if none).
+ */
 extern ArrayType *guard_env_now(void);
 /* A recorded state, from its text[] (NULL: none recorded, every setting at its default). */
 extern GuardEnv *guard_env_from(ArrayType *arr);
