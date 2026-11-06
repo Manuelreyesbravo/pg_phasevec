@@ -1,5 +1,8 @@
 MODULE_big   = pg_phasevec
 OBJS         = src/phasevec_ivf.o src/phasevec_ask.o src/phasevec_truth.o src/phasevec_guard.o
+# The watch trigger's entry point (src/pg_phasevec_observe.c): a library no session that loaded an older
+# pg_phasevec has loaded, so after ALTER EXTENSION UPDATE such a session is told to reconnect.
+MODULES      = src/pg_phasevec_observe
 # Portable by default: the server's CFLAGS plus -O3. A build tuned to THIS machine's CPU (it may not run on
 # another one: SIGILL) is opt-in:  make PHASEVEC_NATIVE=1
 PG_CFLAGS    = -O3

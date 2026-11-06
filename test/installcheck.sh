@@ -16,6 +16,7 @@ mkdir -p "$DATA/ext/extension"
 for f in pg_phasevec.control sql/*.sql; do ln -sfn "$PWD/$f" "$DATA/ext/extension/$(basename "$f")"; done
 make -s PG_CONFIG="$PG/pg_config" >/dev/null
 mkdir -p "$DATA/ext/lib" && ln -sfn "$PWD/pg_phasevec.so" "$DATA/ext/lib/pg_phasevec.so"
+ln -sfn "$PWD/src/pg_phasevec_observe.so" "$DATA/ext/lib/pg_phasevec_observe.so"
 grep -q "^dynamic_library_path" "$DATA/postgresql.conf" || echo "dynamic_library_path = '$DATA/ext/lib:\$libdir'" >> "$DATA/postgresql.conf"
 # Without this a fresh .testcluster reads the control file and scripts INSTALLED in the PostgreSQL
 # tree, not the ones of this checkout, and every test passes against the previous version (seen on

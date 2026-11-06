@@ -85,7 +85,9 @@
 --    judges at READ COMMITTED, and verified_at is when the row was read (_truth_set's p_at).
 -- 18. One ended verifier halted every claim that read alike, and past eight ended sessions a mark was dropped. The mark
 --    names the claim's key (_truth_halted's p_key_hash); every mark is taken.
--- 19. A watch over a FORCE ROW LEVEL SECURITY table rendered nothing as its owner; a key column that is not unique let
+-- 19. After this update every write to a watched table from a session that loaded the library of 0.19.0 failed with
+--    "could not find function". The trigger is in a library of its own that says to reconnect.
+-- 20. A watch over a FORCE ROW LEVEL SECURITY table rendered nothing as its owner; a key column that is not unique let
 --    a writer forget another's key. The owner renders without FORCE; watch() needs a unique key.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
@@ -336,9 +338,12 @@ BEGIN
 END;
 $$;
 
--- The watch trigger: C. Same name, so every trigger already installed (phasevec_watch_<id>) keeps working.
+-- The watch trigger: C. Same name, so every trigger already installed (phasevec_watch_<id>) keeps working. It is
+-- declared in a library of its own (src/pg_phasevec_observe.c), which runs phasevec_observe from the session's
+-- pg_phasevec library: a session that loaded the library of 0.19.0 or before, and wrote to a watched table after
+-- this update, got "could not find function"; now it is told to reconnect (the write is refused, not let through).
 CREATE OR REPLACE FUNCTION phasevec._observe() RETURNS trigger
-AS $q$MODULE_PATHNAME$q$, $q$phasevec_observe$q$ LANGUAGE C;
+AS $q$pg_phasevec_observe$q$, $q$phasevec_observe_entry$q$ LANGUAGE C;
 DROP FUNCTION phasevec._note(int, text, bytea, text);
 
 CREATE OR REPLACE FUNCTION phasevec.next(p_watch text, p_limit integer DEFAULT 64)
