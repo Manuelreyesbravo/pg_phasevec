@@ -206,6 +206,28 @@ LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdo
 --    keeper, a session of the extension's owner, spends the turns before the claims go to their author's session.
 -- 42. Freshness is judged at the moment of reading: _verdict() and every read path compare max_age and expires_at
 --    with clock_timestamp(), not now() (the start of the reader's transaction).
+--
+-- Found by the sixteenth review (four lenses; each finding run against this cut):
+--
+-- 43. A statement phasevec ran as its owner resolved its names through the search_path of whoever was connected. A
+--    proof's session is a session of its author: an author's ALTER ROLE ... SET search_path put its own '=' for
+--    bytea before pg_catalog's, the IS DISTINCT FROM of the claim's take ran it as the owner (a superuser), and the
+--    author made itself superuser and wrote a 'verified' for a false proof. Now become() (src/phasevec_truth.c)
+--    pins search_path = pg_catalog, pg_temp and every setting that changes what a value reads or prints (the same
+--    pins a recipe has, transform_null_equals off) for each statement it runs, kept plans included; and every
+--    operator in phasevec's own C statements names its schema. Below, _term() and _reads() name theirs, and the C
+--    functions that run SQL as their caller (the IVF ones) carry a search_path of their own.
+-- 44. _verdict(t) kept who may see a watch for as long as PL/pgSQL kept its expression (a transaction): after a
+--    REVOKE or ENABLE ROW LEVEL SECURITY it went on answering, and a forged row told whether a guess was a hidden
+--    row's text. Now it checks on every call; and it keeps only which table a watch reads, in fixed slots (each miss
+--    kept a copy of the watch in the query's memory: 1 GB for one query over 20 watches).
+-- 45. The freshness horizon was computed in the reader's TimeZone: a '1 day' max_age lasted that zone's day (48 hours
+--    under a POSIX rule). It is computed in UTC (_verdict_of, _truth_due, the claim's take), whoever reads.
+-- 46. verify() in a READ ONLY transaction ran every proof and committed their verdicts, in sessions of its own. A
+--    transaction (or session, or standby) that writes nothing records nothing through verify() either.
+-- 47. A proof session kept judging, and stamping 'verified', in the name of an author dropped during the call. A
+--    verdict is recorded in its author's name only while the author is a role (locked against DROP ROLE until it
+--    commits).
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -285,8 +307,11 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 -- max_age. Not a halted claim's (its proof ended its session: not run again) nor a refute() with
                 -- no proof (nothing judges it again).
                 WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.proof IS NOT NULL AND NOT t.halted
-                 AND coalesce(t.verified_at + (SELECT w.max_age FROM phasevec.watches w WHERE w.id = t.watch)
-                              > clock_timestamp(), false)
+                 -- (sixteenth review, 45) in UTC: in the reader's TimeZone a '1 day' max_age was the length of
+                 -- that zone's day (48 hours under a POSIX rule a reader may set; 23 or 25 across a DST change).
+                 AND coalesce(timezone($q$UTC$q$, t.verified_at)
+                              + (SELECT w.max_age FROM phasevec.watches w WHERE w.id = t.watch)
+                              > timezone($q$UTC$q$, clock_timestamp()), false)
                      IS NOT TRUE
                 THEN $q$unproven$q$
                 WHEN t.verdict = $q$verified$q$
@@ -387,8 +412,9 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
        -- a stale claim is due once for each text it reads (verify() records that it looked: looked_at,
        -- looked_for), and again for the same text after p_every; any other, when its verdict is older than p_every
        AND CASE WHEN x.stale
-                THEN t.looked_at IS NULL OR t.looked_at < now() - p_every OR t.looked_for IS DISTINCT FROM s.text_hash
-                ELSE t.verified_at IS NULL OR t.verified_at < now() - p_every END
+                THEN t.looked_at IS NULL OR timezone($q$UTC$q$, t.looked_at) < timezone($q$UTC$q$, now()) - p_every
+                     OR t.looked_for IS DISTINCT FROM s.text_hash
+                ELSE t.verified_at IS NULL OR timezone($q$UTC$q$, t.verified_at) < timezone($q$UTC$q$, now()) - p_every END
        AND (r.oid IS NULL OR pg_catalog.pg_has_role(p_verifier, r.oid, $q$USAGE$q$))
      ORDER BY coalesce(a.attempted_at, t.changed_at), t.key
      LIMIT p_n
@@ -909,3 +935,38 @@ BEGIN
     END IF;
 END
 $d$;
+
+-- (sixteenth review, 43) No name phasevec uses is looked up through its caller's search_path. These two are inlined
+-- into their callers (no SET clause of their own): every operator names its schema, and the backslashes are in E''
+-- strings, which standard_conforming_strings does not change.
+CREATE OR REPLACE FUNCTION phasevec._reads(p_manifest jsonb)
+RETURNS jsonb
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS $$
+    SELECT pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object(
+        'pooling', p_manifest OPERATOR(pg_catalog.->) 'pooling', 'ctx', p_manifest OPERATOR(pg_catalog.->) 'ctx',
+        'query_prefix', p_manifest OPERATOR(pg_catalog.->) 'query_prefix',
+        'tokens', p_manifest OPERATOR(pg_catalog.->) 'tokens', 'marker', p_manifest OPERATOR(pg_catalog.->) 'marker',
+        'query_instruction', p_manifest OPERATOR(pg_catalog.->) 'query_instruction'));
+$$;
+CREATE OR REPLACE FUNCTION phasevec._term(p_lexeme text)
+RETURNS tsquery
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT (E'\'' OPERATOR(pg_catalog.||) pg_catalog.replace(pg_catalog.replace(p_lexeme, E'\\', E'\\\\'), E'\'', E'\'\'')
+            OPERATOR(pg_catalog.||) E'\'')::pg_catalog.tsquery;
+$$;
+-- The C functions that run SQL with their caller's identity (src/phasevec_ivf.c) resolve it in pg_catalog first,
+-- as every SQL function of the extension does; the truth functions run theirs as the owner, in become().
+ALTER FUNCTION phasevec._ivf_build(integer, integer, integer, integer, integer, integer, boolean)
+    SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION phasevec._ivf_build(integer, integer, integer, integer, integer, integer, boolean, boolean)
+    SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION phasevec.ivf_sweep(integer, bit, smallint[], integer, integer, integer)
+    SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION phasevec.ivf_delta(integer, integer, bit, smallint[], integer)
+    SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION phasevec._ivf_absorb(integer, integer, text)
+    SET search_path = pg_catalog, pg_temp;
+ALTER FUNCTION phasevec._ivf_find(integer, integer, bit, smallint[], integer, integer, integer, integer, real)
+    SET search_path = pg_catalog, pg_temp;

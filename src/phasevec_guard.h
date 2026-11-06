@@ -56,6 +56,16 @@ extern void guard_unpin_settings(int nest);
 extern bool guard_active(void);
 
 /*
+ * (sixteenth review) phasevec's own statements: the same pins (search_path pg_catalog, pg_temp; TimeZone UTC;
+ * DateStyle, IntervalStyle, extra_float_digits, bytea_output, the lc_* that format, standard_conforming_strings, ...)
+ * and transform_null_equals off, in a nest level of their own. Every become() (phasevec_truth.c) opens one: no
+ * statement phasevec runs as its owner resolves a name, or computes a value, through its caller's or a proof's
+ * author's settings.
+ */
+extern int	guard_own_enter(void);
+extern void guard_own_leave(int nest);
+
+/*
  * The proof's own session (phasevec_truth.c): this backend is one, the only kind where GUARD_AUTHOR runs. The custom
  * placeholders a session has (sorted), and the first one it has that is neither among base nor named by env (NULL:
  * none): one a proof, a recorded state or a recipe made, which the next claim's author may not have had.

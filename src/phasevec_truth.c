@@ -76,6 +76,7 @@
 #include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/shm_mq.h"
 #include "tcop/tcopprot.h"
@@ -184,13 +185,27 @@ typedef struct Who
 {
 	Oid			userid;
 	int			sec;
+	int			nest;			/* the nest level of the owner's pinned settings */
 } Who;
 
-/* Step into the extension's owner to run its own SQL, as PostgreSQL's RI triggers do; an error puts the caller back. */
+/*
+ * Step into the extension's owner to run its own SQL, as PostgreSQL's RI triggers do; an error puts the caller back.
+ *
+ * (sixteenth review) With the owner's identity, the owner's settings: the pins (guard_own_enter), in a nest level that
+ * unbecome() closes. Until this cut become() changed only the user id, and every statement phasevec ran as its owner
+ * resolved its names through the search_path of whoever happened to be connected: in a proof's session (a session of
+ * the claim's author) the author's ALTER ROLE ... SET search_path put the author's own '=' for bytea in front of
+ * pg_catalog's, CLAIM_LOCK_SQL's IS DISTINCT FROM ran it as the owner (a superuser), and the author made itself a
+ * superuser and wrote a 'verified' for a false proof. And a 'day' of a reader's TimeZone stretched the freshness
+ * horizon (_verdict_of): 27 hours of a '1 day' max_age read 'verified'. Every statement prepared or run in here (the
+ * kept plans too: PostgreSQL plans a kept statement again when the search_path it was planned in is not the current
+ * one) reads the same names and computes the same values, whoever calls and from whatever session.
+ */
 static void
 become(Oid role, Who *was)
 {
 	GetUserIdAndSecContext(&was->userid, &was->sec);
+	was->nest = guard_own_enter();
 	SetUserIdAndSecContext(role, was->sec | SECURITY_LOCAL_USERID_CHANGE);
 }
 
@@ -198,6 +213,7 @@ static void
 unbecome(const Who *was)
 {
 	SetUserIdAndSecContext(was->userid, was->sec);
+	guard_own_leave(was->nest);
 }
 
 static void
@@ -1631,12 +1647,19 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
  * waited for the row a verify() was judging, and after that one recorded 'refuted' it wrote its own older 'verified'
  * over it. Taken first, of two judgments of a claim the one that reads later commits later.
  */
-#define LOCK_OLD(c) "t." c " IS NULL OR t." c " OPERATOR(pg_catalog.<) (pg_catalog.now() OPERATOR(pg_catalog.-) $3)"
+/*
+ * (sixteenth review) Every operator named by its schema: "a IS DISTINCT FROM b" is "a = b" looked up through
+ * search_path (an author's '=' ran here as the owner), so it is written with pg_catalog's '=' (DISTINCT), and the
+ * horizon is computed in UTC, not in the session's TimeZone (become() pins it too).
+ */
+#define DISTINCT(a, b) "COALESCE(NOT (" a " OPERATOR(pg_catalog.=) " b "), (" a " IS NULL) OPERATOR(pg_catalog.<>) (" b " IS NULL))"
+#define LOCK_OLD(c) "t." c " IS NULL OR pg_catalog.timezone('UTC', t." c ") OPERATOR(pg_catalog.<) " \
+	"(pg_catalog.timezone('UTC', pg_catalog.now()) OPERATOR(pg_catalog.-) $3)"
 #define CLAIM_LOCK_SQL \
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
 	"AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
 	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
-	"AND t.asserted_for IS DISTINCT FROM h THEN " LOCK_OLD("looked_at") " OR t.looked_for IS DISTINCT FROM h " \
+	"AND " DISTINCT("t.asserted_for", "h") " THEN " LOCK_OLD("looked_at") " OR " DISTINCT("t.looked_for", "h") " " \
 	"ELSE " LOCK_OLD("verified_at") " END " \
 	"FROM (SELECT (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch OPERATOR(pg_catalog.=) t.watch " \
 	"AND s.key OPERATOR(pg_catalog.=) t.key) AS h) s)) FOR NO KEY UPDATE SKIP LOCKED"
@@ -1654,6 +1677,14 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
  * recorded 'refuted'.
  */
 #define CLAIM_TRY_SQL CLAIM_TAKE_SQL " SKIP LOCKED"
+
+/* The proof's author is still a role, locked against DROP ROLE until this transaction ends. In a worker. */
+static bool
+author_still_there(Oid author)
+{
+	LockSharedObject(AuthIdRelationId, author, 0, AccessShareLock);
+	return SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(author));
+}
 
 static bool
 claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every)
@@ -2064,6 +2095,31 @@ phasevec_proof_main(Datum arg)
 			{
 				if (kind == MSG_JUDGE)
 				{
+					/*
+					 * (sixteenth review) A proof is judged, and its verdict recorded, only while its author is a role:
+					 * the role is locked here until this transaction commits (DROP ROLE takes it exclusively, so it
+					 * waits for the verdict), and one dropped before is found gone. In the fifteenth cut a call went on
+					 * running the proofs of a role dropped mid-call, and stamped 'verified' in its name.
+					 */
+					if (ready && sh->author != sh->owner)
+					{
+						if (!author_still_there(sh->author))
+						{
+							ready = false;
+							memset(&j, 0, sizeof(j));
+							j.out = OUT_UNPROVEN;
+							j.err = "the author of this proof was dropped during the call: nothing is judged in its "
+								"name; assert it again, or adopt it naming its author (phasevec.adopt)";
+						}
+						else if (lock_waited_since(GetCurrentTransactionStartTimestamp()))
+						{
+							/* a DROP ROLE of the author held it, and was rolled back: this transaction's now() is old */
+							ready = false;
+							memset(&j, 0, sizeof(j));
+							j.out = OUT_NO_VERDICT;
+							j.err = "not judged: a DROP ROLE of its author held the role, and was rolled back";
+						}
+					}
 					if (ready)
 					{
 						sh->started = GetCurrentTimestamp();
@@ -3105,8 +3161,16 @@ refuse_inside_proof(void)
  * nothing in the caller's transaction: it may verify again in it.
  */
 static void
-require_no_writes(void)
+require_no_writes(const char *what)
 {
+	/*
+	 * (sixteenth review) verify() records what it judges, in sessions of its own that commit each verdict (and start
+	 * background workers): its writes are not this transaction's, and READ ONLY did not stop them. A transaction (or a
+	 * session, default_transaction_read_only; or a standby) that says it writes nothing records nothing through
+	 * verify() either. yggdrasil's read-only acts ran every ygg_lector proof and committed 610 verdicts.
+	 */
+	PreventCommandIfReadOnly(what);
+	PreventCommandDuringRecovery(what);
 	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
@@ -3250,7 +3314,7 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	require_clock(l.timeout_ms);
 	refuse_inside_proof();
 	require_fresh_snapshots();
-	require_no_writes();
+	require_no_writes("phasevec.verify()");
 	budget_us = interval_usec(PG_GETARG_INTERVAL_P(3));
 	InitMaterializedSRF(fcinfo, 0);
 
@@ -3388,7 +3452,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	require_clock(l.timeout_ms);
 	refuse_inside_proof();
 	require_fresh_snapshots();
-	require_no_writes();
+	require_no_writes("phasevec.verify_one()");
 
 	become(owner, &was);
 	spi_connect();
@@ -4207,15 +4271,25 @@ phasevec_door(PG_FUNCTION_ARGS)
  * the owner's) as the extension's owner. Its argument is whatever row the caller gives it: one made up for a table the
  * caller may not read gets NULL, so it is no way to test what a hidden row says.
  */
-#define VERDICT_SEEN 16
+/*
+ * (sixteenth review) Nothing about who may see is kept from one call to the next: the caller's SELECT on the table and
+ * whether row-level security filters it are checked on every call (two syscache lookups), the row's key under that
+ * security too. The fifteenth cut decided once per (watch, role) and kept the decision in fn_extra, which a PL/pgSQL
+ * expression keeps for its whole transaction: after a REVOKE or an ENABLE ROW LEVEL SECURITY committed by another
+ * session (which a new query, and has_table_privilege, already saw) the kept expression went on answering, and a
+ * forged row then told whether a guess was the hidden row's text (10000 guesses in 0.1 s). What is kept is only which
+ * table a watch reads (a watch never changes its table: watch() makes a new one), in a few fixed slots: the fifteenth
+ * cut kept a whole copy of the watch (its recipe, its statement) per miss in the query's memory, and a query over 17
+ * watches in turn grew by ~0.8 kB a row (1 GB for 40000 rows of 20 watches with an 8 kB recipe). Under row-level
+ * security the watch is read for the call, in memory that ends with it.
+ */
+#define VERDICT_SEEN 64
 
 typedef struct VerdictWatch
 {
 	int32		watch;
-	Oid			caller;
-	bool		shown;			/* the caller may SELECT the watch's table */
-	bool		rls;			/* row-level security filters it for the caller */
-	Target		t;				/* loaded when rls */
+	bool		known;			/* there is such a watch */
+	Oid			relid;			/* its table */
 } VerdictWatch;
 
 typedef struct VerdictCache
@@ -4228,6 +4302,72 @@ typedef struct VerdictCache
 	VerdictWatch w[VERDICT_SEEN];
 } VerdictCache;
 
+/* May the caller see the claim (watch, key) now? */
+static bool
+verdict_shown(VerdictCache *vc, int32 watch, Datum keyd, Oid caller)
+{
+	VerdictWatch *vw = NULL;
+	bool		shown;
+	Who			was;
+
+	for (int i = 0; i < vc->n && vw == NULL; i++)
+		if (vc->w[i].watch == watch)
+			vw = &vc->w[i];
+	if (vw == NULL)
+	{
+		MemoryContext cx = AllocSetContextCreate(CurrentMemoryContext, "phasevec _verdict", ALLOCSET_SMALL_SIZES);
+		MemoryContext o = MemoryContextSwitchTo(cx);
+		Target		t;
+		bool		known;
+
+		become(vc->owner, &was);
+		spi_connect();
+		known = load_target_ext(Int32GetDatum(watch), true, &t, cx, true);
+		SPI_finish();
+		unbecome(&was);
+		MemoryContextSwitchTo(o);
+		if (vc->n < VERDICT_SEEN)
+			vw = &vc->w[vc->n++];
+		else
+		{
+			vw = &vc->w[vc->next];
+			vc->next = (vc->next + 1) % VERDICT_SEEN;
+		}
+		vw->watch = watch;
+		vw->known = known;
+		vw->relid = known ? t.relid : InvalidOid;
+		MemoryContextDelete(cx);
+	}
+	if (!vw->known)
+		return false;
+	/* a table dropped since (the watch goes with it at commit) shows nothing */
+	{
+		bool		missing = false;
+
+		shown = pg_class_aclcheck_ext(vw->relid, caller, ACL_SELECT, &missing) == ACLCHECK_OK && !missing;
+	}
+	if (!shown)
+		return false;
+	/* a key is a row too: one row-level security hides from the caller gets nothing */
+	if (check_enable_rls(vw->relid, caller, true) == RLS_ENABLED)
+	{
+		MemoryContext cx = AllocSetContextCreate(CurrentMemoryContext, "phasevec _verdict", ALLOCSET_SMALL_SIZES);
+		MemoryContext o = MemoryContextSwitchTo(cx);
+		Target		t;
+
+		become(vc->owner, &was);
+		spi_connect();
+		shown = load_target_ext(Int32GetDatum(watch), true, &t, cx, true) && t.relid == vw->relid;
+		SPI_finish();
+		unbecome(&was);
+		if (shown)
+			shown = key_visible_out(&t, caller, TextDatumGetCString(keyd));
+		MemoryContextSwitchTo(o);
+		MemoryContextDelete(cx);
+	}
+	return shown;
+}
+
 Datum
 phasevec_verdict(PG_FUNCTION_ARGS)
 {
@@ -4238,7 +4378,6 @@ phasevec_verdict(PG_FUNCTION_ARGS)
 	bool		isnull;
 	int32		watch;
 	Datum		keyd;
-	VerdictWatch *vw = NULL;
 	Who			was;
 	Datum		res;
 
@@ -4268,39 +4407,7 @@ phasevec_verdict(PG_FUNCTION_ARGS)
 		vc->rowtype = argt;
 	}
 
-	/* who may see this watch: once per query for each (watch, role) */
-	for (int i = 0; i < vc->n && vw == NULL; i++)
-		if (vc->w[i].watch == watch && vc->w[i].caller == caller)
-			vw = &vc->w[i];
-	if (vw == NULL)
-	{
-		Target		t;
-		bool		known;
-
-		become(vc->owner, &was);
-		spi_connect();
-		known = load_target_ext(Int32GetDatum(watch), true, &t, mcxt, true);
-		SPI_finish();
-		unbecome(&was);
-		if (vc->n < VERDICT_SEEN)
-			vw = &vc->w[vc->n++];
-		else
-		{
-			vw = &vc->w[vc->next];
-			vc->next = (vc->next + 1) % VERDICT_SEEN;
-		}
-		memset(vw, 0, sizeof(VerdictWatch));
-		vw->watch = watch;
-		vw->caller = caller;
-		vw->shown = known && may_read(&t, caller);
-		vw->rls = vw->shown && rls_for(&t, caller);
-		if (known)
-			vw->t = t;
-	}
-	if (!vw->shown)
-		PG_RETURN_NULL();
-	/* a key is a row too: one row-level security hides from the caller gets nothing */
-	if (vw->rls && !key_visible_out(&vw->t, caller, TextDatumGetCString(keyd)))
+	if (!verdict_shown(vc, watch, keyd, caller))
 		PG_RETURN_NULL();
 
 	become(vc->owner, &was);

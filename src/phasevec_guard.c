@@ -541,6 +541,22 @@ current_pin(void)
 }
 
 int
+guard_own_enter(void)
+{
+	int			nest = NewGUCNestLevel();
+
+	apply_pins();
+	set_one("transform_null_equals", "off");
+	return nest;
+}
+
+void
+guard_own_leave(int nest)
+{
+	AtEOXact_GUC(true, nest);
+}
+
+int
 guard_pin_settings(void)
 {
 	int			nest = NewGUCNestLevel();
