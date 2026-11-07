@@ -26,28 +26,35 @@ $enc$;
 -- the thirteenth cut a writer that held watches on its way to truth and this script, holding truth on its way to
 -- watches, deadlocked, and one of them was aborted. Run the update alone, not in a transaction with DDL on watched
 -- tables (that DDL waits for their writers while this holds the extension's tables they wait for).
--- (nineteenth review, R19-F9) This update also gives every watched table a TRUNCATE trigger (below), which takes the
--- table first: a writer holds its table while it waits for the extension's tables, so the watched tables are taken
--- before them, all together or none (NOWAIT, and again until no writer holds one): a writer of two watched tables is
--- never waited for while this holds the other.
+-- (twentieth review, RT20M-3, RT20-CRASH-1/2) Only the extension's tables are taken here, in one queued LOCK (it waits
+-- its turn behind the writers that hold them and gets them when they end; lock_timeout bounds the wait, and then the
+-- update stops, named, and is run again). No watched table is held while this waits, and none is waited for while
+-- this holds the extension's tables: the TRUNCATE triggers below are made only on a table no one is writing (taken
+-- with NOWAIT, once), and phasevec.watch_truncate() makes the rest. In the nineteenth review's cut the watched
+-- tables were taken first, with NOWAIT and again until all were free: under steady short writes that moment rarely
+-- came (the update did not finish in minutes), lock_timeout never applied, and a transaction that had read
+-- phasevec and then wrote a watched table deadlocked with it (the update held the table and waited for phasevec's).
 DO $lk$
-DECLARE r record; tries int := 0;
+DECLARE holders text;
 BEGIN
-    LOOP
-        BEGIN
-            FOR r IN SELECT DISTINCT w.source::oid AS relid FROM phasevec.watches w ORDER BY 1 LOOP
-                EXECUTE pg_catalog.format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE NOWAIT', r.relid::regclass);
-            END LOOP;
-            EXIT;
-        EXCEPTION WHEN lock_not_available THEN
-            tries := tries OPERATOR(pg_catalog.+) 1;
-            PERFORM pg_catalog.pg_sleep(0.01 OPERATOR(pg_catalog.*) LEAST(tries, 50));
-        END;
-    END LOOP;
+    LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdocs, phasevec.truth
+        IN ACCESS EXCLUSIVE MODE;
+EXCEPTION WHEN lock_not_available THEN
+    SELECT pg_catalog.string_agg(DISTINCT l.pid::text, ', ') INTO holders
+      FROM pg_catalog.pg_locks l
+     WHERE l.granted AND l.locktype = 'relation' AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d
+                                                                    WHERE d.datname = pg_catalog.current_database())
+       AND l.relation IN ('phasevec.watches'::regclass, 'phasevec.sources'::regclass, 'phasevec.lexstats'::regclass,
+                          'phasevec.lexdocs'::regclass, 'phasevec.truth'::regclass)
+       AND l.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+    RAISE EXCEPTION 'phasevec: the update to 0.20.0 could not take phasevec''s tables within lock_timeout (%): '
+                    'nothing was changed', pg_catalog.current_setting('lock_timeout')
+        USING ERRCODE = 'lock_not_available',
+              DETAIL = pg_catalog.format('Sessions holding them: %s.', coalesce(holders, 'none any more')),
+              HINT = 'Run the update again (a longer lock_timeout waits longer for the writers to end), or end those '
+                     'sessions first (pg_stat_activity).';
 END
 $lk$;
-LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdocs, phasevec.truth
-    IN ACCESS EXCLUSIVE MODE;
 
 -- Found by the public-readiness review of 2026-11-05, then by an adversarial review of the first cut of 0.20.0
 -- (never released) that ran the attacks:
@@ -305,6 +312,21 @@ LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdo
 -- 58. (nineteenth review, R19-PRIV-2) _key_shape() locked any table for any role with USAGE on the schema: it answers
 --    only a role that may watch the table, before it locks it. (RT19-CRASH-1) A DROP TABLE while a verifier read the
 --    table's shape was an internal error: the indexes are read from pg_index, and a table gone is the shape refusal.
+-- 59. (twentieth review, RT20M-1) A claim asserted again by a transaction that began before its proof did, and that
+--    committed after the proof's session ended itself, was halted (_truth_halted took the assert's changed_at, its
+--    transaction's start, for older than the proof). A record made apart from the run it is about (a halt, a proof
+--    that overran, an interruption) is now the claim's only while its row is the version that run took (xmin), not
+--    by any time (_truth_halted, _truth_set, _truth_tried).
+-- 60. (twentieth review, RT20M-2) A wrapper's SET DateStyle = ISO over its caller's 'SQL, DMY' recorded 'ISO, DMY' as
+--    the author's: a composite setting is recorded only when every value it was built on is the author's.
+-- 61. (twentieth review, RT20P-ENV-1) A recorded setting that could not be set again (a role's REVOKE, an object
+--    dropped) was dropped with a WARNING and the proof judged without it: now the claim reads 'unproven', with why.
+-- 62. (twentieth review, RT20M-3, RT20-CRASH-1/2, RT20P-UPD-1) The update took the watched tables with NOWAIT until all
+--    were free: it starved under steady writes, ignored lock_timeout, deadlocked a transaction that read phasevec and
+--    then wrote, and failed on a table owner's trigger of the TRUNCATE trigger's name. It takes only phasevec's tables
+--    (queued, bounded by lock_timeout, named when it gives up); a busy table's TRUNCATE trigger is made apart
+--    (phasevec.watch_truncate()). (RT20M-4) adopt() takes the watched table before the claims' rows, as DROP TABLE
+--    does; (RT20M-5) a replaced claim is not taken for its proof.
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -603,9 +625,14 @@ $f$;
 -- forward in time. A worker takes the claim's row before it judges, so of two judgments of one claim the later one
 -- commits later; a record of what a verifier found about an earlier run (a proof that took too long) can still come
 -- after a newer verdict, and is dropped.
+-- (twentieth review, RT20M-1) p_taken: for a record made in another transaction than the one that took the claim for
+-- its proof (what the verifier found about a run whose session it ended, src/phasevec_truth.c), the version of the
+-- claim's row that run took (its xmin): the record is the claim's only while no one has written the row since. The
+-- bind cannot tell it (the same proof asserted again binds alike), and neither can a time: a writer's now() is the
+-- start of its transaction, which may be older than the run it outlasted.
 DROP FUNCTION phasevec._truth_set(int, text, boolean, text);
 CREATE FUNCTION phasevec._truth_set(p_watch int, p_key text, p_outcome text, p_error text, p_bind bytea,
-                                    p_at timestamptz)
+                                    p_at timestamptz, p_taken xid DEFAULT NULL)
 RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE v text;
 BEGIN
@@ -619,6 +646,7 @@ BEGIN
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict IN ($q$verified$q$, $q$refuted$q$)
            AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+           AND (p_taken IS NULL OR t.xmin = p_taken)
            AND phasevec._truth_stale(t);
         p_outcome := CASE WHEN FOUND THEN NULL ELSE $q$unproven$q$ END;
     END IF;
@@ -630,6 +658,7 @@ BEGIN
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
            AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
            AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+           AND (p_taken IS NULL OR t.xmin = p_taken)
            AND (t.verified_at IS NULL OR t.verified_at <= coalesce(p_at, now()));
     END IF;
     SELECT phasevec._verdict_of(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
@@ -643,13 +672,21 @@ $f$;
 -- the claim, and one session that ended halted every key whose text, proof and author read alike. Recorded only by a
 -- verifier that may act as the claim's author (anyone, for a claim whose author is gone): another one neither writes
 -- nor locks the row (in the sixth review a role with no rights over the author held it, and the author's assert()
--- waited). A claim asserted again since the proof began (p_started) is not the one that ran: it runs. Returns 1 when
+-- waited). A claim written since its proof's session took it is not the one that ran: it runs. Returns 1 when
 -- recorded, 0 when no such claim is left, -1 when this verifier may not record it.
-CREATE FUNCTION phasevec._truth_halted(p_watch int, p_key_hash bytea, p_bind bytea, p_verifier oid,
-                                       p_started timestamptz)
+-- (twentieth review, RT20M-1) "Written since" is the version of the claim's row the proof's session took (p_taken, its
+-- xmin), not a time: every write of the row makes a new version, the proof's own session writes none, and the version
+-- does not depend on any clock. In the nineteenth review's cut it was changed_at <= p_started, and changed_at is the
+-- writer's now(), the start of its transaction: an assert() whose transaction began before the proof, and that waited
+-- for the proof's row and committed after the session ended, was taken for the claim that ran and halted, and the
+-- assert that is the documented way out of a halt was undone (verify() never ran it again).
+CREATE FUNCTION phasevec._truth_halted(p_watch int, p_key_hash bytea, p_bind bytea, p_verifier oid, p_taken xid)
 RETURNS int LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE k text; a oid; known boolean;
 BEGIN
+    IF p_taken IS NULL THEN
+        RETURN 0;
+    END IF;
     SELECT t.key, t.asserted_by_oid, r.oid IS NOT NULL INTO k, a, known
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
@@ -657,9 +694,8 @@ BEGIN
        -- the key's own bytes, as the proof's session hashes them (src/phasevec_truth.c, key_hash)
        AND sha256(convert_to(t.key, getdatabaseencoding()::name)) = p_key_hash
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
-       AND (t.changed_at IS NULL OR t.changed_at <= p_started)
-       -- (tenth review) a verdict read after this proof began stands
-       AND (t.verified_at IS NULL OR t.verified_at <= p_started);
+       -- the row as the proof's session took it: nothing written since (a verdict, an assert of the same claim)
+       AND t.xmin = p_taken;
     IF NOT FOUND THEN
         RETURN 0;
     END IF;
@@ -673,10 +709,8 @@ BEGIN
            last_error = $q$the session that ran this proof ended while it ran: not run again until it is asserted again$q$
      WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$ AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
        AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
-       -- (nineteenth review, 53) again under the row's lock: a verdict recorded since the check above stands
-       AND (t.verified_at IS NULL OR t.verified_at <= p_started)
-       -- (nineteenth review, R19-F7) and so does a claim asserted again since (the same proof, a new claim)
-       AND (t.changed_at IS NULL OR t.changed_at <= p_started);
+       -- again under the row's lock (a write that committed since the check above made a new version)
+       AND t.xmin = p_taken;
     RETURN CASE WHEN FOUND THEN 1 ELSE 0 END;
 END;
 $f$;
@@ -700,7 +734,10 @@ $f$;
 -- now.
 -- (nineteenth review, R19-F7) An interruption is the claim's that was tried (p_bind), read again under the row's lock:
 -- until then it was stamped on whatever claim the key had when it was recorded, one asserted since included.
-CREATE FUNCTION phasevec._truth_tried(p_watch int, p_key text, p_why text, p_interrupted boolean, p_bind bytea)
+-- (twentieth review, RT20M-1) and, when the run is known (p_taken, as for _truth_halted), only while no one has
+-- written the row since that run took it.
+CREATE FUNCTION phasevec._truth_tried(p_watch int, p_key text, p_why text, p_interrupted boolean, p_bind bytea,
+                                      p_taken xid DEFAULT NULL)
 RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE v text;
 BEGIN
@@ -710,7 +747,8 @@ BEGIN
         UPDATE phasevec.truth t SET interrupted_at = now(), interrupted_why = p_why
          WHERE t.watch = p_watch AND t.key = p_key AND t.verdict <> $q$replaced$q$
            AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
-           AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
+           AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+           AND (p_taken IS NULL OR t.xmin = p_taken);
     END IF;
     SELECT phasevec._verdict_of(t) INTO v FROM phasevec.truth t WHERE t.watch = p_watch AND t.key = p_key;
     RETURN v;
@@ -891,6 +929,77 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_key_shape$q$ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION phasevec._key_shape(regclass, name) IS
     $q$Why p_source cannot be watched by p_key (a partitioned table, a partition, an inheritance parent or child, a key without a unique btree index of its own enforced at once), or NULL when it can (0.20.0, eighteenth review).$q$;
 
+-- (twentieth review, RT20M-3, RT20P-UPD-1) A watch's TRUNCATE trigger (R19-F9), made where it is missing: by watch(),
+-- by this update for every older watch whose table no one is writing, and by phasevec.watch_truncate() for the rest.
+-- CREATE TRIGGER holds the table in SHARE ROW EXCLUSIVE mode, which waits for its writers: p_wait false takes it only if
+-- it is free now ('busy' otherwise), so the update never waits for a writer while it holds phasevec's tables (a writer
+-- holds its table and then waits for them). A trigger of that name already there is the watch's when it is phasevec's
+-- own ('there'); another one ('taken': a table owner may make any trigger on its table) is left alone and named. In the
+-- nineteenth review's cut the update failed on it with a bare "already exists".
+CREATE FUNCTION phasevec._truncate_trigger(p_watch int, p_wait boolean)
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+    src regclass;
+    nm  name := $q$phasevec_watch_$q$ || p_watch || $q$_truncate$q$;
+    tg  record;
+BEGIN
+    SELECT w.source INTO src FROM phasevec.watches w WHERE w.id = p_watch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'phasevec: no watch %', p_watch;
+    END IF;
+    IF p_wait THEN
+        EXECUTE format($q$LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE$q$, src);
+    ELSE
+        BEGIN
+            EXECUTE format($q$LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE NOWAIT$q$, src);
+        EXCEPTION WHEN lock_not_available THEN
+            RETURN $q$busy$q$;
+        END;
+    END IF;
+    SELECT t.tgfoid, t.tgtype, t.tgargs INTO tg FROM pg_trigger t WHERE t.tgrelid = src AND t.tgname = nm;
+    IF FOUND THEN
+        -- AFTER TRUNCATE FOR EACH STATEMENT (tgtype 32), phasevec._observe(<this watch>)
+        RETURN CASE WHEN tg.tgfoid = $q$phasevec._observe()$q$::regprocedure AND tg.tgtype = 32
+                         AND tg.tgargs = convert_to(p_watch::text, $q$UTF8$q$) || $q$\x00$q$::bytea
+                    THEN $q$there$q$ ELSE $q$taken$q$ END;
+    END IF;
+    EXECUTE format($q$CREATE TRIGGER %I AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION phasevec._observe(%L)$q$,
+                   nm, src, p_watch);
+    RETURN $q$made$q$;
+END;
+$f$;
+
+-- (twentieth review) The TRUNCATE trigger of a watch made before 0.20.0, for a table this update found busy (it says
+-- which): true when made, false when it was there. It waits for the table's writers like any CREATE TRIGGER (and as
+-- long as lock_timeout lets it), holding nothing else of phasevec's; one call per watch, each in its own transaction.
+-- Owner only, or granted; the caller must own the table, as for watch().
+CREATE FUNCTION phasevec.watch_truncate(p_watch text) RETURNS boolean
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+    w   phasevec.watches;
+    r   text;
+BEGIN
+    SELECT * INTO w FROM phasevec.watches x WHERE x.name = p_watch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'phasevec: no watch named %', p_watch;
+    END IF;
+    IF NOT pg_has_role(current_user, (SELECT c.relowner FROM pg_class c WHERE c.oid = w.source), $q$USAGE$q$) THEN
+        RAISE EXCEPTION 'phasevec: a watch''s TRUNCATE trigger is a trigger on %, so only its owner may make it', w.source;
+    END IF;
+    r := phasevec._truncate_trigger(w.id, true);
+    IF r = $q$taken$q$ THEN
+        RAISE EXCEPTION 'phasevec: % already has a trigger named %, which is not the watch''s', w.source,
+                        $q$phasevec_watch_$q$ || w.id || $q$_truncate$q$
+            USING ERRCODE = 'duplicate_object',
+                  HINT = format('Drop or rename that trigger, then call phasevec.watch_truncate(%L) again.', p_watch);
+    END IF;
+    RETURN r = $q$made$q$;
+END;
+$f$;
+REVOKE ALL ON FUNCTION phasevec._truncate_trigger(int, boolean), phasevec.watch_truncate(text) FROM PUBLIC;
+COMMENT ON FUNCTION phasevec.watch_truncate(text) IS
+    $q$Makes the TRUNCATE trigger of a watch made before 0.20.0 whose table the update found busy: true when made, false when it was there. Waits for the table's writers (lock_timeout bounds it). Owner only, or granted; the caller must own the table (0.20.0).$q$;
+
 CREATE OR REPLACE FUNCTION phasevec.watch(p_name text, p_source regclass, p_key name, p_recipe text, p_reader text,
                                           p_min_coverage numeric DEFAULT 0.95, p_doubt_below real DEFAULT NULL::real)
 RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
@@ -941,8 +1050,10 @@ BEGIN
                    'FOR EACH ROW EXECUTE FUNCTION phasevec._observe(%L, %L, %L)',
                    'phasevec_watch_' || wid, p_source, wid, p_key, p_recipe);
     -- (nineteenth review, R19-F9) and a TRUNCATE: the watch forgets every row the table had
-    EXECUTE format('CREATE TRIGGER %I AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION phasevec._observe(%L)',
-                   'phasevec_watch_' || wid || '_truncate', p_source, wid);
+    IF phasevec._truncate_trigger(wid, true) = 'taken' THEN
+        RAISE EXCEPTION 'phasevec: % already has a trigger named %', p_source, 'phasevec_watch_' || wid || '_truncate'
+            USING ERRCODE = 'duplicate_object', HINT = 'Drop or rename that trigger, then watch the table again.';
+    END IF;
 
     -- Every row already there is noted, so it is pending until read -- not invisible.
     INSERT INTO phasevec.sources (watch, key, text_hash)
@@ -951,17 +1062,38 @@ BEGIN
 END;
 $f$;
 
--- (nineteenth review, R19-F9) Every watch made before this update gets its TRUNCATE trigger too (its table is held
--- since the top of this script).
+-- (nineteenth review, R19-F9) Every watch made before this update gets its TRUNCATE trigger too. (twentieth review)
+-- Only where its table is free now (NOWAIT, once): a table a writer holds is not waited for (the writer may be waiting
+-- for phasevec's tables, which this holds), and neither is a trigger of the watch's name that is not phasevec's. Each
+-- such watch is named, with what to do: until phasevec.watch_truncate() makes its trigger, a TRUNCATE of its table
+-- leaves what the watch noted, as under 0.19.0.
 DO $tr$
-DECLARE w record;
+DECLARE
+    w record;
+    busy text := $q$$q$;
+    taken text := $q$$q$;
 BEGIN
-    FOR w IN SELECT x.id, x.source FROM phasevec.watches x ORDER BY x.id LOOP
-        EXECUTE pg_catalog.format('CREATE TRIGGER %I AFTER TRUNCATE ON %s FOR EACH STATEMENT '
-                                  'EXECUTE FUNCTION phasevec._observe(%L)',
-                                  'phasevec_watch_' OPERATOR(pg_catalog.||) w.id OPERATOR(pg_catalog.||) '_truncate',
-                                  w.source, w.id);
+    FOR w IN SELECT x.id, x.name, x.source FROM phasevec.watches x ORDER BY x.id LOOP
+        CASE phasevec._truncate_trigger(w.id, false)
+            WHEN $q$busy$q$ THEN
+                busy := busy OPERATOR(pg_catalog.||) pg_catalog.format(E'\n  SELECT phasevec.watch_truncate(%L);', w.name);
+            WHEN $q$taken$q$ THEN
+                taken := taken OPERATOR(pg_catalog.||) pg_catalog.format(E'\n  watch %s: %s has a trigger named %I',
+                    w.name, w.source, $q$phasevec_watch_$q$ OPERATOR(pg_catalog.||) w.id
+                                      OPERATOR(pg_catalog.||) $q$_truncate$q$);
+            ELSE NULL;
+        END CASE;
     END LOOP;
+    IF busy OPERATOR(pg_catalog.<>) $q$$q$ THEN
+        RAISE WARNING 'phasevec: these watched tables were being written during the update; each watch needs its '
+                      'TRUNCATE trigger made, one statement each (a TRUNCATE of the table forgets nothing until then):%',
+                      busy;
+    END IF;
+    IF taken OPERATOR(pg_catalog.<>) $q$$q$ THEN
+        RAISE WARNING 'phasevec: these watched tables have a trigger with the name of the watch''s TRUNCATE trigger, '
+                      'which is not phasevec''s:%', taken
+            USING HINT = 'Drop or rename each one, then call phasevec.watch_truncate(<watch>).';
+    END IF;
 END
 $tr$;
 
@@ -1083,8 +1215,8 @@ REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth
     phasevec._claim_state(phasevec.truth), phasevec._claim_state(timestamptz, text, boolean),
     phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
-    phasevec._truth_set(int, text, text, text, bytea, timestamptz), phasevec._truth_halted(int, bytea, bytea, oid, timestamptz),
-    phasevec._truth_attempt(int, text), phasevec._truth_tried(int, text, text, boolean, bytea),
+    phasevec._truth_set(int, text, text, text, bytea, timestamptz, xid), phasevec._truth_halted(int, bytea, bytea, oid, xid),
+    phasevec._truth_attempt(int, text), phasevec._truth_tried(int, text, text, boolean, bytea, xid),
     phasevec._note_set(int, text, bytea, text), phasevec._note_clear(int),
     phasevec.adopt(text, regrole, text[], text[]),
     phasevec._door_recall(text, text, int, boolean, text[]), phasevec._door_disputes(text, text[]),

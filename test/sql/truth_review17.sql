@@ -45,7 +45,8 @@ ALTER FUNCTION public.pv17_assert_as_au(text, text) OWNER TO pv17_au;
 SET session_replication_role = replica;
 SELECT public.pv17_assert_as_au($k$2$k$, $p$current_setting('session_replication_role') = 'replica'$p$);
 RESET session_replication_role;
--- a hand-written setting the author may not set is not set in its proof's session either (key 3)
+-- a hand-written setting the author may not set is not set in its proof's session either (key 3), and (twentieth
+-- review, RT20P-ENV-1) the proof is not judged without it: 'unproven' (until then it ran without it: 'refuted')
 SET ROLE pv17_au;
 SELECT phasevec.assert($w$notes17$w$, $k$3$k$, $p$current_setting('session_replication_role') = 'replica'$p$);
 RESET ROLE;

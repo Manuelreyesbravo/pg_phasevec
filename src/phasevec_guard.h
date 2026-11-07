@@ -84,4 +84,13 @@ extern ArrayType *guard_env_now(Oid author);
 /* A recorded state, from its text[] (NULL: none recorded, every setting at its default). */
 extern GuardEnv *guard_env_from(ArrayType *arr);
 
+/*
+ * (twentieth review, RT20P-ENV-1) A GUARD_AUTHOR guard sets every recorded setting again exactly, or raises: in the
+ * PG_CATCH of the code that entered it, guard_env_unreplayed() names the setting refused (NULL: the error is not
+ * that). After a proof, guard_env_kept() names a recorded setting a library the proof loaded did not keep (NULL: all
+ * kept). Either way the proof is not judged.
+ */
+extern const char *guard_env_unreplayed(void);
+extern const char *guard_env_kept(void);
+
 #endif

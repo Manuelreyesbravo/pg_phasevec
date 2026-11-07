@@ -1045,6 +1045,13 @@ typedef struct Judgment
 	Outcome		out;
 	char	   *err;
 	TimestampTz at;				/* when the row was read for it: the state it judged */
+	/*
+	 * (twentieth review, RT20M-1) For a record made in another transaction than the run's (what the verifier found about
+	 * a session it ended, or that ended itself): the version (xmin) of the claim's row that run took. The record is the
+	 * claim's only while no one has written the row since (phasevec._truth_halted, _truth_set, _truth_tried). Invalid:
+	 * recorded in the transaction that took the row, or no run took it.
+	 */
+	TransactionId taken;
 } Judgment;
 
 typedef struct Claim
@@ -1199,6 +1206,14 @@ lock_waited_since(TimestampTz since)
  * claim's row). Nothing phasevec reads now sits between the proof's now() and the proof; and a wait here is not on
  * the proof's clock: its time is the read's own.
  */
+/*
+ * (twentieth review, RT20P-ENV-1) A setting the claim records could not be set again as its author had it: the proof
+ * is not judged under it, and the claim reads 'unproven' (a verdict reached under other settings would be recorded for
+ * a bind that names these). Asserting it again records the settings the author has then.
+ */
+#define ENV_UNSET_ERR "not judged: the setting %s this claim records cannot be set again as its author had it (%s): " \
+	"assert it again"
+
 static bool
 judge_row(const Target *target, const char *key, bool author_rls, Oid as_role, GuardMode mode, const GuardEnv *env,
 		  const bytea *asserted_for, int timeout_ms, Seen *first, Judgment *j)
@@ -1273,6 +1288,7 @@ judge_row(const Target *target, const char *key, bool author_rls, Oid as_role, G
 		bool		ours = prove_fired;
 		bool		late = timeout_ms > 0 && started != 0 &&
 			TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms);
+		const char *unset;
 
 		if (timeout_ms > 0)
 			disable_timeout(prove_timeout, false);
@@ -1289,8 +1305,15 @@ judge_row(const Target *target, const char *key, bool author_rls, Oid as_role, G
 			QueryCancelPending = false;
 		ready = false;
 		out = OUT_NO_VERDICT;
-		err = (ours || late) ? psprintf("not judged: the row took longer than %d ms to read", timeout_ms) :
-			psprintf("not judged: the row could not be read (%s)", edata->message);
+		if ((unset = guard_env_unreplayed()) != NULL)
+		{
+			/* (twentieth review, RT20P-ENV-1) what its author sees, under settings that are not the claim's */
+			out = OUT_UNPROVEN;
+			err = psprintf(ENV_UNSET_ERR, unset, edata->message);
+		}
+		else
+			err = (ours || late) ? psprintf("not judged: the row took longer than %d ms to read", timeout_ms) :
+				psprintf("not judged: the row could not be read (%s)", edata->message);
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -1381,6 +1404,18 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 				if (isnull)
 					err = "the proof returned NULL";
 			}
+			if (mode == GUARD_AUTHOR)
+			{
+				const char *lost = guard_env_kept();
+
+				if (lost != NULL)
+				{
+					out = OUT_UNPROVEN;
+					err = MemoryContextStrdup(oldcontext,
+											  psprintf(ENV_UNSET_ERR, lost,
+													   "a library the proof loaded did not take the value"));
+				}
+			}
 			guard_leave(&g);
 			phase = 2;
 			if (target)
@@ -1435,6 +1470,7 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		bool		late = timeout_ms > 0 && started != 0 &&
 			TimestampDifferenceExceeds(started, GetCurrentTimestamp(), timeout_ms);
 		bool		waited = lock_waited_since(started);
+		const char *unset;
 
 		if (timeout_ms > 0)
 			disable_timeout(prove_timeout, false);
@@ -1458,7 +1494,13 @@ judge(const char *proof, int timeout_ms, double max_cost, Oid as_role, GuardMode
 		 * (not_a_verdict); one reading it again records nothing.
 		 */
 		out = phase == 1 ? OUT_REFUTED : OUT_MOVED;
-		if ((waiting || from_deadlock(edata) ||
+		if ((unset = guard_env_unreplayed()) != NULL)
+		{
+			/* (twentieth review, RT20P-ENV-1) the proof never ran under its claim's settings: no verdict for it */
+			out = OUT_UNPROVEN;
+			err = psprintf(ENV_UNSET_ERR, unset, edata->message);
+		}
+		else if ((waiting || from_deadlock(edata) ||
 						   (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE && from_interrupts(edata))))
 		{
 			/* (ninth review) a lock another session holds: not the proof's answer, and no verdict */
@@ -1601,7 +1643,7 @@ phasevec_prove(PG_FUNCTION_ARGS)
  * spends the turn itself: ending it leaves that claim's turn where it was, and no other claim waits behind it.
  */
 #define PROOF_MAGIC		0x50565046
-#define PROOF_PROTOCOL	4
+#define PROOF_PROTOCOL	5
 #define PROOF_QUEUE		(64 * 1024)
 #define PROOF_GRACE_MS	5000
 #define PROOF_AHEAD		8		/* claims queued ahead of their answers, and no more than PROOF_QUEUE / 2 bytes */
@@ -1619,6 +1661,7 @@ typedef struct ProofShared
 	int32		watch;
 	pg_atomic_uint32 judging;	/* 1 while the worker judges a claim */
 	TimestampTz started;		/* when it began to (written before judging is set) */
+	TransactionId taken;		/* the version of the claim's row it took (written before judging is set) */
 	volatile int32 pid;			/* the worker's process */
 	volatile int32 signaller;	/* the process that sent it SIGTERM first: 0 none, -1 unknown */
 } ProofShared;
@@ -1784,18 +1827,19 @@ claim_message(StringInfo b, ProofKind kind, const Claim *c, const Interval *ever
 	}
 	put_int(b, rec ? rec->out : OUT_NOT_JUDGED);
 	put_int(b, rec ? rec->at : 0);
+	put_int(b, rec ? rec->taken : InvalidTransactionId);
 	put_str(b, rec ? rec->err : NULL);
 }
 
-#define RECORD_SQL "SELECT phasevec._truth_set($1, $2, $3, $4, $5, $6)"
+#define RECORD_SQL "SELECT phasevec._truth_set($1, $2, $3, $4, $5, $6, $7)"
 
 /* Record a judgment through phasevec._truth_set, as the owner; the verdict as it reads now. */
 static char *
 record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 {
-	Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
-	Datum		av[6];
-	char		nulls[7] = "      ";
+	Oid			at[7] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID, XIDOID};
+	Datum		av[7];
+	char		nulls[8] = "       ";
 	const char *name = outcome_name[j->out];
 	MemoryContext keep = CurrentMemoryContext;
 	char	   *v = NULL;
@@ -1811,11 +1855,13 @@ record(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 	nulls[4] = c->bind ? ' ' : 'n';
 	av[5] = TimestampTzGetDatum(j->at);
 	nulls[5] = j->at != 0 ? ' ' : 'n';
+	av[6] = TransactionIdGetDatum(j->taken);
+	nulls[6] = TransactionIdIsValid(j->taken) ? ' ' : 'n';
 
 	become(owner, &was);
 	spi_connect();
 	if ((t->record_plan ? SPI_execute_plan(t->record_plan, av, nulls, false, 1)
-		 : SPI_execute_with_args(RECORD_SQL, 6, at, av, nulls, false, 1)) != SPI_OK_SELECT)
+		 : SPI_execute_with_args(RECORD_SQL, 7, at, av, nulls, false, 1)) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the verdict was not recorded");
 	if (SPI_processed == 1)
 	{
@@ -1882,11 +1928,13 @@ record_halted(Oid owner, Oid verifier, const Target *t, const Claim *c, const Ju
 	become(owner, &was);
 	spi_connect();
 	{
-		Oid			at[5] = {INT4OID, BYTEAOID, BYTEAOID, OIDOID, TIMESTAMPTZOID};
+		Oid			at[5] = {INT4OID, BYTEAOID, BYTEAOID, OIDOID, XIDOID};
 		Datum		av[5] = {Int32GetDatum(t->watch), PointerGetDatum(bytes32(kh)), PointerGetDatum(c->bind),
-		ObjectIdGetDatum(verifier), TimestampTzGetDatum(j->at)};
+		ObjectIdGetDatum(verifier), TransactionIdGetDatum(j->taken)};
+		char		nulls[6] = "     ";
 
-		if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3, $4, $5)", 5, at, av, NULL, false, 1)
+		nulls[4] = TransactionIdIsValid(j->taken) ? ' ' : 'n';
+		if (SPI_execute_with_args("SELECT phasevec._truth_halted($1, $2, $3, $4, $5)", 5, at, av, nulls, false, 1)
 			!= SPI_OK_SELECT)
 			elog(ERROR, "phasevec: a halted proof could not be recorded");
 	}
@@ -1907,17 +1955,18 @@ record_tried(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 	MemoryContext keep = CurrentMemoryContext;
 	char	   *v = NULL;
 	Who			was;
-	Oid			at[5] = {INT4OID, TEXTOID, TEXTOID, BOOLOID, BYTEAOID};
-	Datum		av[5] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key),
+	Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, BOOLOID, BYTEAOID, XIDOID};
+	Datum		av[6] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key),
 	j->err ? CStringGetTextDatum(j->err) : (Datum) 0, BoolGetDatum(j->out == OUT_INTERRUPTED),
-	PointerGetDatum(c->bind)};
-	char		nulls[6] = "     ";
+	PointerGetDatum(c->bind), TransactionIdGetDatum(j->taken)};
+	char		nulls[7] = "      ";
 
 	nulls[2] = j->err ? ' ' : 'n';
 	nulls[4] = c->bind ? ' ' : 'n';
+	nulls[5] = TransactionIdIsValid(j->taken) ? ' ' : 'n';
 	become(owner, &was);
 	spi_connect();
-	if (SPI_execute_with_args("SELECT phasevec._truth_tried($1, $2, $3, $4, $5)", 5, at, av, nulls, false, 1)
+	if (SPI_execute_with_args("SELECT phasevec._truth_tried($1, $2, $3, $4, $5, $6)", 6, at, av, nulls, false, 1)
 		!= SPI_OK_SELECT)
 		elog(ERROR, "phasevec: what was tried could not be recorded");
 	if (SPI_processed == 1)
@@ -1996,9 +2045,16 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
 #define DISTINCT(a, b) "COALESCE(NOT (" a " OPERATOR(pg_catalog.=) " b "), (" a " IS NULL) OPERATOR(pg_catalog.<>) (" b " IS NULL))"
 #define LOCK_OLD(c) "t." c " IS NULL OR pg_catalog.timezone('UTC', t." c ") OPERATOR(pg_catalog.<) " \
 	"(pg_catalog.timezone('UTC', pg_catalog.now()) OPERATOR(pg_catalog.-) $3)"
+/*
+ * (twentieth review) Each take returns the version of the row it took (xmin): a record made later, in another
+ * transaction, about that run is the claim's only while that is still the row's version (Judgment.taken, RT20M-1).
+ * And a replaced claim is not taken (RT20M-5): supersede() changes no part of the bind, and a verify_one() that waited
+ * for one ran the replaced claim's proof and answered 'replaced'.
+ */
+#define NOT_REPLACED "t.verdict OPERATOR(pg_catalog.<>) 'replaced'"
 #define CLAIM_LOCK_SQL \
-	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND t.retired_at IS NULL AND NOT t.halted AND " SAME_CLAIM " " \
+	"SELECT t.xmin FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
+	"AND t.retired_at IS NULL AND NOT t.halted AND " NOT_REPLACED " AND " SAME_CLAIM " " \
 	"AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
 	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
 	"AND " DISTINCT("t.asserted_for", "h") " THEN " LOCK_OLD("looked_at") " OR " DISTINCT("t.looked_for", "h") " " \
@@ -2007,8 +2063,8 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
 	"AND s.key OPERATOR(pg_catalog.=) t.key) AS h) s)) FOR NO KEY UPDATE SKIP LOCKED"
 
 #define CLAIM_TAKE_SQL \
-	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND t.retired_at IS NULL AND " SAME_CLAIM " FOR NO KEY UPDATE"
+	"SELECT t.xmin FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
+	"AND t.retired_at IS NULL AND " NOT_REPLACED " AND " SAME_CLAIM " FOR NO KEY UPDATE"
 
 /*
  * (fourteenth review) verify_one() takes its claim without waiting, in the transaction that judges it; when another
@@ -2042,7 +2098,7 @@ watched_table_first(const Target *t)
 }
 
 static bool
-claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every)
+claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every, TransactionId *xmin)
 {
 	Datum		av[4] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), PointerGetDatum(every),
 	PointerGetDatum(c->bind)};
@@ -2055,6 +2111,13 @@ claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const I
 	if (SPI_execute_plan(plan, av, nulls, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: a claim could not be taken");
 	taken = SPI_processed == 1;
+	if (xmin)
+	{
+		bool		isnull = true;
+		Datum		d = taken ? SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull) : (Datum) 0;
+
+		*xmin = isnull ? InvalidTransactionId : DatumGetTransactionId(d);
+	}
 	SPI_finish();
 	unbecome(&was);
 	return taken;
@@ -2246,10 +2309,10 @@ phasevec_proof_main(Datum arg)
 	load_target(Int32GetDatum(sh->watch), true, &target, TopMemoryContext);
 	prepare_read(&target);
 	{
-		Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
+		Oid			at[7] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID, XIDOID};
 		Oid			lt[4] = {INT4OID, TEXTOID, INTERVALOID, BYTEAOID};
 
-		(void) kept_plan(&target.record_plan, RECORD_SQL, 6, at);
+		(void) kept_plan(&target.record_plan, RECORD_SQL, 7, at);
 		(void) kept_plan(&worker_lock_plan, CLAIM_LOCK_SQL, 4, lt);
 		(void) kept_plan(&worker_take_plan, CLAIM_TAKE_SQL, 4, lt);
 		(void) kept_plan(&worker_try_plan, CLAIM_TRY_SQL, 4, lt);
@@ -2281,7 +2344,9 @@ phasevec_proof_main(Datum arg)
 		char	   *v = NULL;
 		bool		ready = false;
 		Seen		first = {0};
+		TransactionId xmin = InvalidTransactionId;
 
+		memset(&j, 0, sizeof(j));
 		MemoryContextReset(per);
 		MemoryContextSwitchTo(per);
 		if (shm_mq_receive(req, &n, &data, false) != SHM_MQ_SUCCESS)
@@ -2354,6 +2419,7 @@ phasevec_proof_main(Datum arg)
 		}
 		j.out = (Outcome) get_int(&m);
 		j.at = (TimestampTz) get_int(&m);
+		j.taken = (TransactionId) get_int(&m);
 		j.err = get_bytes(&m, NULL);
 		if (c.key == NULL || (kind == MSG_JUDGE && c.proof == NULL) || (kind != MSG_JUDGE && kind != MSG_RECORD))
 			elog(ERROR, "phasevec: a malformed message between a verifier and a proof's session");
@@ -2420,7 +2486,7 @@ phasevec_proof_main(Datum arg)
 				MemoryContextSwitchTo(per);
 				pgstat_report_activity(STATE_RUNNING, "phasevec: judging a claim");
 				watched_table_first(&target);
-				taken = claim_taken(sh->owner, every ? worker_lock_plan : worker_try_plan, &target, &c, every);
+				taken = claim_taken(sh->owner, every ? worker_lock_plan : worker_try_plan, &target, &c, every, &xmin);
 				if (taken && lock_waited_since(GetCurrentTransactionStartTimestamp()))
 				{
 					PopActiveSnapshot();
@@ -2451,7 +2517,7 @@ phasevec_proof_main(Datum arg)
 				 * claim's row (refute(), assert()) and then altered the table (ALTER TABLE, DROP TABLE)
 				 * deadlocked with it: each waited for what the other held.
 				 */
-				gone = !claim_taken(sh->owner, worker_take_plan, &target, &c, NULL);
+				gone = !claim_taken(sh->owner, worker_take_plan, &target, &c, NULL, NULL);
 				PopActiveSnapshot();
 				CommitTransactionCommand();
 				MemoryContextSwitchTo(per);
@@ -2487,6 +2553,7 @@ phasevec_proof_main(Datum arg)
 					}
 					if (ready)
 					{
+						sh->taken = xmin;
 						sh->started = GetCurrentTimestamp();
 						pg_write_barrier();
 						pg_atomic_write_u32(&sh->judging, 1);
@@ -2950,6 +3017,7 @@ line_unjudged(Line *l, const char *why, bool author_wide)
 	Oid			author = l->q[l->qh].c->author;
 	Judgment	j;
 
+	memset(&j, 0, sizeof(j));
 	j.out = OUT_NO_VERDICT;
 	j.at = 0;
 	j.err = (char *) why;
@@ -3264,6 +3332,7 @@ line_next(Line *l, Done *d)
 			Judgment	j;
 			char	   *v;
 
+			memset(&j, 0, sizeof(j));
 			m.p = data;
 			m.end = (const char *) data + n;
 			what = (ProofAnswer) get_int(&m);
@@ -3327,7 +3396,9 @@ line_next(Line *l, Done *d)
 				Judgment	j;
 				int32		by = sh->signaller;
 
+				memset(&j, 0, sizeof(j));
 				j.at = sh->started;
+				j.taken = sh->taken;
 				if (by == 0 || by == sh->pid)
 				{
 					/* the proof ended the session it ran in: its own FATAL, its author's transaction_timeout */
@@ -3394,8 +3465,10 @@ line_next(Line *l, Done *d)
 			{
 				Judgment	j;
 
+				memset(&j, 0, sizeof(j));
 				j.out = OUT_REFUTED;
 				j.at = proof_cur->sh->started;
+				j.taken = proof_cur->sh->taken;
 				j.err = psprintf("the proof took longer than %d ms (its session did not answer, and was ended)",
 								 l->timeout_ms);
 				line_restart(l, true);
@@ -4101,6 +4174,15 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	spi_connect();
 	become(owner, &was);
 	load_target(PG_GETARG_DATUM(0), false, &t, keep);
+
+	/*
+	 * (twentieth review, RT20M-4) The watched table first, then the claims' rows, as every verifier takes them and as
+	 * DROP TABLE does (the table, then the rows through phasevec._on_drop). Since the nineteenth review's cut held
+	 * the orphans before it rendered the first row (when it took the table), a DROP TABLE of the watch's table
+	 * deadlocked with it, and one of them was aborted. Now a DROP waits for adopt(), or adopt() waits for the DROP
+	 * and then finds no orphan left.
+	 */
+	watched_table_first(&t);
 	{
 		Oid			at[2] = {INT4OID, TEXTARRAYOID};
 		Datum		av[2] = {Int32GetDatum(t.watch), keys ? PointerGetDatum(keys) : (Datum) 0};

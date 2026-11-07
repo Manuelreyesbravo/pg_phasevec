@@ -293,15 +293,106 @@ set_one(const char *name, const char *value)
  * superuser-only setting of a library its session had not loaded yet (SET plpgsql.variable_conflict) had it in the
  * proof's session, where it then took effect.
  */
+/*
+ * (twentieth review, RT20P-ENV-1) A recorded setting is set again exactly, or the proof is not judged. Until this cut
+ * one PostgreSQL refused (the author lost the SET privilege it had through a role, by another role's REVOKE; the value
+ * names an object its owner dropped since) was dropped with a WARNING, the proof ran with the author's default, and
+ * its verdict was recorded for the claim's bind, which still names the setting: 'verified' for settings the proof
+ * never ran under. Now the refusal is an ERROR here, the name is kept (guard_env_unreplayed), and the judge records
+ * 'unproven' with the reason, never a verdict. "Exactly": the value it has after the SET reads as the one recorded.
+ */
+static const char *env_replaying = NULL;	/* the recorded setting being set again: an error now is its refusal */
+
+#define ENV_MAX_LATE 64
+static int	env_late_n = 0;		/* recorded settings that were placeholders when set again (a library that loads */
+static const char *env_late_name[ENV_MAX_LATE];	/* later in the proof applies its own definition to them) */
+static const char *env_late_value[ENV_MAX_LATE];
+
+static bool
+reads_as(const struct config_generic *g, const char *value)
+{
+	char		buf[64];
+	const char *now = value_of(g, false, buf);
+
+	return strcmp(now ? now : "", value) == 0;
+}
+
 static void
 set_as_author(const char *name, const char *value, Oid author)
 {
 	const char *now = GetConfigOption(name, true, false);
+	struct config_generic *g;
 
-	if (now != NULL && strcmp(now, value) == 0)
-		return;
-	(void) set_config_option_ext(name, value, PGC_USERSET, PGC_S_SESSION, author, GUC_ACTION_SAVE, true, WARNING,
-								 false);
+	env_replaying = name;
+	if (now == NULL || strcmp(now, value) != 0)
+		(void) set_config_option_ext(name, value, PGC_USERSET, PGC_S_SESSION, author, GUC_ACTION_SAVE, true, ERROR,
+									 false);
+	g = find_option(name, false, true, 0);
+	if (g == NULL || !reads_as(g, value))
+	{
+		char		buf[64];
+		const char *v = g ? value_of(g, false, buf) : NULL;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("set to \"%s\", it reads \"%s\"", value, v ? v : "")));
+	}
+	if ((g->flags & GUC_CUSTOM_PLACEHOLDER) != 0 && env_late_n < ENV_MAX_LATE)
+	{
+		env_late_name[env_late_n] = name;
+		env_late_value[env_late_n] = value;
+		env_late_n++;
+	}
+	env_replaying = NULL;
+}
+
+/*
+ * A custom setting recorded as one that exists with no value ("app.x=": a placeholder named and never set, or set to
+ * ''), whose library this session has loaded and which does not take '': the library's definition is in effect, at
+ * its default, as in the author's own session once it loaded the library (a placeholder with no value is not applied
+ * then). Nothing to set. One that takes '' is set to it.
+ */
+static bool
+empty_placeholder_defined(const char *name, const char *value, Oid author)
+{
+	struct config_generic *g;
+
+	if (value[0] != '\0' || strchr(name, '.') == NULL)
+		return false;
+	g = find_option(name, false, true, 0);
+	if (g == NULL || (g->flags & GUC_CUSTOM_PLACEHOLDER) != 0)
+		return false;
+	/* only checked (changeVal false), and refused quietly */
+	return set_config_option_ext(name, value, PGC_USERSET, PGC_S_SESSION, author, GUC_ACTION_SAVE, false, DEBUG5,
+								 false) <= 0;
+}
+
+/* In a PG_CATCH of the code that entered a GUARD_AUTHOR guard: the recorded setting the error refused, or NULL. */
+const char *
+guard_env_unreplayed(void)
+{
+	const char *r = env_replaying;
+
+	env_replaying = NULL;
+	return r;
+}
+
+/*
+ * After the proof ran: a recorded setting that was a placeholder when it was set again, and that a library the proof
+ * loaded has defined since, still reads as recorded (the library applies its own definition: a superuser-only one is
+ * dropped, with a WARNING, for an author that may not set it any more). NULL when every one does.
+ */
+const char *
+guard_env_kept(void)
+{
+	for (int i = 0; i < env_late_n; i++)
+	{
+		struct config_generic *g = find_option(env_late_name[i], false, true, 0);
+
+		if (g == NULL || ((g->flags & GUC_CUSTOM_PLACEHOLDER) == 0 && !reads_as(g, env_late_value[i])))
+			return env_late_name[i];
+	}
+	return NULL;
 }
 
 static bool
@@ -419,6 +510,46 @@ authors_value(const struct config_generic *g, Oid author)
 	return by == author || has_privs_of_role(by, author);
 }
 
+/*
+ * (twentieth review, RT20M-2) A composite setting: one whose new value is made of the part a SET names and the rest of
+ * the value it replaces (SET DateStyle = ISO keeps the field order, DMY or MDY, the session had). PostgreSQL stamps
+ * the merged value with the role of the last SET alone, so authors_value() took a wrapper's SET DateStyle = ISO over
+ * its caller's 'SQL, DMY' for the author's 'ISO, DMY': a role without the author's privileges chose how the author's
+ * proof read '03/04/2026'. A composite value is the author's only when every value it was built on is: the one in
+ * effect and each one under it in the session's stack, down to the session's own, was set by the author or a role
+ * with its privileges, or by the configuration every session of the database starts from. Otherwise it is not
+ * recorded, and the proof has its author's own value (the proof's session is a new session of the author): what any
+ * caller does with its session decides nothing. Refusing the assert instead would let any caller of an author's
+ * function make it fail (a trigger that asserts: every write) by setting its own DateStyle.
+ */
+static const char *const composite[] = {"DateStyle"};
+
+static bool
+set_by_authors(Oid by, GucSource source, Oid author)
+{
+	/* ALTER ROLE ... SET of the session's own role (PostgreSQL stamps it as set by a superuser): that role's */
+	if (source == PGC_S_USER || source == PGC_S_DATABASE_USER)
+		by = GetSessionUserId();
+	return by == author || has_privs_of_role(by, author);
+}
+
+static bool
+built_by_authors(const struct config_generic *g, Oid author)
+{
+	if (!named_in(g->name, composite, lengthof(composite)))
+		return true;
+	if (!set_by_authors(g->srole, g->source, author))
+		return false;
+	for (const GucStack *st = g->stack; st != NULL; st = st->prev)
+	{
+		if (!set_by_authors(st->srole, st->source, author))
+			return false;
+		if (st->state == GUC_SET_LOCAL && !set_by_authors(st->masked_srole, PGC_S_SESSION, author))
+			return false;
+	}
+	return true;
+}
+
 static bool
 recorded(const struct config_generic *g)
 {
@@ -444,7 +575,8 @@ guard_env_now(Oid author)
 			continue;
 		v = value_of(vars[i], false, buf);
 		source = vars[i]->source;
-		if (!session_made(vars[i], source) || !author_may_set(vars[i], author) || !authors_value(vars[i], author))
+		if (!session_made(vars[i], source) || !author_may_set(vars[i], author) || !authors_value(vars[i], author) ||
+			!built_by_authors(vars[i], author))
 			continue;
 		items[m++] = psprintf("%s=%s", vars[i]->name, v ? v : "");
 	}
@@ -812,12 +944,25 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 			 * A new session of the author (the proof's own: phasevec_truth.c) with what its author's session changed
 			 * on top. Only what a claim records: a hand-edited row cannot set anything else.
 			 */
+			env_late_n = 0;
+			env_replaying = NULL;
 			for (int i = 0; env && i < env->n; i++)
 			{
 				struct config_generic *rec = find_option(env->name[i], false, true, 0);
 
 				if (rec == NULL ? strchr(env->name[i], '.') != NULL : recorded(rec))
-					set_as_author(env->name[i], env->value[i], role);
+				{
+					if (!empty_placeholder_defined(env->name[i], env->value[i], role))
+						set_as_author(env->name[i], env->value[i], role);
+				}
+				else
+				{
+					/* (twentieth review) not a setting phasevec sets again here (gone from this server): no verdict */
+					env_replaying = env->name[i];
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("this server has no setting \"%s\" that phasevec sets", env->name[i])));
+				}
 			}
 			break;
 		case GUARD_READER:

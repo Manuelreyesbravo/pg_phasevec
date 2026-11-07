@@ -1,0 +1,263 @@
+-- 0.20.0 (twentieth review). One file for what one session shows: (a) RT20M-2, a composite setting (DateStyle) is
+-- recorded only when every value it was built on is the author's; (b) RT20P-ENV-1, a recorded setting that cannot be
+-- set again is not judged under other settings; (c) RT20M-3 and RT20P-UPD-1, a watch's TRUNCATE trigger made apart
+-- (phasevec.watch_truncate), and the update with a trigger of that name that is not phasevec's. The races (RT20M-1,
+-- RT20M-4, RT20M-5) are in test/truth_review20.sh; the update under writers in test/upgrade_writers.sh.
+\set VERBOSITY terse
+CREATE EXTENSION pg_phasevec;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+CREATE TABLE n20 (id int PRIMARY KEY, body text);
+INSERT INTO n20 SELECT g, $t$03/04/2026$t$ FROM generate_series(1, 8) g;
+SELECT phasevec.watch($w$n20$w$, $w$n20$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
+ watch 
+-------
+ t
+(1 row)
+
+CREATE ROLE pv20_au;
+CREATE ROLE pv20_other;
+CREATE ROLE pv20_grp;
+GRANT USAGE ON SCHEMA phasevec TO pv20_au, pv20_other;
+GRANT SELECT ON n20 TO pv20_au;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv20_au;
+-- (a) RT20M-2. The author's wrapper sets DateStyle = ISO (the output only: the field order is the one it replaces),
+-- and a proof reads '03/04/2026' as a date: 4 March under MDY (true), 3 April under DMY (false). In the nineteenth
+-- review's cut PostgreSQL's merged value ('ISO, DMY' over a caller's 'SQL, DMY') was recorded as the author's: a
+-- caller without the author's privileges refuted keys 2 and 3. Now the merged value is recorded only when what it
+-- was built on is the author's too (key 1, a superuser's session under it; key 4, the author's own SET); otherwise
+-- nothing of DateStyle is recorded, and the proof has its author's own (the server's 'ISO, MDY'). The caller's DMY from
+-- its role's own settings (ALTER ROLE ... SET) is in test/truth_review20.sh (pg_regress sets DateStyle at connect).
+CREATE SCHEMA app20 AUTHORIZATION pv20_au;
+GRANT USAGE ON SCHEMA app20 TO pv20_other;
+SET ROLE pv20_au;
+CREATE FUNCTION app20.afirmar(k int) RETURNS void LANGUAGE sql SECURITY DEFINER
+    SET search_path = pg_catalog, public SET DateStyle = ISO AS $f$
+    SELECT phasevec.assert('n20', k::text,
+                           format('SELECT (SELECT body FROM public.n20 WHERE id = %s)::date = date ''2026-03-04''', k))
+$f$;
+CREATE FUNCTION app20.afirmar_local(k int) RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, public AS $f$
+BEGIN
+    SET LOCAL DateStyle = 'Postgres';
+    PERFORM phasevec.assert('n20', k::text,
+                            format('SELECT (SELECT body FROM public.n20 WHERE id = %s)::date = date ''2026-03-04''', k));
+END
+$f$;
+REVOKE ALL ON FUNCTION app20.afirmar(int), app20.afirmar_local(int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app20.afirmar(int), app20.afirmar_local(int) TO pv20_other;
+SELECT app20.afirmar(1);
+ afirmar 
+---------
+ 
+(1 row)
+
+SET DateStyle = 'SQL, DMY';
+SELECT app20.afirmar(4);
+ afirmar 
+---------
+ 
+(1 row)
+
+RESET DateStyle;
+RESET ROLE;
+SET ROLE pv20_other;
+SET DateStyle = 'SQL, DMY';
+SELECT app20.afirmar(2);
+ afirmar 
+---------
+ 
+(1 row)
+
+SELECT app20.afirmar_local(3);
+ afirmar_local 
+---------------
+ 
+(1 row)
+
+RESET DateStyle;
+RESET ROLE;
+SELECT key, array(SELECT e FROM unnest(proof_env) e WHERE e ~ '^DateStyle') AS datestyle
+  FROM phasevec.truth WHERE key IN ($k$1$k$, $k$2$k$, $k$3$k$, $k$4$k$) ORDER BY key;
+ key |       datestyle        
+-----+------------------------
+ 1   | {"DateStyle=ISO, MDY"}
+ 2   | {}
+ 3   | {}
+ 4   | {"DateStyle=ISO, DMY"}
+(4 rows)
+
+SET client_min_messages = error;
+SELECT key, verdict FROM phasevec.verify($w$n20$w$, 10, $e$0$e$)
+ WHERE key IN ($k$1$k$, $k$2$k$, $k$3$k$, $k$4$k$) ORDER BY key;
+ key | verdict  
+-----+----------
+ 1   | verified
+ 2   | verified
+ 3   | verified
+ 4   | refuted
+(4 rows)
+
+RESET client_min_messages;
+-- (b) RT20P-ENV-1. A setting the author could set when it asserted, and cannot set again when its proof runs: key 6
+-- recorded lo_compat_privileges = on, which the author may set through a role it lost since; key 7 recorded a text
+-- search configuration whose owner dropped it since. Each proof is false under its recorded setting and true without
+-- it. In the nineteenth review's cut the replay failed with a WARNING, the proof ran with the author's default, and
+-- 'verified' was recorded for a bind that names the setting. Now the claim reads 'unproven', with the reason. Key 8
+-- is key 7's control: its configuration is there, the proof runs under it, and is refuted.
+GRANT SET ON PARAMETER lo_compat_privileges TO pv20_grp;
+GRANT pv20_grp TO pv20_au;
+CREATE SCHEMA lib20;
+CREATE TEXT SEARCH CONFIGURATION lib20.plain (COPY = pg_catalog.simple);
+CREATE TEXT SEARCH CONFIGURATION lib20.plain2 (COPY = pg_catalog.simple);
+GRANT USAGE ON SCHEMA lib20 TO pv20_au;
+SET ROLE pv20_au;
+SET lo_compat_privileges = on;
+SELECT phasevec.assert($w$n20$w$, $k$6$k$, $p$SELECT current_setting('lo_compat_privileges') = 'off'$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET lo_compat_privileges;
+SET default_text_search_config = 'lib20.plain';
+SELECT phasevec.assert($w$n20$w$, $k$7$k$, $p$SELECT to_tsvector('running')::text = '''run'':1'$p$);
+ assert 
+--------
+ 
+(1 row)
+
+SET default_text_search_config = 'lib20.plain2';
+SELECT phasevec.assert($w$n20$w$, $k$8$k$, $p$SELECT to_tsvector('running')::text = '''run'':1'$p$);
+ assert 
+--------
+ 
+(1 row)
+
+RESET default_text_search_config;
+RESET ROLE;
+REVOKE pv20_grp FROM pv20_au;
+DROP TEXT SEARCH CONFIGURATION lib20.plain;
+SELECT key, array(SELECT e FROM unnest(proof_env) e WHERE e ~ '^(lo_compat|default_text)') AS env
+  FROM phasevec.truth WHERE key IN ($k$6$k$, $k$7$k$, $k$8$k$) ORDER BY key;
+ key |                    env                    
+-----+-------------------------------------------
+ 6   | {lo_compat_privileges=on}
+ 7   | {default_text_search_config=lib20.plain}
+ 8   | {default_text_search_config=lib20.plain2}
+(3 rows)
+
+SET client_min_messages = error;
+SELECT key, verdict, error FROM phasevec.verify($w$n20$w$, 10, $e$0$e$)
+ WHERE key IN ($k$6$k$, $k$7$k$, $k$8$k$) ORDER BY key;
+ key | verdict  |                                                                                                   error                                                                                                   
+-----+----------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 6   | unproven | not judged: the setting lo_compat_privileges this claim records cannot be set again as its author had it (permission denied to set parameter "lo_compat_privileges"): assert it again
+ 7   | unproven | not judged: the setting default_text_search_config this claim records cannot be set again as its author had it (invalid value for parameter "default_text_search_config": "lib20.plain"): assert it again
+ 8   | refuted  | 
+(3 rows)
+
+RESET client_min_messages;
+SELECT key, verdict, phasevec._verdict(t) AS reads, last_error FROM phasevec.truth t
+ WHERE key IN ($k$6$k$, $k$7$k$, $k$8$k$) ORDER BY key;
+ key | verdict  |  reads   |                                                                                                last_error                                                                                                 
+-----+----------+----------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 6   | unproven | unproven | not judged: the setting lo_compat_privileges this claim records cannot be set again as its author had it (permission denied to set parameter "lo_compat_privileges"): assert it again
+ 7   | unproven | unproven | not judged: the setting default_text_search_config this claim records cannot be set again as its author had it (invalid value for parameter "default_text_search_config": "lib20.plain"): assert it again
+ 8   | refuted  | refuted  | 
+(3 rows)
+
+-- (c) RT20M-3, RT20P-UPD-1. phasevec.watch_truncate() makes a watch's TRUNCATE trigger where it is missing (true),
+-- leaves it where it is (false), and names a trigger of that name that is not phasevec's.
+SELECT id AS wid FROM phasevec.watches WHERE name = $w$n20$w$ \gset
+SELECT format('phasevec_watch_%s_truncate', :wid) AS trg \gset
+DROP TRIGGER :"trg" ON n20;
+SELECT phasevec.watch_truncate($w$n20$w$) AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT phasevec.watch_truncate($w$n20$w$) AS made;
+ made 
+------
+ f
+(1 row)
+
+DROP TRIGGER :"trg" ON n20;
+CREATE FUNCTION public.pv20_noop() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RETURN NULL; END $f$;
+CREATE TRIGGER :"trg" AFTER TRUNCATE ON n20 FOR EACH STATEMENT EXECUTE FUNCTION public.pv20_noop();
+SELECT phasevec.watch_truncate($w$n20$w$) AS made;
+ERROR:  phasevec: public.n20 already has a trigger named phasevec_watch_1_truncate, which is not the watch's
+DROP TRIGGER :"trg" ON n20;
+SELECT phasevec.watch_truncate($w$n20$w$) AS made;
+ made 
+------
+ t
+(1 row)
+
+TRUNCATE n20;
+SELECT count(*) AS noted FROM phasevec.sources;
+ noted 
+-------
+     0
+(1 row)
+
+SELECT has_function_privilege($r$public$r$, $f$phasevec.watch_truncate(text)$f$, $p$EXECUTE$p$) AS public_may;
+ public_may 
+------------
+ f
+(1 row)
+
+DROP TABLE n20;
+DROP EXTENSION pg_phasevec;
+-- The update with a watched table's owner's trigger named like the watch's TRUNCATE trigger: the update goes
+-- through, says so, and phasevec.watch_truncate() makes it once that trigger is gone. In the nineteenth review's cut
+-- the update failed with a bare "trigger ... already exists".
+CREATE EXTENSION pg_phasevec VERSION $v$0.19.0$v$;
+SELECT phasevec.reader_register($n$r1$n$, repeat($h$a$h$, 64), 4) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+CREATE TABLE u20 (id int PRIMARY KEY, body text);
+INSERT INTO u20 SELECT g, $t$note $t$ || g FROM generate_series(1, 3) g;
+SELECT phasevec.watch($w$u20$w$, $w$u20$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) AS uwid \gset
+SELECT format('phasevec_watch_%s_truncate', :uwid) AS utrg \gset
+CREATE TRIGGER :"utrg" AFTER TRUNCATE ON u20 FOR EACH STATEMENT EXECUTE FUNCTION public.pv20_noop();
+ALTER EXTENSION pg_phasevec UPDATE TO $v$0.20.0$v$;
+WARNING:  phasevec: these watched tables have a trigger with the name of the watch's TRUNCATE trigger, which is not phasevec's:
+  watch u20: public.u20 has a trigger named phasevec_watch_1_truncate
+SELECT extversion FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
+ extversion 
+------------
+ 0.20.0
+(1 row)
+
+DROP TRIGGER :"utrg" ON u20;
+SELECT phasevec.watch_truncate($w$u20$w$) AS made;
+ made 
+------
+ t
+(1 row)
+
+TRUNCATE u20;
+SELECT count(*) AS noted FROM phasevec.sources;
+ noted 
+-------
+     0
+(1 row)
+
+DROP TABLE u20;
+DROP EXTENSION pg_phasevec;
+DROP FUNCTION public.pv20_noop();
+REVOKE SET ON PARAMETER lo_compat_privileges FROM pv20_grp;
+DROP SCHEMA app20, lib20 CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DROP OWNED BY pv20_au, pv20_other, pv20_grp;
+DROP ROLE pv20_au, pv20_other, pv20_grp;

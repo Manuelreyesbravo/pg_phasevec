@@ -104,7 +104,7 @@ RESET ROLE;
 SELECT key, verdict FROM phasevec.verify($w$n19b$w$, 10, $e$0$e$) WHERE key IN ($k$6$k$, $k$7$k$, $k$8$k$) ORDER BY key;
 SELECT phasevec._truth_halted(t.watch, sha256(convert_to(t.key, $e$UTF8$e$)),
                               phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env),
-                              t.asserted_by_oid, now()) AS halted
+                              t.asserted_by_oid, t.xmin) AS halted
   FROM phasevec.truth t WHERE key = $k$6$k$;
 SELECT phasevec.refute($w$n19b$w$, $k$7$k$, $r$gone$r$);
 CREATE TEMP TABLE before19b AS

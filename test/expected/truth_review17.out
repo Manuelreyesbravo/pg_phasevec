@@ -72,7 +72,8 @@ SELECT public.pv17_assert_as_au($k$2$k$, $p$current_setting('session_replication
 (1 row)
 
 RESET session_replication_role;
--- a hand-written setting the author may not set is not set in its proof's session either (key 3)
+-- a hand-written setting the author may not set is not set in its proof's session either (key 3), and (twentieth
+-- review, RT20P-ENV-1) the proof is not judged without it: 'unproven' (until then it ran without it: 'refuted')
 SET ROLE pv17_au;
 SELECT phasevec.assert($w$notes17$w$, $k$3$k$, $p$current_setting('session_replication_role') = 'replica'$p$);
  assert 
@@ -93,11 +94,11 @@ SELECT key, array(SELECT e FROM unnest(proof_env) e WHERE e NOT LIKE $l$applicat
 
 SET client_min_messages = error;
 SELECT key, verdict FROM phasevec.verify($w$notes17$w$, 10, $e$0$e$) WHERE key IN ($k$1$k$, $k$2$k$, $k$3$k$) ORDER BY key;
- key | verdict 
------+---------
+ key | verdict  
+-----+----------
  1   | refuted
  2   | refuted
- 3   | refuted
+ 3   | unproven
 (3 rows)
 
 RESET client_min_messages;
