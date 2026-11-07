@@ -1062,6 +1062,56 @@ BEGIN
 END;
 $f$;
 
+-- A key names one row (0.20.0), provably in everything phasevec reads (eighteenth review): a watch made before
+-- that a read would now refuse (a partitioned table or a partition, an inheritance parent or child, a key without
+-- a unique btree index of its own enforced at once) stops the update, named, with what to do. Until the seventeenth
+-- cut such a watch was only warned about, and kept serving; every read now refuses it.
+-- (twentieth review, second pass) _key_shape() reads the table under a reader's lock, and this update holds
+-- phasevec's tables: the lock is taken with NOWAIT first, so a watched table that another session is altering (ALTER
+-- TABLE, TRUNCATE, in a transaction that then writes it and waits for phasevec's tables) stops the update, named, and
+-- nothing changed. In the first cut of this review the update waited for that table, and the deadlock detector aborted
+-- the other session's transaction.
+DO $d$
+DECLARE
+    w record;
+    why text;
+    holders text;
+    bad text := $q$$q$;
+BEGIN
+    FOR w IN SELECT x.name, x.source, x.key_col FROM phasevec.watches x ORDER BY x.id LOOP
+        BEGIN
+            -- a table gone is _key_shape()'s to name
+            IF EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = w.source::oid) THEN
+                EXECUTE format($q$LOCK TABLE %s IN ACCESS SHARE MODE NOWAIT$q$, w.source);
+            END IF;
+        EXCEPTION WHEN undefined_table THEN
+            NULL;
+        WHEN lock_not_available THEN
+            SELECT string_agg(DISTINCT l.pid::text, ', ') INTO holders
+              FROM pg_locks l
+             WHERE l.locktype = $q$relation$q$ AND l.relation = w.source::oid
+               AND l.mode = $q$AccessExclusiveLock$q$ AND l.pid <> pg_backend_pid();
+            RAISE EXCEPTION 'phasevec: the update to 0.20.0 found watched table % being altered by another session: '
+                            'nothing was changed', w.source
+                USING ERRCODE = 'lock_not_available',
+                      DETAIL = format('Sessions holding or waiting to alter it: %s.', coalesce(holders, 'none any more')),
+                      HINT = 'Run the update again once that transaction has ended (pg_stat_activity).';
+        END;
+        why := phasevec._key_shape(w.source, w.key_col);
+        IF why IS NOT NULL THEN
+            bad := bad || format(E'\n  watch %s reads %s by %s: %s', w.name, w.source, w.key_col, why);
+        END IF;
+    END LOOP;
+    IF bad <> $q$$q$ THEN
+        RAISE EXCEPTION 'phasevec 0.20.0 does not read these watches:%', bad
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Give each table a PRIMARY KEY or a UNIQUE constraint (not DEFERRABLE) on its key column alone, '
+                         'and take it out of any inheritance tree, or drop the watch (phasevec.watches), then update. '
+                         'README, Supported configurations.';
+    END IF;
+END
+$d$;
+
 -- (nineteenth review, R19-F9) Every watch made before this update gets its TRUNCATE trigger too. (twentieth review)
 -- Only where its table is free now (NOWAIT, once): a table a writer holds is not waited for (the writer may be waiting
 -- for phasevec's tables, which this holds), and neither is a trigger of the watch's name that is not phasevec's. Each
@@ -1241,31 +1291,6 @@ REVOKE ALL ON FUNCTION phasevec._brief_keys(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION phasevec.brief(text, int) FROM PUBLIC;
 COMMENT ON FUNCTION phasevec._brief_keys(text) IS
     $q$Keys, verdicts, usefulness and judged text hash of a watch, for brief() (which runs it as the owner). The owner's only (0.20.0).$q$;
-
--- A key names one row (0.20.0), provably in everything phasevec reads (eighteenth review): a watch made before
--- that a read would now refuse (a partitioned table or a partition, an inheritance parent or child, a key without
--- a unique btree index of its own enforced at once) stops the update, named, with what to do. Until the seventeenth
--- cut such a watch was only warned about, and kept serving; every read now refuses it.
-DO $d$
-DECLARE
-    w record;
-    bad text := $q$$q$;
-BEGIN
-    FOR w IN SELECT x.name, x.source, x.key_col, phasevec._key_shape(x.source, x.key_col) AS why
-               FROM phasevec.watches x ORDER BY x.id LOOP
-        IF w.why IS NOT NULL THEN
-            bad := bad || format(E'\n  watch %s reads %s by %s: %s', w.name, w.source, w.key_col, w.why);
-        END IF;
-    END LOOP;
-    IF bad <> $q$$q$ THEN
-        RAISE EXCEPTION 'phasevec 0.20.0 does not read these watches:%', bad
-            USING ERRCODE = 'feature_not_supported',
-                  HINT = 'Give each table a PRIMARY KEY or a UNIQUE constraint (not DEFERRABLE) on its key column alone, '
-                         'and take it out of any inheritance tree, or drop the watch (phasevec.watches), then update. '
-                         'README, Supported configurations.';
-    END IF;
-END
-$d$;
 
 -- 9. Every row's text in the pinned settings: what the watch trigger noted before 0.20.0 was rendered in its
 -- writer's settings. A text that now reads otherwise is noted again (its reading turns stale, its verdict unproven).

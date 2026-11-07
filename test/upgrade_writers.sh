@@ -14,6 +14,10 @@
 # 3. A transaction that read phasevec, then writes a watched table, while the update waits for phasevec's tables: it
 #    commits, and so does the update. In the nineteenth review's cut the update held the watched table and waited for
 #    phasevec.watches, and the writer was aborted by the deadlock detector.
+# 4. (twentieth review, second pass) A transaction that alters a watched table (ALTER TABLE, TRUNCATE) and then writes
+#    it, while the update holds phasevec's tables: the update stops, named, nothing changed, and that transaction
+#    commits; the update then goes through. In the first cut of this review the update read the table's shape under a
+#    reader's lock it waited for, and the deadlock detector aborted the other transaction.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -126,4 +130,31 @@ if [ "$(version)" = "0.20.0" ] && ! grep -q -i "error\|deadlock" "$W/rw.out" && 
 else
     nok "read then write: writer '$(tr '\n' ' ' <"$W/rw.out")', update '${up:0:200}', version $(version)"
 fi
+
+# 4. a transaction that alters a watched table, then writes it
+for ddl in "ALTER TABLE hallazgos ADD COLUMN x int" "TRUNCATE hallazgos"; do
+    fresh
+    q >"$W/ddl.out" 2>&1 <<SQL &
+BEGIN;
+$ddl;
+SELECT pg_sleep(1.5);
+INSERT INTO hallazgos (id, body) VALUES (100, 'new');
+COMMIT;
+SQL
+    dw=$!
+    pause 0.5
+    ln -sfn "$PWD/pg_phasevec.so" "$W/lib/pg_phasevec.so"
+    up=$(PGOPTIONS="$PGOPTIONS -c statement_timeout=20s -c deadlock_timeout=300ms" \
+         q -c "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" 2>&1)
+    ver=$(version)
+    wait $dw
+    again=$(PGOPTIONS="$PGOPTIONS -c statement_timeout=20s" q -c "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" 2>&1)
+    if [ "$ver" = "0.19.0" ] && echo "$up" | grep -q "being altered by another session" \
+       && ! grep -q -i "error\|deadlock" "$W/ddl.out" && [ "$(q -c "SELECT count(*) FROM hallazgos WHERE id = 100")" = "1" ] \
+       && [ "$(version)" = "0.20.0" ] && [ -z "$(echo "$again" | grep -i 'error')" ]; then
+        ok "${ddl%% *} of a watched table, then a write, during the update: the update stops named, that transaction commits"
+    else
+        nok "${ddl%% *} then write: writer '$(tr '\n' ' ' <"$W/ddl.out")', update '${up:0:200}' at $ver, again '${again:0:200}'"
+    fi
+done
 exit $fallas
