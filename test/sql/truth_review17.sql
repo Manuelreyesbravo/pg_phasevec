@@ -56,11 +56,14 @@ SET client_min_messages = error;
 SELECT key, verdict FROM phasevec.verify($w$notes17$w$, 10, $e$0$e$) WHERE key IN ($k$1$k$, $k$2$k$, $k$3$k$) ORDER BY key;
 RESET client_min_messages;
 
--- (c) MIND-ENV-1. What the author's SESSION had: not the SET clause of the function it asserted through. Key 4 is
--- asserted by the author's session, key 5 through a SECURITY DEFINER function with SET search_path (yggdrasil's
--- _afirmar): the same proof, the same settings, the same verdict. In the sixteenth cut key 5 recorded
--- search_path=pg_catalog, pg_temp and was refuted (function pv17_one() does not exist). Key 6: a SET inside such a
--- function outlives it (PostgreSQL's rule) and is the session's: recorded.
+-- (c) MIND-ENV-1, as the nineteenth review (R19-PRIV-1) settled it: a claim records the settings in effect where
+-- assert() was called, as its author had them there; the SET clause of the author's own function is the author's.
+-- Key 4 is asserted by the author's session; key 5 through a SECURITY DEFINER function of the author with SET
+-- search_path = pg_catalog, pg_temp (yggdrasil's _afirmar): it records that search_path and its proof means what it
+-- means inside that function, where pv17_one() is not found: refuted (in the seventeenth and eighteenth cuts the
+-- clause was read past, and a caller without the author's rights chose the search_path of the author's proof:
+-- truth_review19b plays that, and the adopted copy of a wrapper's claim). Key 6: a SET inside such a function is the
+-- author's too: recorded.
 CREATE FUNCTION public.pv17_afirmar(p_key text, p_proof text) RETURNS void LANGUAGE sql SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp AS $f$ SELECT phasevec.assert('notes17', p_key, p_proof) $f$;
 ALTER FUNCTION public.pv17_afirmar(text, text) OWNER TO pv17_au;

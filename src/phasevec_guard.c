@@ -15,7 +15,7 @@
  *   reads, prints or computes at its default, and DateStyle ISO, TimeZone UTC, search_path pg_catalog, ... pinned on top:
  *   the same text whoever calls it from whatever session. A proof does not run in its verifier's session at all
  *   (0.20.0, eighth review): it runs in a session of its own, a new session of its author (phasevec_truth.c), with
- *   what its author's session had changed on top, as recorded when it was asserted (guard_env_now). Until then it
+ *   what was in effect where it was asserted on top, as its author had it (guard_env_now). Until then it
  *   ran in the verifier's session, and each review found one more piece of that session that decided verdicts: its
  *   temporary objects, its settings' values, which custom placeholders it had, its uncommitted writes and DDL, its
  *   session_user, its application_name.
@@ -379,57 +379,6 @@ session_made(const struct config_generic *g, GucSource source)
 	return placeholder(g) && (source == PGC_S_DEFAULT || source == PGC_S_DYNAMIC_DEFAULT);
 }
 
-/* A value stacked by PostgreSQL (a GucStack's prior), as text; as value_of. buf: 64 bytes. */
-static const char *
-prior_of(const struct config_generic *g, const config_var_value *p, char *buf)
-{
-	switch (g->vartype)
-	{
-		case PGC_BOOL:
-			return p->val.boolval ? "on" : "off";
-		case PGC_INT:
-			snprintf(buf, 64, "%d", p->val.intval);
-			return buf;
-		case PGC_REAL:
-			snprintf(buf, 64, "%.17g", p->val.realval);
-			return buf;
-		case PGC_STRING:
-			return p->val.stringval;
-		case PGC_ENUM:
-			return ENUM_NAME(unconstify(struct config_generic *, g), p->val.enumval);
-	}
-	return NULL;
-}
-
-/*
- * The value a setting has in the author's SESSION, and where it came from (seventeenth review): the current one, but
- * for what the SET clause of a function the session is inside set (a nest level saved for the length of the call,
- * GUC_SAVE: fmgr_security_definer, a procedure's SET, an extension's own), which ends with that call and is not the
- * session's choice. PostgreSQL's own rule, read from the stack top down: a saved level gives back its prior value; a
- * SET LOCAL inside it (GUC_LOCAL) goes with it; a SET (GUC_SET, GUC_SET_LOCAL) outlives it, and is the session's. In
- * the sixteenth cut a claim asserted through a SECURITY DEFINER function with SET search_path (yggdrasil's
- * _afirmar) recorded that search_path as its author's, and the same proof, asserted from the author's session
- * itself, meant something else: a true claim was refuted.
- */
-static const char *
-session_value(const struct config_generic *g, GucSource *source, char *buf)
-{
-	const char *v = value_of(g, false, buf);
-
-	*source = g->source;
-	for (const GucStack *st = g->stack; st != NULL; st = st->prev)
-	{
-		if (st->state == GUC_SAVE)
-		{
-			v = prior_of(g, &st->prior, buf);
-			*source = st->source;
-		}
-		else if (st->state == GUC_SET || st->state == GUC_SET_LOCAL)
-			break;
-	}
-	return v;
-}
-
 /*
  * May the author set this setting itself? (seventeenth review) A setting its session has that the author could not
  * set (a superuser's session SET it, and the author is the owner of a SECURITY DEFINER function it called) is not the
@@ -441,6 +390,33 @@ author_may_set(const struct config_generic *g, Oid author)
 	if (g->context == PGC_USERSET)
 		return true;
 	return superuser_arg(author) || pg_parameter_aclcheck(g->name, author, ACL_SET) == ACLCHECK_OK;
+}
+
+/*
+ * Is the value a setting has now the author's? (nineteenth review, R19-PRIV-1) A value is the author's when the role
+ * that set it (PostgreSQL keeps it: srole) is the author or a role with the author's privileges: the author's own
+ * session, a SET clause of a function the author owns (PostgreSQL sets it as the function's owner, once the call is
+ * the owner's), a SET inside such a function, or the session of a role that could have asserted as the author anyway
+ * (yggdrasil's manu, a superuser, calling _afirmar of ygg_autor). A value a role WITHOUT the author's privileges set
+ * (the session of the caller of the author's SECURITY DEFINER function, the startup options of that session, the SET
+ * clause of that caller's own function) is not the author's, and is not recorded: the proof's session has the
+ * author's own value for it. In the eighteenth cut the value recorded was the session's, read down PostgreSQL's
+ * stack past every function's SET clause: a role that could call a wrapper hardened with SET search_path decided the
+ * search_path its owner's proof ran with, and its own operator, found there, ran as the owner (a superuser: the
+ * caller made itself one).
+ */
+static bool
+authors_value(const struct config_generic *g, Oid author)
+{
+	Oid			by = g->srole;
+
+	/*
+	 * A placeholder that only exists (made by RESET, or named by the configuration: no value, and PostgreSQL records
+	 * no setter for it) is the session's: the author's when the session's own role could act as the author.
+	 */
+	if (g->source == PGC_S_DEFAULT || g->source == PGC_S_DYNAMIC_DEFAULT)
+		by = GetOuterUserId();
+	return by == author || has_privs_of_role(by, author);
 }
 
 static bool
@@ -466,8 +442,9 @@ guard_env_now(Oid author)
 
 		if (!recorded(vars[i]))
 			continue;
-		v = session_value(vars[i], &source, buf);
-		if (!session_made(vars[i], source) || !author_may_set(vars[i], author))
+		v = value_of(vars[i], false, buf);
+		source = vars[i]->source;
+		if (!session_made(vars[i], source) || !author_may_set(vars[i], author) || !authors_value(vars[i], author))
 			continue;
 		items[m++] = psprintf("%s=%s", vars[i]->name, v ? v : "");
 	}

@@ -22,7 +22,8 @@ CREATE FUNCTION pv_o_set(k text, v text, at timestamptz) RETURNS text LANGUAGE s
                                t.asserted_by_oid, t.proof_env), at)
       FROM phasevec.truth t WHERE t.key = k $f$;
 CREATE FUNCTION pv_o_tried(k text, why text, interrupted boolean) RETURNS text LANGUAGE sql AS $f$
-    SELECT phasevec._truth_tried(t.watch, t.key, why, interrupted) FROM phasevec.truth t WHERE t.key = k $f$;
+    SELECT phasevec._truth_tried(t.watch, t.key, why, interrupted, phasevec._bind(t.asserted_for, t.proof,
+                                 t.asserted_by_oid, t.proof_env)) FROM phasevec.truth t WHERE t.key = k $f$;
 CREATE FUNCTION pv_o_show(k text) RETURNS TABLE (verdict text, reads text, last_error text, interrupted boolean,
                                                  tried boolean, why text)
 LANGUAGE sql AS $f$
@@ -91,7 +92,7 @@ SELECT phasevec.assert($w$o1$w$, $k$4$k$, $p$1 = 1$p$);
 SELECT * FROM pv_o_due();
 SELECT * FROM pv_o_show($k$4$k$);
 -- only the owner records, and only the owner reads the turns
-SELECT has_function_privilege($r$public$r$, $f$phasevec._truth_tried(int, text, text, boolean)$f$, $p$EXECUTE$p$) AS tried_public,
+SELECT has_function_privilege($r$public$r$, $f$phasevec._truth_tried(int, text, text, boolean, bytea)$f$, $p$EXECUTE$p$) AS tried_public,
        has_function_privilege($r$public$r$, $f$phasevec._truth_attempt(int, text)$f$, $p$EXECUTE$p$) AS attempt_public,
        has_table_privilege($r$public$r$, $t$phasevec.attempts$t$, $p$SELECT$p$) AS attempts_public;
 

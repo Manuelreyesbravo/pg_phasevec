@@ -45,7 +45,9 @@
 #include <signal.h>
 #include <string.h>
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/stratnum.h"
 #include "access/tupconvert.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -88,6 +90,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -357,9 +360,10 @@ source_shape_problem(Oid relid, AttrNumber keyatt, bool at_watch, bool lock)
 	char		relkind;
 	bool		ispartition;
 	bool		hassubclass;
-	Relation	rel;
-	List	   *indexes;
-	ListCell   *lc;
+	Relation	pg_index;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	it;
 	bool		keyed = false;
 
 	ct = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
@@ -386,25 +390,26 @@ source_shape_problem(Oid relid, AttrNumber keyatt, bool at_watch, bool lock)
 		LockRelationOid(relid, AccessShareLock);
 	else
 		AcceptInvalidationMessages();
-	rel = RelationIdGetRelation(relid);
-	if (!RelationIsValid(rel))
-		return "the table is gone";
-	indexes = RelationGetIndexList(rel);
-	foreach(lc, indexes)
-	{
-		Oid			ix = lfirst_oid(lc);
-		HeapTuple	it = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(ix));
-		HeapTuple	rt;
-		Form_pg_index i;
 
-		if (!HeapTupleIsValid(it))
-			continue;
-		i = (Form_pg_index) GETSTRUCT(it);
+	/*
+	 * (nineteenth review, RT19-CRASH-1) The table's indexes are read from pg_index (by indrelid), not from the table's
+	 * relcache entry: without a lock (a verifier) that entry was opened, and rebuilt, while a DROP TABLE committed,
+	 * and verify() failed with an internal error ("relation N deleted while still in use", "pg_attribute catalog is
+	 * missing 3 attribute(s)") instead of saying the table is gone.
+	 */
+	pg_index = table_open(IndexRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_index, IndexIndrelidIndexId, true, NULL, 1, &skey);
+	while (!keyed && HeapTupleIsValid(it = systable_getnext(scan)))
+	{
+		Form_pg_index i = (Form_pg_index) GETSTRUCT(it);
+		HeapTuple	rt;
+
 		if (i->indisunique && i->indimmediate && i->indisvalid && i->indislive && i->indnkeyatts == 1 &&
 			i->indkey.values[0] == keyatt && heap_attisnull(it, Anum_pg_index_indpred, NULL) &&
 			heap_attisnull(it, Anum_pg_index_indexprs, NULL))
 		{
-			rt = SearchSysCache1(RELOID, ObjectIdGetDatum(ix));
+			rt = SearchSysCache1(RELOID, ObjectIdGetDatum(i->indexrelid));
 			if (HeapTupleIsValid(rt))
 			{
 				if (((Form_pg_class) GETSTRUCT(rt))->relam == BTREE_AM_OID)
@@ -412,12 +417,11 @@ source_shape_problem(Oid relid, AttrNumber keyatt, bool at_watch, bool lock)
 				ReleaseSysCache(rt);
 			}
 		}
-		ReleaseSysCache(it);
-		if (keyed)
-			break;
 	}
-	list_free(indexes);
-	RelationClose(rel);
+	systable_endscan(scan);
+	table_close(pg_index, AccessShareLock);
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return "the table is gone";
 	if (!keyed)
 		return "its key column has no unique btree index of its own enforced at once (not DEFERRABLE, valid, "
 			"on that column alone, with no predicate and no expression)";
@@ -448,7 +452,26 @@ phasevec_key_shape(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	Name		key = PG_GETARG_NAME(1);
-	const char *why = source_shape_problem(relid, get_attnum(relid, NameStr(*key)), true, true);
+	HeapTuple	ct = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Oid			relowner;
+	const char *why;
+
+	/*
+	 * (nineteenth review, R19-PRIV-2) Only for whoever may watch the table (its owner, or a role with its owner's
+	 * privileges: watch()'s own rule), asked before anything is locked. In the eighteenth cut any role with USAGE on
+	 * the schema held a reader's lock on any table until its transaction ended, and the ALTER TABLE queued behind it
+	 * stopped every later reader of the table.
+	 */
+	if (!HeapTupleIsValid(ct))
+		PG_RETURN_TEXT_P(cstring_to_text("the table is gone"));
+	relowner = ((Form_pg_class) GETSTRUCT(ct))->relowner;
+	ReleaseSysCache(ct);
+	if (!has_privs_of_role(GetUserId(), relowner))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: a watch is a trigger on %s, so only its owner may ask whether it can be watched",
+						DatumGetCString(DirectFunctionCall1(regclassout, ObjectIdGetDatum(relid))))));
+	why = source_shape_problem(relid, get_attnum(relid, NameStr(*key)), true, true);
 
 	if (why == NULL)
 		PG_RETURN_NULL();
@@ -618,7 +641,18 @@ role_exists(Oid role)
 static bool
 may_read(const Target *t, Oid role)
 {
-	return pg_class_aclcheck(t->relid, role, ACL_SELECT) == ACLCHECK_OK;
+	bool		missing = false;
+	AclResult	r = pg_class_aclcheck_ext(t->relid, role, ACL_SELECT, &missing);
+
+	/*
+	 * (nineteenth review, RT19-CRASH-1) A table dropped since the watch was read is the shape refusal every read
+	 * makes, not "relation with OID N does not exist".
+	 */
+	if (missing)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("phasevec: watch %s cannot be read: %s: the table is gone", t->name, t->src)));
+	return r == ACLCHECK_OK;
 }
 
 static void
@@ -1873,15 +1907,17 @@ record_tried(Oid owner, const Target *t, const Claim *c, const Judgment *j)
 	MemoryContext keep = CurrentMemoryContext;
 	char	   *v = NULL;
 	Who			was;
-	Oid			at[4] = {INT4OID, TEXTOID, TEXTOID, BOOLOID};
-	Datum		av[4] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key),
-	j->err ? CStringGetTextDatum(j->err) : (Datum) 0, BoolGetDatum(j->out == OUT_INTERRUPTED)};
-	char		nulls[5] = "    ";
+	Oid			at[5] = {INT4OID, TEXTOID, TEXTOID, BOOLOID, BYTEAOID};
+	Datum		av[5] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key),
+	j->err ? CStringGetTextDatum(j->err) : (Datum) 0, BoolGetDatum(j->out == OUT_INTERRUPTED),
+	PointerGetDatum(c->bind)};
+	char		nulls[6] = "     ";
 
 	nulls[2] = j->err ? ' ' : 'n';
+	nulls[4] = c->bind ? ' ' : 'n';
 	become(owner, &was);
 	spi_connect();
-	if (SPI_execute_with_args("SELECT phasevec._truth_tried($1, $2, $3, $4)", 4, at, av, nulls, false, 1)
+	if (SPI_execute_with_args("SELECT phasevec._truth_tried($1, $2, $3, $4, $5)", 5, at, av, nulls, false, 1)
 		!= SPI_OK_SELECT)
 		elog(ERROR, "phasevec: what was tried could not be recorded");
 	if (SPI_processed == 1)
@@ -1950,12 +1986,20 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
  * search_path (an author's '=' ran here as the owner), so it is written with pg_catalog's '=' (DISTINCT), and the
  * horizon is computed in UTC, not in the session's TimeZone (become() pins it too).
  */
+/*
+ * (nineteenth review, R19-F10) A claim is taken only while it is the claim that was read: its row, read again under
+ * the lock, still binds the same text, proof, author and settings ($4, the claim's phasevec._bind). In the eighteenth
+ * cut a verify_one() that waited for a transaction that refuted the claim and asserted it again took the new claim,
+ * judged the old proof, recorded nothing (the bind no longer matched) and answered 'unproven' for a claim never run.
+ */
+#define SAME_CLAIM "phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) OPERATOR(pg_catalog.=) $4"
 #define DISTINCT(a, b) "COALESCE(NOT (" a " OPERATOR(pg_catalog.=) " b "), (" a " IS NULL) OPERATOR(pg_catalog.<>) (" b " IS NULL))"
 #define LOCK_OLD(c) "t." c " IS NULL OR pg_catalog.timezone('UTC', t." c ") OPERATOR(pg_catalog.<) " \
 	"(pg_catalog.timezone('UTC', pg_catalog.now()) OPERATOR(pg_catalog.-) $3)"
 #define CLAIM_LOCK_SQL \
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND t.retired_at IS NULL AND NOT t.halted AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
+	"AND t.retired_at IS NULL AND NOT t.halted AND " SAME_CLAIM " " \
+	"AND ((" LOCK_OLD("verified_at") ") AND (" LOCK_OLD("looked_at") ") OR " \
 	"(SELECT CASE WHEN t.verdict OPERATOR(pg_catalog.=) ANY ('{verified,refuted}'::pg_catalog.text[]) " \
 	"AND " DISTINCT("t.asserted_for", "h") " THEN " LOCK_OLD("looked_at") " OR " DISTINCT("t.looked_for", "h") " " \
 	"ELSE " LOCK_OLD("verified_at") " END " \
@@ -1964,7 +2008,7 @@ record_judgment(Oid owner, Oid verifier, const Target *t, const Claim *c, const 
 
 #define CLAIM_TAKE_SQL \
 	"SELECT 1 FROM phasevec.truth t WHERE t.watch OPERATOR(pg_catalog.=) $1 AND t.key OPERATOR(pg_catalog.=) $2 " \
-	"AND t.retired_at IS NULL FOR NO KEY UPDATE"
+	"AND t.retired_at IS NULL AND " SAME_CLAIM " FOR NO KEY UPDATE"
 
 /*
  * (fourteenth review) verify_one() takes its claim without waiting, in the transaction that judges it; when another
@@ -2000,13 +2044,15 @@ watched_table_first(const Target *t)
 static bool
 claim_taken(Oid owner, SPIPlanPtr plan, const Target *t, const Claim *c, const Interval *every)
 {
-	Datum		av[3] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), PointerGetDatum(every)};
+	Datum		av[4] = {Int32GetDatum(t->watch), CStringGetTextDatum(c->key), PointerGetDatum(every),
+	PointerGetDatum(c->bind)};
+	char		nulls[5] = {' ', ' ', every ? ' ' : 'n', c->bind ? ' ' : 'n', '\0'};
 	bool		taken;
 	Who			was;
 
 	become(owner, &was);
 	spi_connect();
-	if (SPI_execute_plan(plan, av, NULL, false, 1) != SPI_OK_SELECT)
+	if (SPI_execute_plan(plan, av, nulls, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: a claim could not be taken");
 	taken = SPI_processed == 1;
 	SPI_finish();
@@ -2201,12 +2247,12 @@ phasevec_proof_main(Datum arg)
 	prepare_read(&target);
 	{
 		Oid			at[6] = {INT4OID, TEXTOID, TEXTOID, TEXTOID, BYTEAOID, TIMESTAMPTZOID};
-		Oid			lt[3] = {INT4OID, TEXTOID, INTERVALOID};
+		Oid			lt[4] = {INT4OID, TEXTOID, INTERVALOID, BYTEAOID};
 
 		(void) kept_plan(&target.record_plan, RECORD_SQL, 6, at);
-		(void) kept_plan(&worker_lock_plan, CLAIM_LOCK_SQL, 3, lt);
-		(void) kept_plan(&worker_take_plan, CLAIM_TAKE_SQL, 2, lt);
-		(void) kept_plan(&worker_try_plan, CLAIM_TRY_SQL, 2, lt);
+		(void) kept_plan(&worker_lock_plan, CLAIM_LOCK_SQL, 4, lt);
+		(void) kept_plan(&worker_take_plan, CLAIM_TAKE_SQL, 4, lt);
+		(void) kept_plan(&worker_try_plan, CLAIM_TRY_SQL, 4, lt);
 		(void) kept_plan(&worker_attempt_plan, ATTEMPT_SQL, 2, lt);
 	}
 	SPI_finish();
@@ -3851,6 +3897,19 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 		 */
 		PG_RETURN_NULL();
 	}
+	if (!d.recorded && d.skipped)
+	{
+		/*
+		 * (nineteenth review, R19-F10) The claim it read is not the claim the key has now (asserted again, by its
+		 * author or another, while verify_one() waited for its row): the new one was not run, and verify_one() says
+		 * so instead of answering the verdict of a claim it did not judge.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("phasevec: verify_one() could not judge key %s", c.key),
+				 errdetail("The claim was asserted again while verify_one() waited for it; it was not run."),
+				 errhint("Call verify_one() again to judge the claim the key has now.")));
+	}
 	if (!d.recorded || d.j.out == OUT_INTERRUPTED || d.j.out == OUT_NO_VERDICT)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3922,7 +3981,9 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 }
 
 /*
- * The settings a claim records of its caller's session for `author` (guard_env_now). (seventeenth review) PL/pgSQL,
+ * The settings a claim records for `author`: those in effect where assert() or adopt() is called, as the author has
+ * them there (guard_env_now: a SET clause of the author's own function is the author's; what a role without the
+ * author's privileges set is not recorded). (seventeenth review) PL/pgSQL,
  * through which the claim is written (_assert_set), is loaded first: a setting of it the session named before it was
  * loaded is then what PL/pgSQL's definition makes of it (a superuser-only one the session may not set is dropped, by
  * PostgreSQL, with a WARNING), not a placeholder recorded as it was before the load.
@@ -3943,7 +4004,9 @@ claim_env(Oid author)
 /*
  * phasevec.assert(watch text, key text, proof text, topic text, support jsonb, expires_at timestamptz)
  * Records the claim with its author, the current user of the CALLER (a SECURITY DEFINER wrapper vouches with its
- * owner's rights, and that owner is the author), and the caller's settings, which the proof will run with.
+ * owner's rights, and that owner is the author), and the settings in effect at the call as the author has them
+ * (claim_env), which the proof will run with: a wrapper's SET clause is its owner's, and its caller's own settings
+ * are recorded only when that caller could have asserted as the author itself.
  */
 Datum
 phasevec_assert(PG_FUNCTION_ARGS)
@@ -3980,6 +4043,17 @@ in_text_array(ArrayType *a, const char *s)
 	return false;
 }
 
+/* The orphans of a watch ($1): a proof whose author is unknown or no longer the role it was. */
+#define ORPHANS_SQL \
+	"SELECT x.key, x.proof, x.topic, x.support, x.expires_at, x.asserted_by::pg_catalog.text " \
+	"FROM phasevec.truth x WHERE x.watch OPERATOR(pg_catalog.=) $1 " \
+	"AND phasevec._claim_state(x.retired_at, x.proof, x.halted) OPERATOR(pg_catalog.=) " \
+	"ANY ('{judged,halted}'::pg_catalog.text[]) " \
+	"AND x.verdict OPERATOR(pg_catalog.<>) 'replaced' " \
+	"AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r " \
+	"WHERE r.oid OPERATOR(pg_catalog.=) x.asserted_by_oid " \
+	"AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by) "
+
 /*
  * phasevec.adopt(watch text, author regrole, keys text[] DEFAULT NULL, superuser_keys text[] DEFAULT NULL)
  *   RETURNS TABLE (key text, proof text, former_author text, adopted boolean, note text)
@@ -3988,7 +4062,9 @@ in_text_array(ArrayType *a, const char *s)
  * silently: the new author is named, the caller must already hold its privileges (be it, SET ROLE to it, or be
  * granted it), every proof is returned with its former author, and a superuser becomes the author of a key only when
  * that key is named in superuser_keys (an orphaned proof may be anyone's SQL, a role can orphan its own on purpose,
- * and as a superuser's it would run with every right). The proofs run with the caller's settings.
+ * and as a superuser's it would run with every right). The proofs run with the settings in effect where adopt() is
+ * called, by assert()'s rule (claim_env): adopted through a wrapper with the SET clause of the one that asserted
+ * them, they mean what they meant there.
  */
 Datum
 phasevec_adopt(PG_FUNCTION_ARGS)
@@ -4026,18 +4102,22 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	become(owner, &was);
 	load_target(PG_GETARG_DATUM(0), false, &t, keep);
 	{
-		Oid			at[1] = {INT4OID};
-		Datum		av[1] = {Int32GetDatum(t.watch)};
+		Oid			at[2] = {INT4OID, TEXTARRAYOID};
+		Datum		av[2] = {Int32GetDatum(t.watch), keys ? PointerGetDatum(keys) : (Datum) 0};
+		char		an[3] = {' ', keys ? ' ' : 'n', '\0'};
 
-		if (SPI_execute_with_args("SELECT x.key, x.proof, x.topic, x.support, x.expires_at, x.asserted_by::pg_catalog.text "
-								  "FROM phasevec.truth x WHERE x.watch OPERATOR(pg_catalog.=) $1 "
-								  "AND phasevec._claim_state(x.retired_at, x.proof, x.halted) OPERATOR(pg_catalog.=) "
-								  "ANY ('{judged,halted}'::pg_catalog.text[]) "
-								  "AND x.verdict OPERATOR(pg_catalog.<>) 'replaced' "
-								  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r "
-								  "WHERE r.oid OPERATOR(pg_catalog.=) x.asserted_by_oid "
-								  "AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by) ORDER BY x.key",
-								  1, at, av, NULL, true, 0) != SPI_OK_SELECT)
+		/*
+		 * (nineteenth review, R19-F7) The orphans are taken (FOR NO KEY UPDATE) as they are read, and each is read
+		 * again once its row is held (below): a refute() or an assert() that committed while adopt() waited for the
+		 * row made it no orphan, and it is left alone. In the eighteenth cut they were read with no lock, and the
+		 * claim was asserted again from that read: a claim refute() retired meanwhile got its proof back (and
+		 * verify() served it 'verified'), and a claim another author asserted meanwhile was replaced by the stale
+		 * proof, in the adopter's name. The lock alone is not the check: PostgreSQL re-reads a row it waited for, but
+		 * not the roles it was joined with (the orphan's author is found gone by a join).
+		 */
+		if (SPI_execute_with_args(ORPHANS_SQL "AND ($2 IS NULL OR x.key OPERATOR(pg_catalog.=) ANY ($2)) "
+								  "ORDER BY x.key FOR NO KEY UPDATE OF x",
+								  2, at, av, an, false, 0) != SPI_OK_SELECT)
 			elog(ERROR, "phasevec: the proofs could not be read");
 	}
 	unbecome(&was);
@@ -4063,11 +4143,36 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 		Datum		values[5];
 		bool		nulls[5] = {false, false, false, false, false};
 		bool		adopted = false;
+		bool		gone = false;
 		const char *note;
 
 		if (keys && !in_text_array(keys, k))
 			continue;
-		if (su && !in_text_array(su_keys, k))
+		{
+			Oid			rt[2] = {INT4OID, TEXTOID};
+			Datum		rv[2] = {Int32GetDatum(t.watch), key};
+
+			become(owner, &was);
+			if (SPI_execute_with_args(ORPHANS_SQL "AND x.key OPERATOR(pg_catalog.=) $2", 2, rt, rv, NULL, false, 1)
+				!= SPI_OK_SELECT)
+				elog(ERROR, "phasevec: the proof could not be read again");
+			unbecome(&was);
+			if (SPI_processed == 1)
+			{
+				tup = SPI_tuptable->vals[0];
+				td = SPI_tuptable->tupdesc;
+				proof = SPI_getbinval(tup, td, 2, &n_proof);
+				topic = SPI_getbinval(tup, td, 3, &n_topic);
+				support = SPI_getbinval(tup, td, 4, &n_support);
+				exp = SPI_getbinval(tup, td, 5, &n_exp);
+				former = SPI_getvalue(tup, td, 6);
+			}
+			else
+				gone = true;
+		}
+		if (gone)
+			note = "not adopted: it was refuted or asserted again while adopt() waited for it";
+		else if (su && !in_text_array(su_keys, k))
 			note = "not adopted: its author would be a superuser; name the key in superuser_keys to adopt it";
 		else
 		{
@@ -4097,9 +4202,10 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 /* --------------------------------------------------------------------------------------- the watch trigger -- */
 
 /*
- * phasevec._observe(): the watch trigger, AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW, with the watch's id as its
- * first argument. It belongs to that watch's table and to no other; it renders the row it fires for (the recipe as
- * the table's owner, in the guard and the pinned settings) and notes it, or forgets the key a row left. Nothing a
+ * phasevec._observe(): the watch trigger, AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW, and (nineteenth review)
+ * AFTER TRUNCATE FOR EACH STATEMENT, with the watch's id as its first argument. It belongs to that watch's table and
+ * to no other; it renders the row it fires for (the recipe as the table's owner, in the guard and the pinned
+ * settings) and notes it, forgets the key a row left, or forgets every row after a TRUNCATE. Nothing a
  * caller passes reaches phasevec.sources: in the first cuts of 0.20.0 _note() took a key and a hash from whoever
  * called it, and a writer limited by row-level security, or holding UPDATE on one column, forged, invented and
  * forgot the keys of every row of the watch.
@@ -4229,12 +4335,37 @@ phasevec_observe(PG_FUNCTION_ARGS)
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 						errmsg("phasevec: _observe() is the watch trigger, not a function to call")));
-	if (!TRIGGER_FIRED_AFTER(td->tg_event) || !TRIGGER_FIRED_FOR_ROW(td->tg_event) ||
-		td->tg_trigger->tgnargs < 1)
+	if (!TRIGGER_FIRED_AFTER(td->tg_event) || td->tg_trigger->tgnargs < 1 ||
+		(TRIGGER_FIRED_BY_TRUNCATE(td->tg_event) ? !TRIGGER_FIRED_FOR_STATEMENT(td->tg_event)
+		 : !TRIGGER_FIRED_FOR_ROW(td->tg_event)))
 		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-						errmsg("phasevec: _observe() runs AFTER each row, with the watch's id")));
+						errmsg("phasevec: _observe() runs AFTER each row, or AFTER a TRUNCATE, with the watch's id")));
 	rel = td->tg_relation;
 	watch = pg_strtoint32(td->tg_trigger->tgargs[0]);
+	if (TRIGGER_FIRED_BY_TRUNCATE(td->tg_event))
+	{
+		/*
+		 * (nineteenth review, R19-F9) The table is empty: the watch forgets every row it noted (phasevec._note_clear),
+		 * as the owner, for its own table only.
+		 */
+		Oid			at[1] = {INT4OID};
+		Datum		av[1];
+
+		spi_connect();
+		become(owner, &was);
+		(void) load_target_ext(Int32GetDatum(watch), true, &t, keep, false, false);
+		if (t.relid != RelationGetRelid(rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("phasevec: trigger \"%s\" on %s is not watch %d's: that watch reads %s",
+							td->tg_trigger->tgname, RelationGetRelationName(rel), watch, t.src)));
+		av[0] = Int32GetDatum(t.watch);
+		if (SPI_execute_with_args("SELECT phasevec._note_clear($1)", 1, at, av, NULL, false, 1) != SPI_OK_SELECT)
+			elog(ERROR, "phasevec: the truncated rows were not forgotten");
+		unbecome(&was);
+		SPI_finish();
+		return PointerGetDatum(NULL);
+	}
 	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
 		newt = td->tg_trigtuple;
 	else if (TRIGGER_FIRED_BY_UPDATE(td->tg_event))

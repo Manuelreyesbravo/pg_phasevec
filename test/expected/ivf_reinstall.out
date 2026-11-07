@@ -54,7 +54,7 @@ SELECT count(*) AS answered FROM phasevec.find_ivf('docs', 0, code_of(7, 7), 10,
 (1 row)
 
 DROP EXTENSION pg_phasevec CASCADE;
-NOTICE:  drop cascades to trigger phasevec_watch_1 on table docs
+NOTICE:  drop cascades to 2 other objects
 -- the second installation, in the same session: other texts, other codes, the same watch id and generation
 UPDATE docs SET body = 'second ' || id;
 CREATE EXTENSION pg_phasevec;
@@ -122,7 +122,7 @@ SELECT key FROM phasevec.find_ivf('docs', 0, code_of(7, 107), 2, false, 400, sig
 (2 rows)
 
 DROP EXTENSION pg_phasevec CASCADE;
-NOTICE:  drop cascades to trigger phasevec_watch_1 on table docs
+NOTICE:  drop cascades to 2 other objects
 DROP TABLE docs;
 DROP FUNCTION code_of(int, int);
 DROP FUNCTION signs_of(smallint[]);
