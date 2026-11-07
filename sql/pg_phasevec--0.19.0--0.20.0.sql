@@ -27,44 +27,73 @@ $enc$;
 -- watches, deadlocked, and one of them was aborted. Run the update alone, not in a transaction with DDL on watched
 -- tables (that DDL waits for their writers while this holds the extension's tables they wait for).
 -- (twentieth review, RT20M-3, RT20-CRASH-1/2) Only the extension's tables are taken here: no watched table is held
--- while this waits, and none is waited for while this holds the extension's tables: the TRUNCATE triggers below are
--- made only on a table no one is writing (taken with NOWAIT, once), and phasevec.watch_truncate() makes the rest. In
--- the nineteenth review's cut the watched tables were taken first, with NOWAIT and again until all were free: under
--- steady short writes that moment rarely came (the update did not finish in minutes), lock_timeout never applied, and
--- a transaction that had read phasevec and then wrote a watched table deadlocked with it (the update held the table
--- and waited for phasevec's).
--- (twenty-third review, RT23P-UPD-1, RT23P-UPD-2) The update waits only while it holds nothing, and once it holds
--- something it waits for nothing. Until this review one queued LOCK took the five tables one by one, each held while
--- it waited for the next: a transaction that had read phasevec.truth or phasevec.sources (a report, a GRANT on it)
--- and then wrote a watched table waited for phasevec.watches, which the update held while it waited for truth, and
--- the deadlock detector aborted one of them (the transaction, and the update went on). And the update then waited,
--- with no bound, for a row of the catalog another transaction had changed and not committed (a GRANT or an ALTER of
--- one of phasevec's functions): that transaction's next write to a watched table waited for phasevec's tables, and
--- the deadlock detector aborted it. Now each try waits, queued and bounded by the caller's lock_timeout, for one
--- thing alone (first phasevec.watches, which every writer takes first: once the update has it no writer starts), and
--- then takes everything else it will change without waiting: phasevec's five tables (NOWAIT), the catalog row of
--- each of phasevec's functions (FOR UPDATE NOWAIT) and the function itself (its comment written again, as it is,
--- under lock_timeout = 1 ms: the lock a COMMENT or a DROP takes). The first one busy ends the try, which lets go of
--- all it took, and the next try waits for that one, holding nothing (50 tries at most). Then the rest of the update
--- runs under lock_timeout = 100 ms (the caller's, if shorter; the caller's comes back at the end of this script):
--- what it takes there it holds already, or takes in phasevec._update_step without waiting, and any other wait (for a
--- catalog a VACUUM FULL holds, say) is bounded.
-CREATE FUNCTION phasevec._update_take(p_kind text, p_what oid, p_wait boolean) RETURNS void
+-- while this waits; the TRUNCATE triggers below are made only on a table no one is writing (taken with NOWAIT, once),
+-- and phasevec.watch_truncate() makes the rest.
+-- (twenty-fourth review, RT24P-RR) The update runs only at READ COMMITTED. Under REPEATABLE READ or SERIALIZABLE
+-- the transaction's snapshot was taken when ALTER EXTENSION began, before the update waited for anything: a refute()
+-- committed while it waited was not seen, the claim was not retired, and adopt() and verify() later served it
+-- 'verified'. At READ COMMITTED every statement after the locks below reads what committed before they were held.
+DO $iso$
+BEGIN
+    IF pg_catalog.current_setting('transaction_isolation') IN ('repeatable read', 'serializable') THEN
+        RAISE EXCEPTION 'phasevec: the update to 0.20.0 runs only at READ COMMITTED, and this transaction is %',
+                        pg_catalog.upper(pg_catalog.current_setting('transaction_isolation'))
+            USING ERRCODE = 'feature_not_supported',
+                  DETAIL = 'Its snapshot was taken before the update waited for phasevec''s tables: what '
+                           'committed meanwhile (a refute()) would be missed. Nothing was changed.',
+                  HINT = 'Run ALTER EXTENSION pg_phasevec UPDATE in a transaction of its own, after '
+                         'SET default_transaction_isolation = ''read committed''.';
+    END IF;
+END
+$iso$;
+-- (twenty-fourth review: the principle under the twentieth, twenty-third and twenty-fourth reviews' lock findings)
+-- Everything the update changes is locked before it changes anything, by one function (_update_lock), and every
+-- wait in it is one PostgreSQL can resolve without aborting anyone else:
+--  * What it locks: phasevec's five tables (ACCESS EXCLUSIVE, in its writers' order: watches first), the catalog row
+--    of each of phasevec's functions (FOR UPDATE: a GRANT, ALTER or CREATE OR REPLACE writes it) and each function's
+--    own lock in the mode DROP FUNCTION takes (ALTER ... OWNER TO the owner it has: nothing changes, and the lock
+--    conflicts with every lock another session can hold on a function: a COMMENT's, and the one PostgreSQL
+--    takes on it to record a dependency, a view or a BEGIN ATOMIC body that names it: 19beta2 and 18.6 do).
+--    The twenty-third review's cut wrote the comment again (the lock a COMMENT takes), and a transaction that had
+--    made a view over _brief_keys and then wrote a watched table met the update at its DROP FUNCTION (RT24P-DEP3).
+--  * A try waits first for one of them, holding nothing of phasevec's (phasevec.watches; after a failed
+--    try, the one that ended it), as long as the caller's lock_timeout lets it (0: as long as it takes).
+--    Then it takes the rest, each waited for, queued, at most 100 ms times the try's number and never more
+--    than half the deadlock_timeout this session reads (500 ms by default), with this session's own deadlock
+--    check after 1 ms. A transaction in the update's way that then waits for the update closes a cycle: if
+--    it began waiting first, the update's own check finds the cycle and the update gives up; if it began
+--    later, the update's wait ends before that transaction's deadlock check runs. Either way the update's
+--    subtransaction lets go of what the try took, and that transaction goes on. (A deadlock in the first
+--    wait, which holds nothing of the try's, is the caller's transaction's own, and ends the update.)
+--    Until this review the update held phasevec.watches and took the rest only NOWAIT, 50 tries at most:
+--    under steady writers (who take watches) and steady readers of phasevec.truth (who do not), the two
+--    were never free at once, and the update stopped in about a second whatever the caller's lock_timeout
+--    (RT24P-LIVE). A queued wait gets each one as soon as its holders end, since a new reader queues behind
+--    the update; a bound that grows with each try outlasts holders that keep it longer than 100 ms.
+--  * Tries go on until the caller's lock_timeout is spent (0: until the update has everything, or is canceled);
+--    then the update stops, named, with nothing changed.
+--  * An object outside the extension that depends on a function this script drops (a view, a default, a BEGIN
+--    ATOMIC function: referring to one needs only USAGE on the schema) stops the update before it locks anything,
+--    and again once it holds everything, every such object named (RT24P-DEP). Until this review DROP FUNCTION
+--    found them one per run, after every watch was rendered.
+-- What it takes later it holds already, or takes in phasevec._update_step without waiting; the rest of the script
+-- runs under the same bound as a try (lock_timeout: half the deadlock_timeout, at most 100 ms, at most the
+-- caller's; deadlock_timeout 1 ms), so a wait nothing above foresaw (a catalog a VACUUM FULL holds) ends the update,
+-- with PostgreSQL's own error and nothing changed, before any other session's deadlock check. The caller's
+-- lock_timeout and deadlock_timeout come back at the end of this script.
+CREATE FUNCTION phasevec._update_take(p_kind text, p_what oid) RETURNS void
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 BEGIN
-    IF p_kind = $q$table$q$ THEN
-        EXECUTE format($q$LOCK TABLE %s IN ACCESS EXCLUSIVE MODE%s$q$, p_what::regclass,
-                       CASE WHEN p_wait THEN $q$$q$ ELSE $q$ NOWAIT$q$ END);
-    ELSIF p_kind = $q$row$q$ AND p_wait THEN
+    IF p_kind = 'table' THEN
+        EXECUTE format('LOCK TABLE %s IN ACCESS EXCLUSIVE MODE', p_what::regclass);
+    ELSIF p_kind = 'row' THEN
         PERFORM 1 FROM pg_proc p WHERE p.oid = p_what FOR UPDATE;
-    ELSIF p_kind = $q$row$q$ THEN
-        PERFORM 1 FROM pg_proc p WHERE p.oid = p_what FOR UPDATE NOWAIT;
     ELSE
-        -- no NOWAIT for this one: the caller's lock_timeout, 1 ms when it takes without waiting
-        EXECUTE format($q$COMMENT ON %s %s IS %L$q$,
+        EXECUTE format('ALTER %s %s OWNER TO %I',
                        CASE (SELECT p.prokind FROM pg_proc p WHERE p.oid = p_what)
-                            WHEN $q$p$q$ THEN $q$PROCEDURE$q$ WHEN $q$a$q$ THEN $q$AGGREGATE$q$ ELSE $q$FUNCTION$q$ END,
-                       p_what::regprocedure, obj_description(p_what, $q$pg_proc$q$));
+                            WHEN 'p' THEN 'PROCEDURE' WHEN 'a' THEN 'AGGREGATE' ELSE 'FUNCTION' END,
+                       p_what::regprocedure,
+                       (SELECT pg_get_userbyid(p.proowner) FROM pg_proc p WHERE p.oid = p_what));
     END IF;
 END;
 $f$;
@@ -74,95 +103,154 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
     SELECT format($q$%I.%I(%s)$q$, n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.oid = p_oid
 $f$;
--- The caller's lock_timeout, set again at the end of this script (with the update's own, of the rest of the script).
+-- Every object outside the extension that depends on a function this script drops, named; NULL when none.
+CREATE FUNCTION phasevec._update_dependents() RETURNS text
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT string_agg(format('%s depends on function %s',
+                             CASE WHEN d.classid = 'pg_rewrite'::regclass
+                                  THEN (SELECT pg_describe_object('pg_class'::regclass, r.ev_class, 0)
+                                          FROM pg_rewrite r WHERE r.oid = d.objid)
+                                  ELSE pg_describe_object(d.classid, d.objid, d.objsubid) END,
+                             d.refobjid::regprocedure), '; ' ORDER BY d.refobjid, d.classid, d.objid)
+      FROM pg_depend d
+     WHERE d.refclassid = 'pg_proc'::regclass AND d.deptype = 'n'
+       AND d.refobjid IN (SELECT to_regprocedure(f)
+                            FROM unnest(ARRAY['phasevec._truth_due(int, int, interval)',
+                                              'phasevec._truth_set(int, text, boolean, text)',
+                                              'phasevec._prove_c(text, int, float8)',
+                                              'phasevec._note(int, text, bytea, text)',
+                                              'phasevec._brief_keys(text)']) f)
+       AND NOT EXISTS (SELECT 1 FROM pg_depend e
+                        WHERE e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e'
+                          AND e.refobjid = (SELECT x.oid FROM pg_extension x WHERE x.extname = 'pg_phasevec')
+                          AND ((e.classid = d.classid AND e.objid = d.objid)
+                               OR (d.classid = 'pg_rewrite'::regclass AND e.classid = 'pg_class'::regclass
+                                   AND e.objid = (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid))))
+$f$;
+-- The caller's lock_timeout and deadlock_timeout, set again at the end of this script.
 DO $lt$
 BEGIN
     EXECUTE pg_catalog.format($q$CREATE FUNCTION phasevec._update_lock_timeout() RETURNS text LANGUAGE sql IMMUTABLE
                                  AS %L$q$, pg_catalog.format($q$SELECT %L::text$q$,
                                                             pg_catalog.current_setting($q$lock_timeout$q$)));
+    EXECUTE pg_catalog.format($q$CREATE FUNCTION phasevec._update_deadlock_timeout() RETURNS text LANGUAGE sql
+                                 IMMUTABLE AS %L$q$, pg_catalog.format($q$SELECT %L::text$q$,
+                                                            pg_catalog.current_setting($q$deadlock_timeout$q$)));
 END
 $lt$;
-DO $lk$
+CREATE FUNCTION phasevec._update_lock() RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE
-    kind    text := $q$table$q$;
-    what    oid := $q$phasevec.watches$q$::regclass;
-    waiting boolean;
-    held    boolean := false;
-    t       record;
-    lt_ms   int := (SELECT s.setting::int FROM pg_catalog.pg_settings s WHERE s.name = $q$lock_timeout$q$);
-    holders text;
-    named   text;
-    busy    text;
+    caller_ms  int := (SELECT s.setting::int FROM pg_settings s WHERE s.name = 'lock_timeout');
+    half_ms    int := (SELECT greatest(1, least(s.setting::int, s.reset_val::int) / 2)
+                         FROM pg_settings s WHERE s.name = 'deadlock_timeout');
+    hold_ms    int;
+    tries      int := 0;
+    started    timestamptz := clock_timestamp();
+    left_ms    int;
+    first_kind text := 'table';
+    first_what oid := 'phasevec.watches'::regclass;
+    kind       text;
+    what       oid;
+    first      boolean;
+    held       boolean := false;
+    t          record;
+    deps       text;
+    holders    text;
 BEGIN
-    FOR attempt IN 1..50 LOOP
-        BEGIN
-            waiting := true;
-            PERFORM phasevec._update_take(kind, what, true);
-            waiting := false;
-            PERFORM pg_catalog.set_config($q$lock_timeout$q$, $q$1ms$q$, true);
-            FOR t IN SELECT $q$table$q$ AS kind, x.r::oid AS what
-                       FROM pg_catalog.unnest(ARRAY[$q$phasevec.watches$q$::regclass, $q$phasevec.sources$q$::regclass,
-                                                    $q$phasevec.lexstats$q$::regclass, $q$phasevec.lexdocs$q$::regclass,
-                                                    $q$phasevec.truth$q$::regclass]) x(r)
-                     UNION ALL
-                     SELECT k.kind, p.oid FROM pg_catalog.pg_proc p
-                       CROSS JOIN (VALUES ($q$row$q$), ($q$routine$q$)) k(kind)
-                      WHERE p.pronamespace = $q$phasevec$q$::regnamespace LOOP
-                kind := t.kind;
-                what := t.what;
-                PERFORM phasevec._update_take(t.kind, t.what, false);
-            END LOOP;
-            PERFORM pg_catalog.set_config($q$lock_timeout$q$,
-                                          CASE WHEN lt_ms OPERATOR(pg_catalog.>) 0 AND lt_ms OPERATOR(pg_catalog.<) 100
-                                               THEN lt_ms ELSE 100 END OPERATOR(pg_catalog.||) $q$ms$q$, true);
-            held := true;
-        EXCEPTION WHEN lock_not_available THEN
-            IF waiting THEN
-                named := CASE kind WHEN $q$table$q$ THEN $q$phasevec's tables$q$
-                                   ELSE pg_catalog.format($q$phasevec's function %s$q$,
-                                                          phasevec._update_routine(what)) END;
-                SELECT pg_catalog.string_agg(DISTINCT l.pid::text, ', ') INTO holders
-                  FROM pg_catalog.pg_locks l
-                 WHERE l.granted AND l.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid()
-                   AND CASE kind
-                       WHEN $q$table$q$ THEN
-                            l.locktype = $q$relation$q$ AND l.relation = what
-                            AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d
-                                               WHERE d.datname = pg_catalog.current_database())
-                       WHEN $q$row$q$ THEN
-                            l.locktype = $q$transactionid$q$
-                            AND l.transactionid = (SELECT p.xmax FROM pg_catalog.pg_proc p WHERE p.oid = what)
-                       ELSE l.locktype = $q$object$q$ AND l.classid = $q$pg_catalog.pg_proc$q$::regclass
-                            AND l.objid = what END;
-                busy := CASE kind WHEN $q$table$q$ THEN pg_catalog.format($q$phasevec.%I$q$, (SELECT c.relname
-                                                    FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) what))
-                             WHEN $q$row$q$ THEN pg_catalog.format($q$the catalog row of %s$q$,
-                                                                   phasevec._update_routine(what))
-                             ELSE phasevec._update_routine(what) END;
-                RAISE EXCEPTION 'phasevec: the update to 0.20.0 could not take % within lock_timeout (%): '
-                                'nothing was changed', named, pg_catalog.current_setting('lock_timeout')
-                    USING ERRCODE = 'lock_not_available',
-                          DETAIL = pg_catalog.format('It waited for %s, holding nothing of phasevec''s. Sessions '
-                                                     'holding it: %s.',
-                                                     busy, coalesce(holders, 'none any more')),
-                          HINT = 'Run the update again (a longer lock_timeout waits longer for the writers to end), '
-                                 'or end those sessions first (pg_stat_activity).';
-            END IF;
-        END;
-        EXIT WHEN held;
-    END LOOP;
-    IF NOT held THEN
-        RAISE EXCEPTION 'phasevec: the update to 0.20.0 found phasevec''s tables and functions never free at once in '
-                        '50 tries: nothing was changed'
-            USING ERRCODE = 'lock_not_available',
-                  DETAIL = pg_catalog.format('The last one busy: %s.', CASE kind WHEN $q$table$q$
-                                             THEN pg_catalog.format($q$phasevec.%I$q$, (SELECT c.relname
-                                                  FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) what))
-                                             ELSE phasevec._update_routine(what) END),
-                  HINT = 'Run the update again when fewer sessions write phasevec''s tables or change its functions.';
+    hold_ms := least(100, half_ms);
+    IF caller_ms > 0 THEN
+        hold_ms := least(hold_ms, caller_ms);
     END IF;
-END
-$lk$;
+    FOR pass IN 1..2 LOOP
+        deps := phasevec._update_dependents();
+        IF deps IS NOT NULL THEN
+            RAISE EXCEPTION 'phasevec: the update to 0.20.0 drops functions that objects outside the extension '
+                            'depend on: nothing was changed'
+                USING ERRCODE = 'dependent_objects_still_exist',
+                      DETAIL = deps || '.',
+                      HINT = 'These functions are internals of phasevec 0.19.0, gone in 0.20.0. Drop those objects '
+                             '(or change them not to refer to them), then run the update again.';
+        END IF;
+        EXIT WHEN held;
+        PERFORM set_config('deadlock_timeout', '1ms', true);
+        WHILE NOT held LOOP
+            left_ms := CASE WHEN caller_ms > 0
+                            THEN caller_ms - (extract(epoch FROM clock_timestamp() - started) * 1000)::int END;
+            EXIT WHEN left_ms <= 0;
+            tries := tries + 1;
+            BEGIN
+                kind := first_kind;
+                what := first_what;
+                first := true;
+                PERFORM set_config('lock_timeout', coalesce(left_ms, 0) || 'ms', true);
+                PERFORM phasevec._update_take(kind, what);
+                first := false;
+                FOR t IN SELECT 'table' AS kind, x.r::oid AS what, x.n AS ord
+                           FROM unnest(ARRAY['phasevec.watches'::regclass, 'phasevec.sources'::regclass,
+                                             'phasevec.lexstats'::regclass, 'phasevec.lexdocs'::regclass,
+                                             'phasevec.truth'::regclass]) WITH ORDINALITY x(r, n)
+                         UNION ALL
+                         SELECT k.kind, p.oid, 5 + k.n FROM pg_proc p
+                           CROSS JOIN (VALUES ('row', 1), ('routine', 2)) k(kind, n)
+                          WHERE p.pronamespace = 'phasevec'::regnamespace
+                         ORDER BY ord, what LOOP
+                    kind := t.kind;
+                    what := t.what;
+                    left_ms := CASE WHEN caller_ms > 0
+                                    THEN caller_ms - (extract(epoch FROM clock_timestamp() - started) * 1000)::int
+                               END;
+                    PERFORM set_config('lock_timeout',
+                                       greatest(1, least(half_ms, hold_ms * least(tries, 100), left_ms)) || 'ms',
+                                       true);
+                    PERFORM phasevec._update_take(kind, what);
+                END LOOP;
+                held := true;
+            EXCEPTION WHEN lock_not_available OR deadlock_detected THEN
+                -- A deadlock while this try held nothing is not its own (a lock of the caller's transaction
+                -- closed it): another try would close it again.
+                IF first AND SQLSTATE = '40P01' THEN
+                    RAISE;
+                END IF;
+                -- the next try waits for this one first, holding nothing of phasevec's
+                first_kind := kind;
+                first_what := what;
+            END;
+        END LOOP;
+        IF NOT held THEN
+            SELECT string_agg(DISTINCT l.pid::text, ', ') INTO holders
+              FROM pg_locks l
+             WHERE l.granted AND l.pid <> pg_backend_pid()
+               AND CASE first_kind
+                   WHEN 'table' THEN
+                        l.locktype = 'relation' AND l.relation = first_what
+                        AND l.database = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
+                   WHEN 'row' THEN
+                        l.locktype = 'transactionid'
+                        AND l.transactionid = (SELECT p.xmax FROM pg_proc p WHERE p.oid = first_what)
+                   ELSE l.locktype = 'object' AND l.classid = 'pg_proc'::regclass AND l.objid = first_what END;
+            RAISE EXCEPTION 'phasevec: the update to 0.20.0 could not take % within lock_timeout (%): '
+                            'nothing was changed',
+                            CASE first_kind WHEN 'table' THEN 'phasevec''s tables'
+                                 ELSE format('phasevec''s function %s', phasevec._update_routine(first_what)) END,
+                            phasevec._update_lock_timeout()
+                USING ERRCODE = 'lock_not_available',
+                      DETAIL = format('It waited last for %s. Sessions holding it: %s.',
+                                      CASE first_kind
+                                      WHEN 'table' THEN format('phasevec.%I', (SELECT c.relname FROM pg_class c
+                                                                               WHERE c.oid = first_what))
+                                      WHEN 'row' THEN format('the catalog row of %s',
+                                                             phasevec._update_routine(first_what))
+                                      ELSE phasevec._update_routine(first_what) END,
+                                      coalesce(holders, 'none any more')),
+                      HINT = 'Run the update again (with a longer lock_timeout, or 0, it waits for them), '
+                             'or end those sessions first (pg_stat_activity).';
+        END IF;
+    END LOOP;
+    PERFORM set_config('lock_timeout', hold_ms || 'ms', true);
+END;
+$f$;
+SELECT phasevec._update_lock();
 
 -- Found by the public-readiness review of 2026-11-05, then by an adversarial review of the first cut of 0.20.0
 -- (never released) that ran the attacks:
@@ -1580,9 +1668,13 @@ ALTER FUNCTION phasevec._ivf_absorb(integer, integer, text)
 ALTER FUNCTION phasevec._ivf_find(integer, integer, bit, smallint[], integer, integer, integer, integer, real)
     SET search_path = pg_catalog, pg_temp;
 
--- The caller's lock_timeout again (the update's own from its first lock, above).
+-- The caller's lock_timeout and deadlock_timeout again (the update's own from _update_lock, above).
 SELECT pg_catalog.set_config($q$lock_timeout$q$, phasevec._update_lock_timeout(), true);
+SELECT pg_catalog.set_config($q$deadlock_timeout$q$, phasevec._update_deadlock_timeout(), true);
 DROP FUNCTION phasevec._update_step(int, text);
-DROP FUNCTION phasevec._update_take(text, oid, boolean);
+DROP FUNCTION phasevec._update_lock();
+DROP FUNCTION phasevec._update_take(text, oid);
 DROP FUNCTION phasevec._update_lock_timeout();
+DROP FUNCTION phasevec._update_deadlock_timeout();
+DROP FUNCTION phasevec._update_dependents();
 DROP FUNCTION phasevec._update_routine(oid);
