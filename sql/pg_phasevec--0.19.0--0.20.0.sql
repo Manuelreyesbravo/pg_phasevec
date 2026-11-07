@@ -257,6 +257,12 @@ LOCK TABLE phasevec.watches, phasevec.sources, phasevec.lexstats, phasevec.lexdo
 --    lives in a UTF8 database only, and every hash takes a text's bytes.
 -- 51. A proof's session waited for a claim's row holding the watched table: an owner's refute() and then DDL in one
 --    transaction deadlocked with it (src/phasevec_truth.c).
+-- 52. (nineteenth review) A dropped author's verdict served: after DROP ROLE (and a new role with its name) a claim
+--    went on reading 'verified' until its horizon or the next verify(). A verdict of a proof reads 'unproven' as soon
+--    as no role has its author's OID and name (_verdict_of).
+-- 53. (nineteenth review) refute() in a transaction older than a verdict stamped verified_at with its own now(),
+--    before that verdict. Every writer of verified_at now keeps it from moving back (refute(), unsupersede(),
+--    _truth_halted; _truth_set and assert() already did, or clear it).
 
 ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_oid oid,
                            ADD COLUMN asserted_for bytea, ADD COLUMN verified_for bytea,
@@ -376,6 +382,17 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                               > timezone($q$UTC$q$, clock_timestamp()), false)
                      IS NOT TRUE
                 THEN $q$unproven$q$
+                -- (nineteenth review, 52) a verdict of a proof is its author's: once no role has that OID and name
+                -- (DROP ROLE, a new role under the name, a rename), it reads 'unproven' until an assert() or adopt(),
+                -- as verify() would record it (_truth_due's test: that OID has that name, i.e. the role of that name
+                -- has that OID, one catalog cache lookup; a join with pg_roles cost 3.5 us a claim, brief() +50%).
+                -- Checked here, when read: DROP ROLE fires no event trigger (a role is the cluster's, not a
+                -- database's), and a role dropped from another database of the cluster is gone from this one too. A
+                -- retired claim (no proof) is nobody's verdict.
+                WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.proof IS NOT NULL
+                 AND t.asserted_by_oid IS NOT NULL
+                 AND pg_catalog.to_regrole(pg_catalog.quote_ident(t.asserted_by)) IS DISTINCT FROM t.asserted_by_oid
+                THEN $q$unproven$q$
                 WHEN t.verdict = $q$verified$q$
                  AND (t.verified_for IS NULL
                       OR t.verified_for IS DISTINCT FROM phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid,
@@ -425,6 +442,8 @@ RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_assert$q$ LANGUAGE C VOLATILE
 --   * the text it is about is recorded on every refute(): only a claim refute() inserted had it, and a claim
 --     asserted before 0.20.0 (no text) or with no proof read 'unproven' after refute(), not 'refuted' (yggdrasil
 --     went on serving every memory deleted after the update).
+-- (nineteenth review, 53) verified_at and retired_at never move back: a transaction that began before a verdict was
+-- recorded (its now() is earlier) stamps that verdict's time, not its own.
 CREATE OR REPLACE FUNCTION phasevec.refute(p_watch text, p_key text, p_reason text) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
@@ -438,7 +457,8 @@ BEGIN
     VALUES (w.id, p_key, $q$refuted$q$, now(), p_reason, h, now())
     ON CONFLICT (watch, key) DO UPDATE
        SET verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$refuted$q$ END,
-           verified_at = now(), last_error = p_reason, changed_at = now(), retired_at = now(),
+           verified_at = greatest(now(), t.verified_at), last_error = p_reason, changed_at = now(),
+           retired_at = greatest(now(), t.verified_at),
            proof = NULL, halted = false, asserted_for = h, verified_for = NULL,
            looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
 END;
@@ -454,7 +474,8 @@ BEGIN
     UPDATE phasevec.truth t
        SET replaced_by = NULL, reason = NULL,
            verdict = CASE WHEN phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$retired$q$ THEN $q$refuted$q$ ELSE $q$unproven$q$ END,
-           verified_at = CASE WHEN phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$retired$q$ THEN t.retired_at END,
+           verified_at = CASE WHEN phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$retired$q$
+                              THEN greatest(t.retired_at, t.verified_at) END,
            changed_at = now()
      WHERE t.watch = w.id AND t.key = p_key AND t.verdict = $q$replaced$q$;
 END;
@@ -594,11 +615,14 @@ BEGIN
         RETURN -1;
     END IF;
     UPDATE phasevec.truth t
-       SET verdict = $q$refuted$q$, verified_at = now(), verified_for = p_bind, halted = true, changed_at = now(),
+       SET verdict = $q$refuted$q$, verified_at = greatest(now(), t.verified_at), verified_for = p_bind, halted = true,
+           changed_at = now(),
            interrupted_at = NULL, interrupted_why = NULL,
            last_error = $q$the session that ran this proof ended while it ran: not run again until it is asserted again$q$
      WHERE t.watch = p_watch AND t.key = k AND t.verdict <> $q$replaced$q$ AND phasevec._claim_state(t.retired_at, t.proof, t.halted) <> $q$retired$q$
-       AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind;
+       AND phasevec._bind(t.asserted_for, t.proof, t.asserted_by_oid, t.proof_env) = p_bind
+       -- (nineteenth review, 53) again under the row's lock: a verdict recorded since the check above stands
+       AND (t.verified_at IS NULL OR t.verified_at <= p_started);
     RETURN CASE WHEN FOUND THEN 1 ELSE 0 END;
 END;
 $f$;
