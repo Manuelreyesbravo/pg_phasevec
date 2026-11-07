@@ -5,9 +5,10 @@
 #   PG=~/pg19/bin test/truth_liveness.sh
 # M1. (last: it restarts the cluster with a small lock table) A role with no grants fills the shared lock table with session advisory locks: the proof fails 'out of shared
 #     memory' (53200). It was recorded refuted, for a true claim. Now: not the proof's answer, nothing judged.
-# M2. An uncommitted assert() of a key, by a role that may assert (not the author), holds its truth row for as long as
-#     it stays open: the claim cannot be judged, and brief() kept serving the old 'verified' after the committed state
-#     refuted it. Now the verdict serves only until its horizon (watches.max_age), then reads 'unproven'.
+# M2. An uncommitted assert() of a key holds its truth row for as long as it stays open: the claim cannot be judged,
+#     and brief() kept serving the old 'verified' after the committed state refuted it. Now the verdict serves only
+#     until its horizon (watches.max_age), then reads 'unproven'. (twenty-fifth review) The assert is its author's:
+#     another role's is refused at once, and holds nothing.
 # H1. Once p_n claims are stale (their rows edited, not asserted again) they sorted first in every verify(p_n), and no
 #     other claim was judged again. Now every attempt spends the claim's turn: each claim is tried within
 #     ceil(N / p_n) calls.
@@ -93,9 +94,9 @@ horizon w2 '3 seconds'
 assert_as pv_l_a w2 1 'public.ok(1)'
 v -c "SELECT count(*) FROM phasevec.verify('w2', 10, interval '0', interval '30 seconds', 5000)" >/dev/null
 q -c "UPDATE facts SET ok = false WHERE id = 1"
-as pv_l_s -c "BEGIN" -c "SELECT phasevec.assert('w2', '1', 'true')" -c "SELECT pg_sleep(12)" -c "ROLLBACK" >/dev/null 2>&1 &
+as pv_l_a -c "BEGIN" -c "SELECT phasevec.assert('w2', '1', 'true')" -c "SELECT pg_sleep(12)" -c "ROLLBACK" >/dev/null 2>&1 &
 holder=$!; bg+=("$holder")
-wait_for "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE usename = 'pv_l_s' AND wait_event = 'PgSleep')" || echo "M2: no holder"
+wait_for "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE usename = 'pv_l_a' AND wait_event = 'PgSleep')" || echo "M2: no holder"
 said=$(v -c "SELECT count(*) FROM phasevec.verify('w2', 10, interval '0', interval '30 seconds', 5000)" 2>&1)
 early=$(v -c "SELECT coalesce(string_agg(verdict, ','), 'none') FROM phasevec.brief('w2') WHERE key = '1'")
 sleep 3.5
@@ -145,8 +146,9 @@ wait "$holder" 2>/dev/null
 
 # -------------------------------------------------------------------------------------------------------------- L --
 # N = 60 claims in w5: pv_l_a 1-30, pv_l_b 31-45, pv_l_c 46-60; p_n = 6, so every claim within ceil(60/6) = 10 calls.
-# Hostile at once: pv_l_b holds keys 31-35 (open assert), pv_l_s holds keys 1-3 (open assert), pv_l_w edits the rows of
-# keys 40-49 before each call, pv_l_h keeps four workers busy with slow proofs of its own.
+# Hostile at once: pv_l_b holds keys 31-35 (open assert), pv_l_a holds keys 1-3 (open assert; twenty-fifth review: a
+# claim is its author's, so another role's assert() is refused and holds nothing), pv_l_w edits the rows of keys
+# 40-49 before each call, pv_l_h keeps four workers busy with slow proofs of its own.
 N=60; PN=6; BOUND=$(( (N + PN - 1) / PN ))
 q -c "SET ROLE pv_l_a" -c "SELECT count(phasevec.assert('w5', k::text, format('public.ok(%s)', k))) FROM generate_series(1, 30) k" >/dev/null
 q -c "SET ROLE pv_l_b" -c "SELECT count(phasevec.assert('w5', k::text, format('public.ok(%s)', k))) FROM generate_series(31, 45) k" >/dev/null
@@ -158,11 +160,11 @@ v -c "SELECT count(*) FROM phasevec.verify('w5', 100, interval '0', interval '60
 q -c "UPDATE facts SET ok = false WHERE id <= 60"
 as pv_l_b -c "BEGIN" -c "SELECT count(phasevec.assert('w5', k::text, format('public.ok(%s)', k))) FROM generate_series(31, 35) k" -c "SELECT pg_sleep(60)" >/dev/null 2>&1 &
 bg+=("$!")
-as pv_l_s -c "BEGIN" -c "SELECT count(phasevec.assert('w5', k::text, 'true')) FROM generate_series(1, 3) k" -c "SELECT pg_sleep(60)" >/dev/null 2>&1 &
+as pv_l_a -c "BEGIN" -c "SELECT count(phasevec.assert('w5', k::text, 'true')) FROM generate_series(1, 3) k" -c "SELECT pg_sleep(60)" >/dev/null 2>&1 &
 bg+=("$!")
 hog() { for _ in $(seq 1 40); do as pv_l_h -c "SELECT phasevec.verify_one('w6', '$1', 3000)" >/dev/null 2>&1; done; }
 for k in 1 2 3 4; do hog $k & bg+=("$!"); done
-wait_for "SELECT count(*) = 2 FROM pg_stat_activity WHERE usename IN ('pv_l_b', 'pv_l_s') AND wait_event = 'PgSleep'" || echo "L: holders not ready"
+wait_for "SELECT count(*) = 2 FROM pg_stat_activity WHERE usename IN ('pv_l_b', 'pv_l_a') AND wait_event = 'PgSleep'" || echo "L: holders not ready"
 start=$(q -c "SELECT clock_timestamp()")
 brief_bad=0; brief_seen=0
 check_brief() {

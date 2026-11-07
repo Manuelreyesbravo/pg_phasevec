@@ -42,6 +42,7 @@
 #include "postgres.h"
 
 #include <dlfcn.h>
+#include <math.h>
 #include <signal.h>
 #include <string.h>
 
@@ -120,6 +121,9 @@ PG_FUNCTION_INFO_V1(phasevec_brief);
 PG_FUNCTION_INFO_V1(phasevec_door);
 PG_FUNCTION_INFO_V1(phasevec_verdict);
 PG_FUNCTION_INFO_V1(phasevec_adopt);
+PG_FUNCTION_INFO_V1(phasevec_refute);
+PG_FUNCTION_INFO_V1(phasevec_supersede);
+PG_FUNCTION_INFO_V1(phasevec_unsupersede);
 
 static TimeoutId prove_timeout = MAX_TIMEOUTS;
 static volatile sig_atomic_t prove_fired = false;
@@ -1138,13 +1142,23 @@ require_fresh_snapshots(void)
 				 errhint("Verify outside the transaction, or in one at READ COMMITTED.")));
 }
 
+/*
+ * (twenty-fifth review, RT25PC-INFO-1) And under a cost cap: p_max_cost above 0 (infinity: none). A
+ * NaN or a negative cap was taken as no cap at all: a proof the planner estimated above any cap the
+ * caller meant was run.
+ */
 static void
-require_clock(int timeout_ms)
+require_clock(int timeout_ms, double max_cost)
 {
 	if (timeout_ms <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("phasevec: a proof runs under a clock: p_timeout_ms must be above 0")));
+	if (isnan(max_cost) || max_cost <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("phasevec: a proof runs under a cost cap: "
+						"p_max_cost must be above 0 (infinity: no cap)")));
 }
 
 /*
@@ -3734,7 +3748,11 @@ phasevec_verify(PG_FUNCTION_ARGS)
 	memset(&l, 0, sizeof(l));
 	l.timeout_ms = PG_GETARG_INT32(4);
 	l.max_cost = PG_GETARG_FLOAT8(5);
-	require_clock(l.timeout_ms);
+	require_clock(l.timeout_ms, l.max_cost);
+	if (PG_GETARG_INT32(1) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("phasevec: p_n is how many claims verify() may judge: 0 or more")));
 	refuse_inside_proof();
 	require_fresh_snapshots();
 	require_no_writes("phasevec.verify()");
@@ -3892,7 +3910,7 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
 	memset(&l, 0, sizeof(l));
 	l.timeout_ms = PG_GETARG_INT32(2);
 	l.max_cost = PG_GETARG_FLOAT8(3);
-	require_clock(l.timeout_ms);
+	require_clock(l.timeout_ms, l.max_cost);
 	refuse_inside_proof();
 	require_fresh_snapshots();
 	require_no_writes("phasevec.verify_one()");
@@ -3985,36 +4003,40 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
  * owner, in the pinned settings), and the proof will run with `env`, the settings it was written in. The author must
  * read the table, and with row-level security see the row; a key with no row it sees is bound to no text, and its
  * proof never verifies until asserted again. SPI connected, as anyone; writes as the owner.
+ * (twenty-fifth review, RT25PC-AUTH-1) The author must read the table with no proof too, and the
+ * claim the key has is changed only when it is the author's to change (_assert_set, _claim_mine:
+ * `sees`, whether the author sees the row). adopt() (`adopting`) decides that itself: it takes only
+ * orphans, for an author whose privileges its caller holds.
  */
 static void
 assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool proof_null, Datum topic,
-			 bool topic_null, Datum support, bool support_null, Datum expires, bool expires_null, ArrayType *env)
+			 bool topic_null, Datum support, bool support_null, Datum expires, bool expires_null,
+			 ArrayType *env, bool adopting)
 {
 	MemoryContext keep = CurrentMemoryContext;
-	Oid			types[9] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, JSONBOID, TIMESTAMPTZOID, OIDOID, BYTEAOID,
-	TEXTARRAYOID};
-	Datum		values[9];
-	char		nulls[10] = "         ";
+	Oid			types[11] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, JSONBOID, TIMESTAMPTZOID, OIDOID,
+	BYTEAOID, TEXTARRAYOID, OIDOID, BOOLOID};
+	Datum		values[11];
+	char		nulls[12] = "           ";
 	bytea	   *seen = NULL;
 	Who			was;
 	Target		t;
+	char	   *k = TextDatumGetCString(key);
+	bool		sees;
 
 	become(owner, &was);
 	load_target(watch, false, &t, keep);
 	unbecome(&was);
-	if (!proof_null)
+	must_read(&t, author);
+	sees = !rls_for(&t, author) || key_visible(&t, author, GUARD_READER, NULL, k);
+	if (!proof_null && sees)
 	{
-		char	   *k = TextDatumGetCString(key);
 		char	   *one[1] = {k};
 		Rendered	r;
 
-		must_read(&t, author);
-		if (!rls_for(&t, author) || key_visible(&t, author, GUARD_READER, NULL, k))
-		{
-			render_rows(&t, text_array(one, 1), &r, keep);
-			if (r.n > 0)
-				seen = r.hash[0];
-		}
+		render_rows(&t, text_array(one, 1), &r, keep);
+		if (r.n > 0)
+			seen = r.hash[0];
 	}
 	values[0] = watch;
 	values[1] = key;
@@ -4030,10 +4052,13 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 	values[7] = seen ? PointerGetDatum(seen) : (Datum) 0;
 	nulls[7] = seen ? ' ' : 'n';
 	values[8] = PointerGetDatum(env);
+	values[9] = ObjectIdGetDatum(author);
+	nulls[9] = adopting ? 'n' : ' ';
+	values[10] = BoolGetDatum(sees);
 
 	become(owner, &was);
-	if (SPI_execute_with_args("SELECT phasevec._assert_set($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-							  9, types, values, nulls, false, 1) != SPI_OK_SELECT)
+	if (SPI_execute_with_args("SELECT phasevec._assert_set($1, $2, $3, $4, $5, $6, $7, $8, $9, "
+							  "$10, $11)", 11, types, values, nulls, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the claim was not recorded");
 	unbecome(&was);
 }
@@ -4080,8 +4105,132 @@ phasevec_assert(PG_FUNCTION_ARGS)
 				 PG_ARGISNULL(3) ? (Datum) 0 : PG_GETARG_DATUM(3), PG_ARGISNULL(3),
 				 PG_ARGISNULL(4) ? (Datum) 0 : PG_GETARG_DATUM(4), PG_ARGISNULL(4),
 				 PG_ARGISNULL(5) ? (Datum) 0 : PG_GETARG_DATUM(5), PG_ARGISNULL(5),
-				 claim_env(author));
+				 claim_env(author), false);
 	SPI_finish();
+	PG_RETURN_VOID();
+}
+
+/*
+ * refute(), supersede(), unsupersede() (twenty-fifth review, RT25PC-AUTH-1): SQL SECURITY DEFINER
+ * functions until this review, which saw only the owner: any role granted one changed any claim, on
+ * rows it could not see (row-level security) or of a table it could not read. Now each takes its
+ * caller as assert() does (its current user), refuses one that may not read the watched table, and
+ * tells the owner's SQL (_refute_set, _supersede_set, _unsupersede_set) whether the caller sees
+ * each row it names; that SQL decides on the claim's row as it writes it (_claim_mine). claim_door:
+ * the checks every one of them makes first; SPI connected after it.
+ */
+static void
+claim_door(FunctionCallInfo fcinfo, const char *fn, int nkeys, Target *t, Oid *caller, Oid *owner,
+		   bool *rls)
+{
+	Who			was;
+
+	for (int i = 0; i <= nkeys; i++)
+		if (PG_ARGISNULL(i))
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("phasevec: %s needs a watch and %s", fn,
+							nkeys > 1 ? "both keys" : "a key")));
+	*caller = GetUserId();
+	*owner = function_owner(fcinfo);
+	spi_connect();
+	become(*owner, &was);
+	load_target(PG_GETARG_DATUM(0), false, t, CurrentMemoryContext);
+	unbecome(&was);
+	must_read(t, *caller);
+	*rls = rls_for(t, *caller);
+}
+
+/*
+ * Does the caller see the row of this key? (true with no row-level security: it reads the table)
+ * SPI connected.
+ */
+static bool
+caller_sees(const Target *t, Oid caller, bool rls, Datum key)
+{
+	return !rls || key_visible(t, caller, GUARD_READER, NULL, TextDatumGetCString(key));
+}
+
+/* Run the owner's SQL for a claim door, then leave SPI. */
+static void
+claim_write(Oid owner, const char *sql, int n, Oid *types, Datum *values, const char *nulls)
+{
+	Who			was;
+
+	become(owner, &was);
+	if (SPI_execute_with_args(sql, n, types, values, nulls, false, 1) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: the claim was not changed");
+	unbecome(&was);
+	SPI_finish();
+}
+
+/* phasevec.refute(watch text, key text, reason text) */
+Datum
+phasevec_refute(PG_FUNCTION_ARGS)
+{
+	Oid			types[5] = {TEXTOID, TEXTOID, TEXTOID, OIDOID, BOOLOID};
+	Datum		values[5];
+	char		nulls[6] = "     ";
+	Target		t;
+	Oid			caller,
+				owner;
+	bool		rls;
+
+	claim_door(fcinfo, "refute()", 1, &t, &caller, &owner, &rls);
+	values[0] = PG_GETARG_DATUM(0);
+	values[1] = PG_GETARG_DATUM(1);
+	values[2] = PG_ARGISNULL(2) ? (Datum) 0 : PG_GETARG_DATUM(2);
+	nulls[2] = PG_ARGISNULL(2) ? 'n' : ' ';
+	values[3] = ObjectIdGetDatum(caller);
+	values[4] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	claim_write(owner, "SELECT phasevec._refute_set($1, $2, $3, $4, $5)", 5, types, values, nulls);
+	PG_RETURN_VOID();
+}
+
+/* phasevec.supersede(watch text, old text, new text, reason text) */
+Datum
+phasevec_supersede(PG_FUNCTION_ARGS)
+{
+	Oid			types[7] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, OIDOID, BOOLOID, BOOLOID};
+	Datum		values[7];
+	char		nulls[8] = "       ";
+	Target		t;
+	Oid			caller,
+				owner;
+	bool		rls;
+
+	claim_door(fcinfo, "supersede()", 2, &t, &caller, &owner, &rls);
+	values[0] = PG_GETARG_DATUM(0);
+	values[1] = PG_GETARG_DATUM(1);
+	values[2] = PG_GETARG_DATUM(2);
+	values[3] = PG_ARGISNULL(3) ? (Datum) 0 : PG_GETARG_DATUM(3);
+	nulls[3] = PG_ARGISNULL(3) ? 'n' : ' ';
+	values[4] = ObjectIdGetDatum(caller);
+	values[5] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	values[6] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(2)));
+	claim_write(owner, "SELECT phasevec._supersede_set($1, $2, $3, $4, $5, $6, $7)", 7, types,
+				values, nulls);
+	PG_RETURN_VOID();
+}
+
+/* phasevec.unsupersede(watch text, key text) */
+Datum
+phasevec_unsupersede(PG_FUNCTION_ARGS)
+{
+	Oid			types[4] = {TEXTOID, TEXTOID, OIDOID, BOOLOID};
+	Datum		values[4];
+	Target		t;
+	Oid			caller,
+				owner;
+	bool		rls;
+
+	claim_door(fcinfo, "unsupersede()", 1, &t, &caller, &owner, &rls);
+	values[0] = PG_GETARG_DATUM(0);
+	values[1] = PG_GETARG_DATUM(1);
+	values[2] = ObjectIdGetDatum(caller);
+	values[3] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	claim_write(owner, "SELECT phasevec._unsupersede_set($1, $2, $3, $4)", 4, types, values,
+				"    ");
 	PG_RETURN_VOID();
 }
 
@@ -4244,7 +4393,7 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 		else
 		{
 			assert_claim(owner, author, PG_GETARG_DATUM(0), key, proof, n_proof, topic, n_topic,
-						 support, n_support, exp, n_exp, env);
+						 support, n_support, exp, n_exp, env, true);
 			adopted = true;
 			note = su ? "adopted: it runs with a superuser's rights" : "adopted";
 		}

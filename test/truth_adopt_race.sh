@@ -71,7 +71,8 @@ res=$(q -c "SELECT string_agg(key || '|' || coalesce(asserted_by::text, '-') || 
               FROM phasevec.truth t WHERE key IN ('1', '2')")
 echo "adopt: $(tr '\n' ' ' < "$out/adopt"); claims: $res"
 k1=$(echo "$res" | tr ' ' '\n' | grep '^1|'); k2=$(echo "$res" | tr ' ' '\n' | grep '^2|')
-if [ "$k1" = "1|pv_ar_gone|true|refuted|retired" ]; then
+# (twenty-fifth review) the role that retired a claim is its author
+if [ "$k1" = "1|pv_ar_au|true|refuted|retired" ]; then
     echo "ok - a claim refute() retired while adopt() waited for it stays retired"
 else
     echo "not ok - key 1 (refuted while adopt() ran): $k1"; fallas=1

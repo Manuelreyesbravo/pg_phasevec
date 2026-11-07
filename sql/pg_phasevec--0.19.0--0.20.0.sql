@@ -104,8 +104,36 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.oid = p_oid
 $f$;
 -- Every object outside the extension that depends on a function this script drops, named; NULL when none.
+-- (twenty-fifth review, RT25PU-2) And every column outside the extension that stores the row type
+-- of a table this script alters (phasevec.truth, phasevec.watches: ALTER TABLE ... ADD COLUMN
+-- refuses while one does), directly or through an array, a domain, or a composite type or view
+-- whose own row type is stored: PostgreSQL's own walk (find_composite_type_dependencies). A type is
+-- USAGE to PUBLIC: any role with USAGE on the schema could make such a table, and the update failed
+-- on it after the locks, one table per run.
 CREATE FUNCTION phasevec._update_dependents() RETURNS text
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    WITH RECURSIVE
+    e(f, t) AS (SELECT y.typelem, y.oid FROM pg_type y
+                 WHERE y.typelem <> 0 AND y.typsubscript = 'array_subscript_handler'::regproc
+                UNION ALL
+                SELECT y.typbasetype, y.oid FROM pg_type y WHERE y.typtype = 'd'
+                UNION ALL
+                SELECT a.atttypid, c.reltype
+                  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+                 WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('v', 'c', 'f')
+                   AND c.reltype <> 0),
+    ty(oid) AS (SELECT c.reltype FROM pg_class c
+                 WHERE c.oid IN ('phasevec.truth'::regclass, 'phasevec.watches'::regclass)
+                UNION
+                SELECT e.t FROM ty JOIN e ON e.f = ty.oid),
+    rows_of AS (SELECT format('column %I of %s stores type %s', a.attname, a.attrelid::regclass,
+                              format_type(a.atttypid, a.atttypmod)) AS what, a.attrelid, a.attnum
+                  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+                 WHERE a.attnum > 0 AND NOT a.attisdropped AND a.atttypid IN (SELECT ty.oid FROM ty)
+                   AND c.relkind NOT IN ('v', 'c', 'f'))
+    SELECT nullif(concat_ws('; ',
+                            (SELECT string_agg(r.what, '; ' ORDER BY r.attrelid, r.attnum)
+                               FROM rows_of r), (
     SELECT string_agg(format('%s depends on function %s',
                              CASE WHEN d.classid = 'pg_rewrite'::regclass
                                   THEN (SELECT pg_describe_object('pg_class'::regclass, r.ev_class, 0)
@@ -126,6 +154,21 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                           AND ((e.classid = d.classid AND e.objid = d.objid)
                                OR (d.classid = 'pg_rewrite'::regclass AND e.classid = 'pg_class'::regclass
                                    AND e.objid = (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid))))
+    )), '')
+$f$;
+-- (twenty-fifth review, RT25PU-3, RT26-PREP-1) Who holds a lock, as pg_locks shows it: a session by
+-- its pid, or a prepared transaction by its name (its locks have no pid, and it is in
+-- pg_prepared_xacts, not pg_stat_activity: until this review the update said "none any more" of
+-- one).
+CREATE FUNCTION phasevec._update_who(p_pid int, p_vxid text) RETURNS text
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT CASE WHEN p_pid IS NOT NULL THEN p_pid::text
+                ELSE coalesce((SELECT format('prepared transaction %L', x.gid)
+                                 FROM pg_prepared_xacts x
+                                 JOIN pg_locks l ON l.locktype = 'transactionid'
+                                                AND l.transactionid = x.transaction
+                                WHERE l.virtualtransaction = p_vxid AND l.pid IS NULL LIMIT 1),
+                              'a prepared transaction') END
 $f$;
 -- The caller's lock_timeout and deadlock_timeout, set again at the end of this script.
 DO $lt$
@@ -146,7 +189,7 @@ DECLARE
                          FROM pg_settings s WHERE s.name = 'deadlock_timeout');
     hold_ms    int;
     tries      int := 0;
-    started    timestamptz := clock_timestamp();
+    started    timestamptz;
     left_ms    int;
     first_kind text := 'table';
     first_what oid := 'phasevec.watches'::regclass;
@@ -165,25 +208,33 @@ BEGIN
     FOR pass IN 1..2 LOOP
         deps := phasevec._update_dependents();
         IF deps IS NOT NULL THEN
-            RAISE EXCEPTION 'phasevec: the update to 0.20.0 drops functions that objects outside the extension '
-                            'depend on: nothing was changed'
+            RAISE EXCEPTION 'phasevec: the update to 0.20.0 drops functions, or alters tables, '
+                            'that objects outside the extension depend on: nothing was changed'
                 USING ERRCODE = 'dependent_objects_still_exist',
                       DETAIL = deps || '.',
-                      HINT = 'These functions are internals of phasevec 0.19.0, gone in 0.20.0. Drop those objects '
-                             '(or change them not to refer to them), then run the update again.';
+                      HINT = 'The functions are internals of phasevec 0.19.0, gone in 0.20.0; a '
+                             'column that stores the row type of phasevec.truth or '
+                             'phasevec.watches keeps the update from adding theirs. Drop those '
+                             'objects (or change them not to refer to them), then run the update '
+                             'again.';
         END IF;
         EXIT WHEN held;
         PERFORM set_config('deadlock_timeout', '1ms', true);
+        -- (twenty-fifth review, RT26-LT-1, RT25PU-4) The caller's lock_timeout counts from the
+        -- first try, and the first try is always made, with 1 ms at least: with lock_timeout = 1ms
+        -- the time spent before it (the check above) used up the budget, and the update stopped,
+        -- saying it had waited, on a database where nothing held anything.
+        started := clock_timestamp();
         WHILE NOT held LOOP
             left_ms := CASE WHEN caller_ms > 0
                             THEN caller_ms - (extract(epoch FROM clock_timestamp() - started) * 1000)::int END;
-            EXIT WHEN left_ms <= 0;
+            EXIT WHEN left_ms <= 0 AND tries > 0;
             tries := tries + 1;
             BEGIN
                 kind := first_kind;
                 what := first_what;
                 first := true;
-                PERFORM set_config('lock_timeout', coalesce(left_ms, 0) || 'ms', true);
+                PERFORM set_config('lock_timeout', coalesce(greatest(1, left_ms), 0) || 'ms', true);
                 PERFORM phasevec._update_take(kind, what);
                 first := false;
                 FOR t IN SELECT 'table' AS kind, x.r::oid AS what, x.n AS ord
@@ -218,9 +269,10 @@ BEGIN
             END;
         END LOOP;
         IF NOT held THEN
-            SELECT string_agg(DISTINCT l.pid::text, ', ') INTO holders
+            SELECT string_agg(DISTINCT phasevec._update_who(l.pid, l.virtualtransaction), ', ')
+              INTO holders
               FROM pg_locks l
-             WHERE l.granted AND l.pid <> pg_backend_pid()
+             WHERE l.granted AND l.pid IS DISTINCT FROM pg_backend_pid()
                AND CASE first_kind
                    WHEN 'table' THEN
                         l.locktype = 'relation' AND l.relation = first_what
@@ -244,7 +296,8 @@ BEGIN
                                       ELSE phasevec._update_routine(first_what) END,
                                       coalesce(holders, 'none any more')),
                       HINT = 'Run the update again (with a longer lock_timeout, or 0, it waits for them), '
-                             'or end those sessions first (pg_stat_activity).';
+                             'or end those sessions first (pg_stat_activity), and commit or roll '
+                             'back those prepared transactions (pg_prepared_xacts).';
         END IF;
     END LOOP;
     PERFORM set_config('lock_timeout', hold_ms || 'ms', true);
@@ -532,6 +585,14 @@ ALTER TABLE phasevec.truth ADD COLUMN asserted_by name, ADD COLUMN asserted_by_o
                            ADD COLUMN retired_at timestamptz,
                            ADD CONSTRAINT truth_retired_check
                                CHECK (retired_at IS NULL OR (proof IS NULL AND verdict IN ($q$refuted$q$, $q$replaced$q$)));
+ALTER TABLE phasevec.truth
+    ADD COLUMN data_version text NOT NULL DEFAULT $q$0.19.0$q$
+    CONSTRAINT truth_data_version_check CHECK (data_version IN ($q$0.19.0$q$, $q$0.20.0$q$));
+COMMENT ON COLUMN phasevec.truth.data_version IS
+    'The version of pg_phasevec that wrote this claim as it is (0.20.0, twenty-fifth review): '
+    'every write of 0.20.0 says ''0.20.0''; the default, ''0.19.0'', is what a row written before '
+    'the column was made reads, by the update or by a pg_dump of 0.19.0 restored here. Such a '
+    'claim is not changed or judged until phasevec.migrate() (or the update) brings it to 0.20.0.';
 COMMENT ON COLUMN phasevec.truth.retired_at IS
     $q$When refute() retired this claim (0.20.0, eighteenth review): it has no proof, nothing judges it again, and only an assert() makes it a claim again. NULL for a claim that is not retired. phasevec._claim_state() names every state.$q$;
 COMMENT ON COLUMN phasevec.truth.asserted_by IS
@@ -556,7 +617,14 @@ COMMENT ON COLUMN phasevec.truth.interrupted_why IS
 -- time verify() takes to come round every claim of the watch: ceil(claims / p_n) calls, each p_every or the cron's
 -- interval apart (whichever is longer), and the same again for a call that judges a claim just after p_every.
 ALTER TABLE phasevec.watches ADD COLUMN max_age interval NOT NULL DEFAULT interval $q$1 hour$q$
-    CONSTRAINT watches_max_age_check CHECK (max_age > interval $q$0$q$);
+    CONSTRAINT watches_max_age_check CHECK (max_age > interval $q$0$q$),
+    ADD COLUMN data_version text NOT NULL DEFAULT $q$0.19.0$q$
+    CONSTRAINT watches_data_version_check CHECK (data_version IN ($q$0.19.0$q$, $q$0.20.0$q$));
+COMMENT ON COLUMN phasevec.watches.data_version IS
+    'The version of pg_phasevec that this watch''s rows are as (0.20.0, twenty-fifth review): '
+    'watch() makes ''0.20.0''; the default, ''0.19.0'', is a watch made before the column, brought'
+    ' to 0.20.0 by the update, or restored from a pg_dump of 0.19.0 (phasevec.migrate() brings '
+    'it). Until then no claim of the watch is changed or judged.';
 COMMENT ON COLUMN phasevec.watches.max_age IS
     $q$How long a verdict of this watch serves after it was judged (0.20.0, eleventh review): past verified_at + max_age a 'verified' or 'refuted' reads 'unproven', whatever kept it from being judged again. Longer than verify() takes to come round every claim (ceil(claims / p_n) calls, p_every or the cron's interval apart, twice). The owner sets it: UPDATE phasevec.watches SET max_age = ... WHERE name = ...$q$;
 
@@ -666,17 +734,103 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 ELSE t.verdict END
 $f$;
 
+-- (twenty-fifth review, RT25PC-AUTH-1) A claim is its author's. Until this review any role granted
+-- assert(), refute(), supersede() or unsupersede() changed any claim: a tenant under row-level
+-- security replaced, retired and hid another tenant's verified claims on rows it could not see, and
+-- a role with no SELECT on the table did it through assert() with no proof, refute(), supersede()
+-- and unsupersede(). Now each of them takes its caller (its current user, as assert() always did: a
+-- SECURITY DEFINER wrapper acts with its owner's rights), refuses a caller that may not read the
+-- watched table (src/phasevec_truth.c, must_read), learns whether the caller sees each row it names
+-- (with row-level security), and changes a claim only when _claim_mine says so, on the claim's row
+-- as the write takes it (ON CONFLICT ... WHERE, or the row taken FOR UPDATE): no claim can change
+-- hands between the check and the write. A claim is changed by
+--   * a role with the privileges of the watched table's owner (who can change every row the claim
+--     is about), or
+--   * a role with the privileges of the claim's author, while the author is still that role (its
+--     OID has its name);
+--   * a key with no claim, or with a claim of no author still there (asserted before 0.20.0, or its
+--     author dropped or renamed), by a role that sees its row.
+-- Who last made a claim what it is is its author: assert(), and refute() too (the role that retired
+-- it) and a supersede() of a key with no claim (the placeholder). A refusal reads alike for a row
+-- the caller does not see, a row that does not exist and another author's claim.
+CREATE FUNCTION phasevec._claim_mine(t phasevec.truth, p_caller oid, p_sees boolean,
+                                     p_table_owner oid)
+RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT coalesce(pg_has_role(p_caller, p_table_owner, $q$USAGE$q$), false)
+        OR CASE WHEN t.asserted_by_oid IS NOT NULL
+                 AND to_regrole(quote_ident(t.asserted_by)) IS NOT DISTINCT FROM t.asserted_by_oid
+                THEN coalesce(pg_has_role(p_caller, t.asserted_by_oid, $q$USAGE$q$), false)
+                ELSE coalesce(p_sees, false) END
+$f$;
+CREATE FUNCTION phasevec._claim_refused(p_watch text, p_key text, p_caller oid) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    RAISE EXCEPTION 'phasevec: role "%" may not change the claim on key % of watch %',
+                    pg_get_userbyid(p_caller), p_key, p_watch
+        USING ERRCODE = 'insufficient_privilege',
+              DETAIL = 'A claim is its author''s: a role with its author''s privileges, or with '
+                       'those of the watched table''s owner, changes it. A key with no claim of an '
+                       'author still there is changed by a role that sees its row.';
+END;
+$f$;
+
+-- (twenty-fifth review, RT25PU-1) What pg_phasevec 0.19.0 wrote is not changed or judged by 0.20.0
+-- until it is brought to 0.20.0: every row of phasevec.watches and phasevec.truth carries the
+-- version that wrote it (data_version). The update brings them all (below); a pg_dump of a 0.19.0
+-- database restored where 0.20.0 is installed brings its rows in as 0.19.0 wrote them (pg_dump
+-- names no version: CREATE EXTENSION makes 0.20.0, on empty tables, and the dump's rows come after
+-- it, with the column's default), and phasevec.migrate() brings those. Until it runs, every door
+-- that changes or judges a claim of such a watch refuses, named, with what to do (and a claim of
+-- 0.19.0 reads as 0.20.0 reads one it never judged: never 'verified'). Until this review the
+-- restore left them as they were: a claim refute()d under 0.19.0 kept its proof, adopt() asserted
+-- it again and verify() served it 'verified'; its watch had no TRUNCATE trigger.
+CREATE FUNCTION phasevec._migrated(p_watch int, p_key text) RETURNS boolean
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF EXISTS (SELECT 1 FROM phasevec.watches w
+                WHERE w.id = p_watch AND w.data_version <> $q$0.20.0$q$)
+       OR (p_key IS NOT NULL
+           AND EXISTS (SELECT 1 FROM phasevec.truth t
+                        WHERE t.watch = p_watch AND t.key = p_key
+                          AND t.data_version <> $q$0.20.0$q$)) THEN
+        RAISE EXCEPTION 'phasevec: watch % holds what pg_phasevec 0.19.0 wrote, not brought to '
+                        '0.20.0: its claims are not changed or judged until they are',
+                        (SELECT w.name FROM phasevec.watches w WHERE w.id = p_watch)
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  DETAIL = 'A pg_dump of a 0.19.0 database restored where 0.20.0 is installed '
+                           'brings its rows in as 0.19.0 wrote them: what the update does to them '
+                           '(a refuted claim retired, a verified one not carried over, the '
+                           'TRUNCATE trigger) has not been done.',
+                  HINT = 'The extension''s owner runs SELECT * FROM phasevec.migrate(); once, '
+                         'after the restore.';
+    END IF;
+    RETURN true;
+END;
+$f$;
+
 -- assert(): the same signature and grants; now C (src/phasevec_truth.c): it sees who calls it, renders the row as
 -- the table's owner in pinned settings, records the caller's settings, and writes through _assert_set, as the owner.
-CREATE FUNCTION phasevec._assert_set(p_watch text, p_key text, p_proof text, p_topic text, p_support jsonb,
-                                     p_expires_at timestamptz, p_author oid, p_text_hash bytea, p_env text[])
+-- p_caller: the caller whose right to change the claim is checked (_claim_mine; p_sees: it sees the
+-- row); NULL for adopt(), which checks its own (the caller holds the new author's privileges, and
+-- takes only orphans).
+CREATE FUNCTION phasevec._assert_set(p_watch text, p_key text, p_proof text, p_topic text,
+                                     p_support jsonb, p_expires_at timestamptz, p_author oid,
+                                     p_text_hash bytea, p_env text[], p_caller oid, p_sees boolean)
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
+        own oid := (SELECT c.relowner FROM pg_class c WHERE c.oid = w.source);
 BEGIN
+    PERFORM phasevec._migrated(w.id, p_key);
+    IF p_caller IS NOT NULL
+       AND NOT phasevec._claim_mine(NULL::phasevec.truth, p_caller, p_sees, own)
+       AND NOT EXISTS (SELECT 1 FROM phasevec.truth t WHERE t.watch = w.id AND t.key = p_key) THEN
+        PERFORM phasevec._claim_refused(p_watch, p_key, p_caller);
+    END IF;
     INSERT INTO phasevec.truth AS t (watch, key, proof, topic, support, expires_at,
-                                     asserted_by, asserted_by_oid, asserted_for, proof_env)
+                                     asserted_by, asserted_by_oid, asserted_for, proof_env,
+                                     data_version)
     VALUES (w.id, p_key, p_proof, p_topic, p_support, p_expires_at,
-            pg_get_userbyid(p_author), p_author, p_text_hash, p_env)
+            pg_get_userbyid(p_author), p_author, p_text_hash, p_env, $q$0.20.0$q$)
     ON CONFLICT (watch, key) DO UPDATE
        SET proof = EXCLUDED.proof, topic = EXCLUDED.topic, support = EXCLUDED.support,
            expires_at = EXCLUDED.expires_at, asserted_by = EXCLUDED.asserted_by,
@@ -684,7 +838,12 @@ BEGIN
            proof_env = EXCLUDED.proof_env, halted = false, retired_at = NULL,
            verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$unproven$q$ END,
            verified_at = NULL, verified_for = NULL, last_error = NULL, changed_at = now(),
-           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
+           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL,
+           data_version = $q$0.20.0$q$
+     WHERE p_caller IS NULL OR phasevec._claim_mine(t, p_caller, p_sees, own);
+    IF NOT FOUND THEN
+        PERFORM phasevec._claim_refused(p_watch, p_key, p_caller);
+    END IF;
 END;
 $f$;
 CREATE OR REPLACE FUNCTION phasevec.assert(p_watch text, p_key text, p_proof text DEFAULT NULL, p_topic text DEFAULT NULL,
@@ -705,25 +864,113 @@ RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_assert$q$ LANGUAGE C VOLATILE
 --     went on serving every memory deleted after the update).
 -- (nineteenth review, 53) verified_at and retired_at never move back: a transaction that began before a verdict was
 -- recorded (its now() is earlier) stamps that verdict's time, not its own.
-CREATE OR REPLACE FUNCTION phasevec.refute(p_watch text, p_key text, p_reason text) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+-- (twenty-fifth review, RT25PC-AUTH-1) C (src/phasevec_truth.c), through _refute_set as the owner:
+-- the caller's own claim, or one it may change (_claim_mine); the role that retired it is its
+-- author.
+CREATE FUNCTION phasevec._refute_set(p_watch text, p_key text, p_reason text, p_caller oid,
+                                     p_sees boolean)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
+        own oid := (SELECT c.relowner FROM pg_class c WHERE c.oid = w.source);
         h bytea;
 BEGIN
     IF coalesce(btrim(p_reason), $q$$q$) = $q$$q$ THEN
         RAISE EXCEPTION $q$phasevec: a refutation says why$q$;
     END IF;
+    PERFORM phasevec._migrated(w.id, p_key);
+    IF NOT phasevec._claim_mine(NULL::phasevec.truth, p_caller, p_sees, own)
+       AND NOT EXISTS (SELECT 1 FROM phasevec.truth t WHERE t.watch = w.id AND t.key = p_key) THEN
+        PERFORM phasevec._claim_refused(p_watch, p_key, p_caller);
+    END IF;
     h := (SELECT s.text_hash FROM phasevec.sources s WHERE s.watch = w.id AND s.key = p_key);
-    INSERT INTO phasevec.truth AS t (watch, key, verdict, verified_at, last_error, asserted_for, retired_at)
-    VALUES (w.id, p_key, $q$refuted$q$, now(), p_reason, h, now())
+    INSERT INTO phasevec.truth AS t (watch, key, verdict, verified_at, last_error, asserted_for,
+                                     retired_at, asserted_by, asserted_by_oid, data_version)
+    VALUES (w.id, p_key, $q$refuted$q$, now(), p_reason, h, now(), pg_get_userbyid(p_caller),
+            p_caller, $q$0.20.0$q$)
     ON CONFLICT (watch, key) DO UPDATE
        SET verdict = CASE WHEN t.verdict = $q$replaced$q$ THEN t.verdict ELSE $q$refuted$q$ END,
            verified_at = greatest(now(), t.verified_at), last_error = p_reason, changed_at = now(),
            retired_at = greatest(now(), t.verified_at),
            proof = NULL, halted = false, asserted_for = h, verified_for = NULL,
-           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL;
+           looked_at = NULL, looked_for = NULL, interrupted_at = NULL, interrupted_why = NULL,
+           asserted_by = EXCLUDED.asserted_by, asserted_by_oid = EXCLUDED.asserted_by_oid,
+           data_version = $q$0.20.0$q$
+     WHERE phasevec._claim_mine(t, p_caller, p_sees, own);
+    IF NOT FOUND THEN
+        PERFORM phasevec._claim_refused(p_watch, p_key, p_caller);
+    END IF;
 END;
 $f$;
+CREATE OR REPLACE FUNCTION phasevec.refute(p_watch text, p_key text, p_reason text) RETURNS void
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_refute$q$ LANGUAGE C VOLATILE;
+
+-- supersede(): (twenty-fifth review, RT25PC-AUTH-1) C, through _supersede_set as the owner: the old
+-- key's claim is one the caller may change (_claim_mine; with none, a placeholder whose author is
+-- the caller), and the new key a row the caller sees (a role that sees no such row reads that it
+-- does not exist, as for a row that does not). (RT25PC-INFO-2) A replacement closes no cycle: a new
+-- key whose replacement chain leads back to the old one is refused. Until this review 2 -> 3 then 3
+-- -> 2 was taken, both read 'replaced' and both left brief(). The supersedes of a watch take its
+-- row of phasevec.watches (FOR NO KEY UPDATE, which no write of a claim waits for) and read the
+-- chain after it, at READ COMMITTED (refused at REPEATABLE READ or SERIALIZABLE, whose snapshot
+-- would not show a supersede committed while this one waited): of two at once that would close a
+-- cycle, the second sees the first.
+CREATE FUNCTION phasevec._supersede_set(p_watch text, p_old text, p_new text, p_reason text,
+                                        p_caller oid, p_sees_old boolean, p_sees_new boolean)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE w phasevec.watches := phasevec._watch(p_watch);
+        own oid := (SELECT c.relowner FROM pg_class c WHERE c.oid = w.source);
+BEGIN
+    IF p_old = p_new THEN
+        RAISE EXCEPTION $q$phasevec: a row cannot replace itself$q$;
+    END IF;
+    IF coalesce(btrim(p_reason), $q$$q$) = $q$$q$ THEN
+        RAISE EXCEPTION $q$phasevec: a replacement says why$q$;
+    END IF;
+    IF current_setting($q$transaction_isolation$q$) <> $q$read committed$q$ THEN
+        RAISE EXCEPTION 'phasevec: supersede() runs only at READ COMMITTED'
+            USING ERRCODE = 'feature_not_supported',
+                  DETAIL = 'It reads the replacement chain as it is once it holds the watch: a '
+                           'snapshot taken before would not show a supersede() committed '
+                           'meanwhile, and two could close a cycle.',
+                  HINT = 'Call it outside the transaction, or in one at READ COMMITTED.';
+    END IF;
+    PERFORM phasevec._migrated(w.id, p_old);
+    IF NOT (p_sees_new OR coalesce(pg_has_role(p_caller, own, $q$USAGE$q$), false))
+       OR NOT EXISTS (SELECT 1 FROM phasevec.sources s WHERE s.watch = w.id AND s.key = p_new) THEN
+        RAISE EXCEPTION $q$phasevec: row % of watch % does not exist: it cannot replace anything$q$,
+                        p_new, p_watch;
+    END IF;
+    IF NOT phasevec._claim_mine(NULL::phasevec.truth, p_caller, p_sees_old, own)
+       AND NOT EXISTS (SELECT 1 FROM phasevec.truth t WHERE t.watch = w.id AND t.key = p_old) THEN
+        PERFORM phasevec._claim_refused(p_watch, p_old, p_caller);
+    END IF;
+    PERFORM 1 FROM phasevec.watches x WHERE x.id = w.id FOR NO KEY UPDATE;
+    IF EXISTS (WITH RECURSIVE c(k) AS (
+                   SELECT p_new
+                   UNION
+                   SELECT t.replaced_by
+                     FROM c JOIN phasevec.truth t ON t.watch = w.id AND t.key = c.k
+                    WHERE t.verdict = $q$replaced$q$ AND t.replaced_by IS NOT NULL)
+               SELECT 1 FROM c WHERE c.k = p_old) THEN
+        RAISE EXCEPTION 'phasevec: row % of watch % is replaced, in the end, by row %: % cannot '
+                        'replace %', p_new, p_watch, p_old, p_new, p_old
+            USING ERRCODE = 'invalid_parameter_value',
+                  DETAIL = 'A replacement that closes a cycle would hide every claim on it.';
+    END IF;
+    INSERT INTO phasevec.truth AS t (watch, key, replaced_by, reason, verdict, asserted_by,
+                                     asserted_by_oid, data_version)
+    VALUES (w.id, p_old, p_new, p_reason, $q$replaced$q$, pg_get_userbyid(p_caller), p_caller,
+            $q$0.20.0$q$)
+    ON CONFLICT (watch, key) DO UPDATE
+       SET replaced_by = p_new, reason = p_reason, verdict = $q$replaced$q$, changed_at = now()
+     WHERE phasevec._claim_mine(t, p_caller, p_sees_old, own);
+    IF NOT FOUND THEN
+        PERFORM phasevec._claim_refused(p_watch, p_old, p_caller);
+    END IF;
+END;
+$f$;
+CREATE OR REPLACE FUNCTION phasevec.supersede(p_watch text, p_old text, p_new text, p_reason text)
+RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_supersede$q$ LANGUAGE C VOLATILE;
 
 -- unsupersede(): (eighteenth review) a claim comes back in the state it kept behind its replacement (supersede()
 -- changes none of retired_at, proof, halted, verified_at, verified_for): with the verdict that state has. A state no
@@ -733,10 +980,20 @@ $f$;
 -- Until the eighteenth review every claim came back 'unproven': a retired one (no proof, so never judged again) was
 -- served 'unproven' for good; until the nineteenth a halted one was (verify() does not run it again), and brief()
 -- served a claim its proof had refuted.
-CREATE OR REPLACE FUNCTION phasevec.unsupersede(p_watch text, p_key text)
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+-- (twenty-fifth review, RT25PC-AUTH-1) C, through _unsupersede_set as the owner, on the claim's row
+-- taken FOR UPDATE: only a claim the caller may change (_claim_mine); a key with none is refused
+-- alike when the caller does not see its row, and left as it is when it does.
+CREATE FUNCTION phasevec._unsupersede_set(p_watch text, p_key text, p_caller oid, p_sees boolean)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
 DECLARE w phasevec.watches := phasevec._watch(p_watch);
+        own oid := (SELECT c.relowner FROM pg_class c WHERE c.oid = w.source);
+        c phasevec.truth;
 BEGIN
+    PERFORM phasevec._migrated(w.id, p_key);
+    SELECT * INTO c FROM phasevec.truth t WHERE t.watch = w.id AND t.key = p_key FOR UPDATE;
+    IF NOT phasevec._claim_mine(c, p_caller, p_sees, own) THEN
+        PERFORM phasevec._claim_refused(p_watch, p_key, p_caller);
+    END IF;
     UPDATE phasevec.truth t
        SET replaced_by = NULL, reason = NULL,
            verdict = CASE phasevec._claim_state(t.retired_at, t.proof, t.halted)
@@ -750,6 +1007,8 @@ BEGIN
      WHERE t.watch = w.id AND t.key = p_key AND t.verdict = $q$replaced$q$;
 END;
 $f$;
+CREATE OR REPLACE FUNCTION phasevec.unsupersede(p_watch text, p_key text) RETURNS void
+AS $q$MODULE_PATHNAME$q$, $q$phasevec_unsupersede$q$ LANGUAGE C VOLATILE;
 
 -- The internals of verify() and verify_one() (src/phasevec_truth.c). They are not SECURITY DEFINER: they read and
 -- write phasevec.truth, which only the owner can, so they work only when the C functions call them as the owner.
@@ -790,6 +1049,9 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                                 AND t.asserted_for IS DISTINCT FROM s.text_hash AS stale) x
      WHERE t.watch = p_watch AND phasevec._claim_state(t.retired_at, t.proof, t.halted) = $q$judged$q$ AND t.verdict <> $q$replaced$q$
        AND t.asserted_by_oid IS NOT NULL
+       -- (twenty-fifth review, RT25PU-1) not a watch, nor a claim, that 0.19.0 wrote and nothing
+       -- brought to 0.20.0
+       AND phasevec._migrated(p_watch, NULL) AND t.data_version = $q$0.20.0$q$
        -- a stale claim is due once for each text it reads (verify() records that it looked: looked_at,
        -- looked_for), and again for the same text after p_every; any other, when its verdict is older than p_every
        AND CASE WHEN x.stale
@@ -811,7 +1073,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
       FROM phasevec.truth t
       LEFT JOIN pg_catalog.pg_roles r ON r.oid = t.asserted_by_oid AND r.rolname = t.asserted_by
      WHERE t.watch = p_watch AND t.key = p_key AND phasevec._claim_state(t.retired_at, t.proof, t.halted) IN ($q$judged$q$, $q$halted$q$)
-       AND t.verdict <> $q$replaced$q$
+       AND t.verdict <> $q$replaced$q$ AND phasevec._migrated(p_watch, p_key)
 $f$;
 
 -- Record what a proof's run found, only for the claim it judged (p_bind: the same text, proof, author and settings).
@@ -978,12 +1240,10 @@ COMMENT ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) IS
 -- Verdicts reached before 0.20.0 were reached with the verifier's rights and about no claim: a 'verified' is not
 -- carried over (back to unproven, with the reason in last_error). A 'refuted' stays refuted, about the row's text
 -- as it is now (bound after step 9). Their proofs have no author and do not run until asserted again (phasevec.adopt).
-UPDATE phasevec.truth
-   SET verdict = $q$unproven$q$, verified_at = NULL, changed_at = now(),
-       last_error = $q$verified before 0.20.0, with the verifier's rights: not carried over$q$
- WHERE verdict = $q$verified$q$;
 -- The refuted ones are bound to the row's text, and those refute() refuted retired, after step 9 below: bound to the
--- text as this update renders it.
+-- text as this update renders it. (twenty-fifth review, RT25PU-1) All three in
+-- phasevec._migrate_claims(), after step 9: the same function brings the claims of a 0.19.0 dump
+-- restored here (phasevec.migrate()).
 
 -- ------------------------------------------------------------------------------------------ rendering a row --
 -- 8, 9, 13. One way to read a watched row's text: phasevec._render() (C), the recipe as the table's owner in the
@@ -1221,8 +1481,9 @@ BEGIN
             USING HINT = 'Register it with phasevec.reader_register(); nothing is read without a sealed reader.';
     END IF;
 
-    INSERT INTO phasevec.watches (name, source, key_col, recipe, reader, min_coverage, doubt_below)
-    VALUES (p_name, p_source, p_key, p_recipe, rid, p_min_coverage, p_doubt_below)
+    INSERT INTO phasevec.watches (name, source, key_col, recipe, reader, min_coverage, doubt_below,
+                                  data_version)
+    VALUES (p_name, p_source, p_key, p_recipe, rid, p_min_coverage, p_doubt_below, $q$0.20.0$q$)
     RETURNING id INTO wid;
     -- The recipe must be an expression over the row, aliased r; it is read as every reader reads it (0.20.0).
     PERFORM 1 FROM phasevec._render(p_name, ARRAY[]::text[]);
@@ -1298,12 +1559,14 @@ BEGIN
                 -- none), not one that is not committed yet, not phasevec's own.
                 GET STACKED DIAGNOSTICS nsp = SCHEMA_NAME, rel = TABLE_NAME;
                 rel := nullif(rel, $q$$q$);
-                SELECT string_agg(DISTINCT format('%s (%s %s)', l.pid,
+                SELECT string_agg(DISTINCT format('%s (%s %s)',
+                                                  phasevec._update_who(l.pid, l.virtualtransaction),
                                                   CASE WHEN l.granted THEN 'holds' ELSE 'waits for' END,
                                                   l.relation::regclass), ', ')
                   INTO holders
                   FROM pg_locks l
-                 WHERE l.locktype = $q$relation$q$ AND l.mode = $q$AccessExclusiveLock$q$ AND l.pid <> pg_backend_pid()
+                 WHERE l.locktype = $q$relation$q$ AND l.mode = $q$AccessExclusiveLock$q$
+                   AND l.pid IS DISTINCT FROM pg_backend_pid()
                    AND l.database = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
                    AND (l.relation IN (SELECT w.source::oid
                                       UNION ALL SELECT i.indexrelid FROM pg_index i WHERE i.indrelid = w.source
@@ -1320,7 +1583,8 @@ BEGIN
                           DETAIL = format('Sessions holding or waiting to alter a relation: %s. While it holds '
                                           'phasevec''s tables the update waits for no lock on what a watch reads.',
                                           coalesce(holders, 'none any more')),
-                          HINT = 'Run the update again once that transaction has ended (pg_stat_activity).';
+                          HINT = 'Run the update again once that transaction has ended '
+                                 '(pg_stat_activity; a prepared one: pg_prepared_xacts).';
             END IF;
         WHEN OTHERS THEN
             -- (twenty-third review, RT23P-UPD-3) An error of the render that is not the server's (a lock, a deadlock,
@@ -1523,7 +1787,14 @@ AS $q$MODULE_PATHNAME$q$, $q$phasevec_door$q$ LANGUAGE C STABLE;
 -- stays open: it checks its caller itself.
 REVOKE ALL ON FUNCTION phasevec._bind(bytea, text, oid, text[]), phasevec._truth_stale(phasevec.truth),
     phasevec._claim_state(phasevec.truth), phasevec._claim_state(timestamptz, text, boolean),
-    phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[]),
+    phasevec._assert_set(text, text, text, text, jsonb, timestamptz, oid, bytea, text[], oid,
+                         boolean),
+    phasevec._claim_mine(phasevec.truth, oid, boolean, oid),
+    phasevec._claim_refused(text, text, oid),
+    phasevec._migrated(int, text),
+    phasevec._refute_set(text, text, text, oid, boolean),
+    phasevec._supersede_set(text, text, text, text, oid, boolean, boolean),
+    phasevec._unsupersede_set(text, text, oid, boolean),
     phasevec._truth_due(int, int, interval, oid), phasevec._truth_of(int, text),
     phasevec._truth_set(int, text, text, text, bytea, timestamptz, xid), phasevec._truth_halted(int, bytea, bytea, oid, xid),
     phasevec._truth_attempt(int, text), phasevec._truth_tried(int, text, text, boolean, bytea, xid),
@@ -1582,33 +1853,144 @@ BEGIN
 END
 $d$;
 
--- A 'refuted' from before 0.20.0 is about the row's text as it is now: as step 9 noted it, in the pinned settings,
--- the same text every reader renders. (twenty-first review, RT21M-1) Until this review these claims were bound, and
--- retired, before step 9, to the text 0.19.0 had noted in its writer's settings: with a recipe that prints a date, a
--- time or a float on a server whose TimeZone or DateStyle is not the pinned one, step 9 noted every row again, every
--- retired claim then read 'unproven', and brief() and truth_coverage() served what refute() had retired.
-UPDATE phasevec.truth t SET asserted_for = s.text_hash
-  FROM phasevec.sources s
- WHERE s.watch = t.watch AND s.key = t.key
-   AND (t.verdict = $q$refuted$q$ OR (t.verdict = $q$replaced$q$ AND t.last_error IS NOT NULL));
--- (eighteenth review) A claim refute() refuted under 0.19.0 is retired, as refute() retires one now: under 0.19.0
--- refute() left its proof, and after this update adopt() asserted it again and the next verify() served it
--- 'verified' (yggdrasil: every memory deleted before the update came back current). 0.19.0 recorded 'refuted' in two
--- places, and their columns tell them apart: refute() always gave a reason (last_error) and stamped verified_at and
--- changed_at with one now(); verify() recorded a proof's false with no reason, and its error (or NULL) at a
--- verified_at later than the assert that set changed_at. So a refuted claim with a reason judged in the instant it
--- last changed is retired, and so is one with no proof (refute() of a key never asserted). The only claims this
--- retires that refute() did not are those a proof refuted by an error in the transaction that asserted it: the safe
--- side (an assert() judges them again). A replaced claim whose last verdict had a reason (0.19.0 kept last_error
--- through supersede(), and supersede() changed changed_at) cannot tell refute() from a proof's error: it is retired
--- too, and reads 'refuted' if it is ever unsuperseded. What the columns cannot show is a claim refute() refuted and
--- the next verify() then judged 'verified' under 0.19.0: that is a verified claim now (back to 'unproven' above);
--- the application that refuted it refutes it again (yggdrasil: T2c of its procedure).
-UPDATE phasevec.truth t
-   SET proof = NULL, halted = false, retired_at = coalesce(t.verified_at, t.changed_at)
- WHERE (t.verdict = $q$refuted$q$
-        AND (t.proof IS NULL OR (t.last_error IS NOT NULL AND t.verified_at = t.changed_at)))
-    OR (t.verdict = $q$replaced$q$ AND t.last_error IS NOT NULL);
+-- (twenty-fifth review, RT25PU-1) What this update does to the claims 0.19.0 wrote, one watch at a
+-- time, in one function: the update calls it for every watch (below), and phasevec.migrate() for
+-- the watches a pg_dump of 0.19.0 brought in. It changes only rows that say 0.19.0 wrote them, and
+-- says 0.20.0 of each when done; it runs after the watch's rows are noted as 0.20.0 renders them
+-- (step 9 here; migrate() renders them first too). Returns how many claims it brought.
+--  * Verdicts reached before 0.20.0 were reached with the verifier's rights and about no claim: a
+--    'verified' is not carried over (back to unproven, with the reason in last_error). A 'refuted'
+--    stays refuted, about the row's text as it is now. Their proofs have no author and do not run
+--    until asserted again (phasevec.adopt).
+--  * A 'refuted' from before 0.20.0 is about the row's text as it is now: as step 9 noted it, in
+--    the pinned settings, the same text every reader renders. (twenty-first review, RT21M-1) Until
+--    then these claims were bound, and retired, before step 9, to the text 0.19.0 had noted in its
+--    writer's settings: with a recipe that prints a date, a time or a float on a server whose
+--    TimeZone or DateStyle is not the pinned one, step 9 noted every row again, every retired claim
+--    then read 'unproven', and brief() and truth_coverage() served what refute() had retired.
+--  * (eighteenth review) A claim refute() refuted under 0.19.0 is retired, as refute() retires one
+--    now: under 0.19.0 refute() left its proof, and after this update adopt() asserted it again and
+--    the next verify() served it 'verified' (yggdrasil: every memory deleted before the update came
+--    back current). 0.19.0 recorded 'refuted' in two places, and their columns tell them apart:
+--    refute() always gave a reason (last_error) and stamped verified_at and changed_at with one
+--    now(); verify() recorded a proof's false with no reason, and its error (or NULL) at a
+--    verified_at later than the assert that set changed_at. So a refuted claim with a reason judged
+--    in the instant it last changed is retired, and so is one with no proof (refute() of a key
+--    never asserted). The only claims this retires that refute() did not are those a proof refuted
+--    by an error in the transaction that asserted it: the safe side (an assert() judges them
+--    again). A replaced claim whose last verdict had a reason (0.19.0 kept last_error through
+--    supersede(), and supersede() changed changed_at) cannot tell refute() from a proof's error: it
+--    is retired too, and reads 'refuted' if it is ever unsuperseded. What the columns cannot show
+--    is a claim refute() refuted and the next verify() then judged 'verified' under 0.19.0: that is
+--    a verified claim now (back to 'unproven' above); the application that refuted it refutes it
+--    again (yggdrasil: T2c of its procedure).
+CREATE FUNCTION phasevec._migrate_claims(p_watch int) RETURNS bigint
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE n bigint;
+BEGIN
+    UPDATE phasevec.truth t
+       SET verdict = $q$unproven$q$, verified_at = NULL, changed_at = now(),
+           last_error = $q$verified before 0.20.0, with the verifier's rights: not carried over$q$
+     WHERE t.watch = p_watch AND t.data_version = $q$0.19.0$q$ AND t.verdict = $q$verified$q$;
+    UPDATE phasevec.truth t SET asserted_for = s.text_hash
+      FROM phasevec.sources s
+     WHERE t.watch = p_watch AND t.data_version = $q$0.19.0$q$
+       AND s.watch = t.watch AND s.key = t.key
+       AND (t.verdict = $q$refuted$q$ OR (t.verdict = $q$replaced$q$ AND t.last_error IS NOT NULL));
+    UPDATE phasevec.truth t
+       SET proof = NULL, halted = false, retired_at = coalesce(t.verified_at, t.changed_at)
+     WHERE t.watch = p_watch AND t.data_version = $q$0.19.0$q$
+       AND ((t.verdict = $q$refuted$q$
+             AND (t.proof IS NULL OR (t.last_error IS NOT NULL AND t.verified_at = t.changed_at)))
+            OR (t.verdict = $q$replaced$q$ AND t.last_error IS NOT NULL));
+    UPDATE phasevec.truth t SET data_version = $q$0.20.0$q$
+     WHERE t.watch = p_watch AND t.data_version = $q$0.19.0$q$;
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END;
+$f$;
+REVOKE ALL ON FUNCTION phasevec._migrate_claims(int) FROM PUBLIC;
+DO $d$
+DECLARE
+    w record;
+BEGIN
+    FOR w IN SELECT x.id FROM phasevec.watches x ORDER BY x.id LOOP
+        PERFORM phasevec._migrate_claims(w.id);
+    END LOOP;
+END
+$d$;
+UPDATE phasevec.watches SET data_version = $q$0.20.0$q$;
+
+-- (twenty-fifth review, RT25PU-1) After a pg_dump of a 0.19.0 database is restored where 0.20.0 is
+-- installed, the extension's owner runs this once: every watch whose rows (or some of its claims)
+-- 0.19.0 wrote is brought to 0.20.0, as the update brings it, and named with the claims it brought
+-- and what became of its TRUNCATE trigger ('made', 'there', or 'taken': a trigger of the table's
+-- owner has its name; phasevec.watch_truncate() says what to do). Every watch's table and key are
+-- checked first (a watch 0.20.0 does not read stops it, every one named, nothing changed). Then, a
+-- watch at a time: its table taken in SHARE ROW EXCLUSIVE mode (its writers wait, and it waits for
+-- them, as long as lock_timeout lets it), its TRUNCATE trigger, every row noted again where 0.20.0
+-- renders it otherwise (the rendering of step 9: as the table's owner, in the pinned settings),
+-- then _migrate_claims(). Run it before the database takes writes again, at READ COMMITTED; with
+-- nothing to bring it returns no row. Until it runs, what changes or judges a claim of such a watch
+-- refuses (phasevec._migrated).
+CREATE FUNCTION phasevec.migrate()
+RETURNS TABLE (watch text, claims bigint, truncate_trigger text)
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE
+    w   record;
+    x   record;
+    why text;
+    bad text := $q$$q$;
+BEGIN
+    IF current_setting($q$transaction_isolation$q$) <> $q$read committed$q$ THEN
+        RAISE EXCEPTION 'phasevec: migrate() runs only at READ COMMITTED'
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Call it outside the transaction, or in one at READ COMMITTED.';
+    END IF;
+    FOR w IN SELECT y.id, y.name, y.source, y.key_col FROM phasevec.watches y
+              WHERE y.data_version <> $q$0.20.0$q$
+                 OR EXISTS (SELECT 1 FROM phasevec.truth t
+                             WHERE t.watch = y.id AND t.data_version <> $q$0.20.0$q$)
+              ORDER BY y.id LOOP
+        why := phasevec._key_shape(w.source, w.key_col);
+        IF why IS NOT NULL THEN
+            bad := bad || format(E'\n  watch %s reads %s by %s: %s', w.name, w.source, w.key_col,
+                                 why);
+        END IF;
+    END LOOP;
+    IF bad <> $q$$q$ THEN
+        RAISE EXCEPTION 'phasevec 0.20.0 does not read these watches: nothing was migrated%', bad
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Give each table a PRIMARY KEY or a UNIQUE constraint (not DEFERRABLE) on '
+                         'its key column alone, and take it out of any inheritance tree, or drop '
+                         'the watch (phasevec.watches), then call phasevec.migrate() again. '
+                         'README, Supported configurations.';
+    END IF;
+    FOR w IN SELECT y.id, y.name, y.source FROM phasevec.watches y
+              WHERE y.data_version <> $q$0.20.0$q$
+                 OR EXISTS (SELECT 1 FROM phasevec.truth t
+                             WHERE t.watch = y.id AND t.data_version <> $q$0.20.0$q$)
+              ORDER BY y.id LOOP
+        EXECUTE format($q$LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE$q$, w.source);
+        watch := w.name;
+        truncate_trigger := phasevec._truncate_trigger(w.id, true);
+        FOR x IN SELECT r.key, r.body, r.text_hash FROM phasevec._render(w.name, NULL) r
+                   JOIN phasevec.sources s ON s.watch = w.id AND s.key = r.key
+                  WHERE s.text_hash IS DISTINCT FROM r.text_hash LOOP
+            PERFORM phasevec._note_set(w.id, x.key, x.text_hash, x.body);
+        END LOOP;
+        claims := phasevec._migrate_claims(w.id);
+        UPDATE phasevec.watches y SET data_version = $q$0.20.0$q$ WHERE y.id = w.id;
+        RETURN NEXT;
+    END LOOP;
+END;
+$f$;
+REVOKE ALL ON FUNCTION phasevec.migrate() FROM PUBLIC;
+COMMENT ON FUNCTION phasevec.migrate() IS
+    'Brings to 0.20.0 what a pg_dump of a 0.19.0 database restored here brought in, as the update '
+    'would have (0.20.0, twenty-fifth review): a refute()d claim retired, a ''verified'' one not '
+    'carried over, the rows rendered again, each watch''s TRUNCATE trigger. One row per watch it '
+    'brought. Run once after the restore, before the database takes writes. The owner''s.';
 
 -- (twelfth review) Freshness is judged at the moment of reading, in every read path: what hides an expired claim
 -- from find(), find_hybrid(), find_npu(), find_ivf(), the replacement chain and the recall measure compared
@@ -1678,3 +2060,4 @@ DROP FUNCTION phasevec._update_lock_timeout();
 DROP FUNCTION phasevec._update_deadlock_timeout();
 DROP FUNCTION phasevec._update_dependents();
 DROP FUNCTION phasevec._update_routine(oid);
+DROP FUNCTION phasevec._update_who(int, text);

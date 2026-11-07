@@ -181,6 +181,9 @@ esac
 
 # 2. Another author asserts the same proof while it runs as the first one: session B holds the gate until the proof
 # waits at it and session C's assert waits for the claim's row (the proof's worker holds it while it judges).
+# (twenty-fifth review) A claim is its author's: the other author is the table's owner, the one role besides the
+# author's that may assert over it, and has none of the first author's rights.
+"$PG/psql" "${P[@]}" -c "ALTER TABLE notes OWNER TO pv_race_low" >/dev/null
 "$PG/psql" "${P[@]}" >/dev/null <<'SQL' &
 DO $$ BEGIN
     WHILE NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 81 AND NOT granted) LOOP
@@ -219,6 +222,7 @@ esac
 own=$("$PG/psql" "${P[@]}" -c "SELECT phasevec.verify_one('notes', '1', 10000)")
 echo "author race: verified as its new author: $own"
 [ "$own" = "refuted" ] || { echo "not ok - the claim of the low author was not judged with its own rights"; fallas=1; }
+"$PG/psql" "${P[@]}" -c "ALTER TABLE notes OWNER TO CURRENT_USER" >/dev/null
 
 # 3. Session B holds the gate; session A verifies, and the session its proof runs in ends inside it.
 hold_until_ended 91 | "$PG/psql" "${P[@]}" >/dev/null &
