@@ -18,6 +18,12 @@
 #    it, while the update holds phasevec's tables: the update stops, named, nothing changed, and that transaction
 #    commits; the update then goes through. In the first cut of this review the update read the table's shape under a
 #    reader's lock it waited for, and the deadlock detector aborted the other transaction.
+# 5. (twenty-first review, RT21P-UPD-1, RT21P-UPD-2) The same with a lock the table's own lock does not show: a REINDEX
+#    of the key's index, an ALTER TABLE of a table the recipe reads in a subquery, a LOCK TABLE of a table the recipe
+#    reads through a function of its own. Once it holds phasevec's tables the update waits for no lock: it stops,
+#    named, nothing changed, and that transaction commits. In the twentieth review's second cut only the watched
+#    table was taken with NOWAIT; the update then waited for the index or the recipe's table, and the deadlock
+#    detector aborted the other transaction (the update went on to 0.20.0).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -40,19 +46,23 @@ pause() { python3 -I -c "import time, sys; time.sleep(float(sys.argv[1]))" "$1";
 fallas=0
 ok() { echo "ok - $1"; }
 nok() { echo "not ok - $1"; fallas=1; }
+# $1: the recipe of hallazgos (r.body if not given); side and side_label() are what a recipe may read beyond its row
 fresh() {
     ln -sfn "$W/v019/pg_phasevec.so" "$W/lib/pg_phasevec.so"
     "$PG/dropdb" -h "$SOCK" -p "$PORT" --if-exists pv_uw 2>/dev/null
     "$PG/createdb" -h "$SOCK" -p "$PORT" pv_uw
-    q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+    q -v ON_ERROR_STOP=1 -v recipe="${1:-r.body}" >/dev/null <<'SQL'
 CREATE EXTENSION pg_phasevec VERSION '0.19.0';
 SELECT phasevec.reader_register('r1', repeat('a', 64), 4);
 CREATE TABLE notas (id int PRIMARY KEY, body text);
 CREATE TABLE hallazgos (id int PRIMARY KEY, body text);
+CREATE TABLE side (id int PRIMARY KEY, label text);
 INSERT INTO notas SELECT g, 'n' || g FROM generate_series(1, 20) g;
 INSERT INTO hallazgos SELECT g, 'h' || g FROM generate_series(1, 20) g;
+INSERT INTO side SELECT g, 's' || g FROM generate_series(1, 20) g;
+CREATE FUNCTION side_label(int) RETURNS text LANGUAGE sql STABLE AS 'SELECT s.label FROM public.side s WHERE s.id = $1';
 SELECT phasevec.watch('notas', 'notas'::regclass, 'id', 'r.body', 'r1');
-SELECT phasevec.watch('hallazgos', 'hallazgos'::regclass, 'id', 'r.body', 'r1');
+SELECT phasevec.watch('hallazgos', 'hallazgos'::regclass, 'id', :'recipe', 'r1');
 SQL
 }
 version() { q -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec'"; }
@@ -131,9 +141,15 @@ else
     nok "read then write: writer '$(tr '\n' ' ' <"$W/rw.out")', update '${up:0:200}', version $(version)"
 fi
 
-# 4. a transaction that alters a watched table, then writes it
-for ddl in "ALTER TABLE hallazgos ADD COLUMN x int" "TRUNCATE hallazgos"; do
-    fresh
+# 4. a transaction that alters a watched table, then writes it; 5. one that locks what the update reads beyond the
+#    table's own lock (its key's index, a table its recipe reads directly or through a function), then writes it
+recipes=("r.body" "r.body" "r.body" "r.body || coalesce((SELECT s.label FROM public.side s WHERE s.id = r.id), '')"
+         "r.body || coalesce(public.side_label(r.id), '')")
+ddls=("ALTER TABLE hallazgos ADD COLUMN x int" "TRUNCATE hallazgos" "REINDEX INDEX hallazgos_pkey"
+      "ALTER TABLE side ADD COLUMN extra int" "LOCK TABLE side IN ACCESS EXCLUSIVE MODE")
+for i in "${!ddls[@]}"; do
+    ddl=${ddls[$i]}
+    fresh "${recipes[$i]}"
     q >"$W/ddl.out" 2>&1 <<SQL &
 BEGIN;
 $ddl;
@@ -149,12 +165,12 @@ SQL
     ver=$(version)
     wait $dw
     again=$(PGOPTIONS="$PGOPTIONS -c statement_timeout=20s" q -c "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" 2>&1)
-    if [ "$ver" = "0.19.0" ] && echo "$up" | grep -q "being altered by another session" \
+    if [ "$ver" = "0.19.0" ] && echo "$up" | grep -q "locked by another session: nothing was changed" \
        && ! grep -q -i "error\|deadlock" "$W/ddl.out" && [ "$(q -c "SELECT count(*) FROM hallazgos WHERE id = 100")" = "1" ] \
        && [ "$(version)" = "0.20.0" ] && [ -z "$(echo "$again" | grep -i 'error')" ]; then
-        ok "${ddl%% *} of a watched table, then a write, during the update: the update stops named, that transaction commits"
+        ok "$ddl (recipe ${recipes[$i]}), then a write, during the update: the update stops named, that transaction commits"
     else
-        nok "${ddl%% *} then write: writer '$(tr '\n' ' ' <"$W/ddl.out")', update '${up:0:200}' at $ver, again '${again:0:200}'"
+        nok "$ddl (recipe ${recipes[$i]}) then write: writer '$(tr '\n' ' ' <"$W/ddl.out")', update '${up:0:200}' at $ver, again '${again:0:200}'"
     fi
 done
 exit $fallas
