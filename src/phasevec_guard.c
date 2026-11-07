@@ -1187,21 +1187,59 @@ guard_leave(Guard *g)
 	}
 }
 
+/*
+ * An error out of code phasevec ran, as it leaves the guards it went through. (twenty-third review, RT23P-UPD-3) Out
+ * of a recipe, the codes that are not a recipe's own (guard_error_not_its_own) are the server's: a recipe's own RAISE
+ * of one (55P03, 40001, 57014, ...) comes out as its own error (P0001, its code in the DETAIL), and an error of its own
+ * that it raised after it caught one of the server's comes out as that one (as guard_leave does when it returns).
+ * Until this review a recipe that raised 55P03 was retried by the update as a lock failure and blamed on "another
+ * session", and one that caught the update's lock failure and raised an error of its own stopped the update as if
+ * its rows could not be rendered.
+ */
 ErrorData *
 guard_catch(int mark, MemoryContext cxt)
 {
 	ErrorData  *e;
 	Oid			awaited = InvalidOid;
+	int			foreign = 0;
+	bool		render = false;
 
 	MemoryContextSwitchTo(cxt);
 	e = CopyErrorData();
 	FlushErrorState();
-	for (int i = guard_depth - 1; i >= mark && i >= 0 && !OidIsValid(awaited); i--)
+	for (int i = guard_depth - 1; i >= mark && i >= 0; i--)
 		if (levels[i].render)
-			awaited = levels[i].awaited;
+		{
+			render = true;
+			if (!OidIsValid(awaited))
+				awaited = levels[i].awaited;
+			if (foreign == 0)
+				foreign = levels[i].foreign;
+		}
 	while (guard_depth > mark)
 		unwind_one();
 	MemoryContextSwitchTo(cxt);
+	if (render && foreign != 0 && !guard_error_not_its_own(e->sqlerrcode))
+	{
+		e->message = psprintf("phasevec: the recipe caught an error that was not its own (SQLSTATE %s), then raised "
+							  "one of its own: %s", unpack_sql_state(foreign), e->message ? e->message : "");
+		e->detail = pstrdup("A lock another session holds, a cancel, or the server short of a resource ends a render "
+							"even when the recipe, or a function it calls, catches it: phasevec notes, serves and "
+							"judges no text rendered past such an error.");
+		e->hint = pstrdup("Run it again when that has passed.");
+		e->sqlerrcode = foreign;
+	}
+	else if (render && foreign == 0 && guard_error_not_its_own(e->sqlerrcode) &&
+			 e->funcname != NULL && strcmp(e->funcname, "exec_stmt_raise") == 0)
+	{
+		char	   *note = psprintf("The recipe raised it itself with SQLSTATE %s, a code phasevec keeps for the "
+									"server's own errors (a lock another session holds, a deadlock, a cancel, the "
+									"server short of a resource): it is the recipe's own error.",
+									unpack_sql_state(e->sqlerrcode));
+
+		e->detail = e->detail ? psprintf("%s\n%s", e->detail, note) : note;
+		e->sqlerrcode = ERRCODE_RAISE_EXCEPTION;
+	}
 	/* a lock failure in a recipe, caught or not: the relation it waited for (twenty-second review) */
 	if (e->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE && e->table_name == NULL)
 	{
