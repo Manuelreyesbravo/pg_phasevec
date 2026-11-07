@@ -37,6 +37,12 @@
  *   view, type, domain or operator did. (A proof's own session has none.)
  * - Nothing it keeps outlives what it was kept for: a guard and a pin (the settings and cursors a call reads once)
  *   end with their subtransaction and with their transaction, however they end (guard_subxact, guard_xact).
+ * - (twenty-second review, RT22P-UPD-1) A recipe renders a row's text, or nothing. An error that is not the recipe's
+ *   own (guard_error_not_its_own: a lock another session holds, a deadlock, a cancel, the server short of a resource)
+ *   raised while it renders ends the render with that error, even when the recipe, or a function it calls, caught it
+ *   (an EXCEPTION clause) and went on to return a text of its own (guard_saw_error, guard_leave). That text is no
+ *   reader's: until this review the update to 0.20.0, which reads under a lock_timeout of 1 ms, noted it for every
+ *   row, and bound to it the claims it retired.
  */
 #include "postgres.h"
 
@@ -58,6 +64,7 @@
 #include "catalog/pg_ts_dict.h"
 #include "access/genam.h"
 #include "access/table.h"
+#include "storage/lock.h"
 #include "utils/fmgroids.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -116,6 +123,10 @@ typedef struct Level
 	MemoryContext subcxt;		/* its CurTransactionContext */
 	List	   *started;		/* the queries begun inside it */
 	int			frozen_base;	/* its frozen cursors start here */
+	bool		render;			/* a recipe (GUARD_RENDER): seen below is pushed */
+	ErrorContextCallback seen;	/* guard_saw_error, on error_context_stack while the recipe runs */
+	int			foreign;		/* the first error not the recipe's own raised inside it (0: none) */
+	Oid			awaited;		/* the relation of the lock it was waiting for then, if it was a lock failure */
 } Level;
 
 static Level levels[GUARD_MAX];
@@ -892,6 +903,114 @@ thaw_to(int base)
 	}
 }
 
+/* ------------------------------------------------------------------------- errors not the code's own -- */
+
+/*
+ * (eleventh review) The classes of an error that come from the server or from other sessions, not from what the code
+ * computes: a connection (08), a transaction rolled back (40: serialization, deadlock), a resource of the server (53:
+ * out of shared memory, out of memory, disk full), an operator's intervention (57: shutdown, cancel), a system error
+ * (58), the configuration file (F0), a foreign-data wrapper (HV), an internal error (XX), and a lock another session
+ * holds (55P03). For a proof (not_a_verdict, phasevec_truth.c) such an error is no verdict; for a recipe, no text.
+ */
+bool
+guard_error_not_its_own(int sqlerrcode)
+{
+	if (sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
+		return true;
+	switch (ERRCODE_TO_CATEGORY(sqlerrcode))
+	{
+		case ERRCODE_CONNECTION_EXCEPTION:
+		case ERRCODE_TRANSACTION_ROLLBACK:
+		case ERRCODE_INSUFFICIENT_RESOURCES:
+		case ERRCODE_OPERATOR_INTERVENTION:
+		case ERRCODE_SYSTEM_ERROR:
+		case ERRCODE_CONFIG_FILE_ERROR:
+		case ERRCODE_FDW_ERROR:
+		case ERRCODE_INTERNAL_ERROR:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * The relation of a lock wait in an error's context, as the server describes it there ("relation %u of database
+ * %u", in the server's language: DescribeLockTag): InvalidOid when the context names none of this database.
+ */
+static Oid
+awaited_in(const char *context)
+{
+	const char *fmt = _("relation %u of database %u");
+	const char *cut = strstr(fmt, "%u");
+	const char *p = context;
+	char	   *prefix;
+
+	if (cut == NULL || cut == fmt)
+		return InvalidOid;
+	prefix = pnstrdup(fmt, cut - fmt);
+	while ((p = strstr(p, prefix)) != NULL)
+	{
+		unsigned int rel;
+		unsigned int db;
+
+		if (sscanf(p, fmt, &rel, &db) == 2 && (Oid) db == MyDatabaseId)
+			return (Oid) rel;
+		p++;
+	}
+	return InvalidOid;
+}
+
+static MemoryContext seen_cxt = NULL;
+
+/*
+ * (twenty-second review, RT22P-UPD-1) On error_context_stack while a recipe runs: errfinish() calls it for every
+ * message raised below it, before any handler sees it, so an error the recipe catches is seen too. It notes the
+ * first ERROR that is not the recipe's own (guard_error_not_its_own; a RAISE of the recipe's own code is its own, as
+ * for a proof: not_a_verdict), and for a lock failure the relation the wait was for, which the server's own context
+ * line names (the wait is over by now: GetAwaitedLock() is NULL; PostgreSQL 18 has no such line, and the relation
+ * goes unnamed there). What it notes is acted on when the guard is left
+ * (guard_leave, guard_catch). A copy of the error is read in a context of its own, except for a server short of a
+ * resource (53), which is taken by its code alone (a copy could fail the same way): a message of that class only
+ * logged also ends the render, the safe side.
+ */
+static void
+guard_saw_error(void *arg)
+{
+	Level	   *L = (Level *) arg;
+	int			code = geterrcode();
+
+	if (L->foreign != 0 || !guard_error_not_its_own(code))
+		return;
+	if (ERRCODE_TO_CATEGORY(code) != ERRCODE_INSUFFICIENT_RESOURCES)
+	{
+		MemoryContext o;
+		ErrorData  *e;
+		bool		counts;
+
+		if (seen_cxt == NULL)
+			seen_cxt = AllocSetContextCreate(TopMemoryContext, "phasevec guard errors", ALLOCSET_SMALL_SIZES);
+		o = MemoryContextSwitchTo(seen_cxt);
+		e = CopyErrorData();
+		counts = e->elevel >= ERROR && !(e->funcname != NULL && strcmp(e->funcname, "exec_stmt_raise") == 0);
+		if (counts && code == ERRCODE_LOCK_NOT_AVAILABLE && e->context != NULL)
+			L->awaited = awaited_in(e->context);
+		MemoryContextSwitchTo(o);
+		MemoryContextReset(seen_cxt);
+		if (!counts)
+			return;
+	}
+	L->foreign = code;
+}
+
+/* The schema and name of the relation a render was waiting for when its lock failed (false: none, or gone). */
+static bool
+awaited_names(Oid relid, char **nsp, char **rel)
+{
+	*rel = OidIsValid(relid) ? get_rel_name(relid) : NULL;
+	*nsp = *rel ? get_namespace_name(get_rel_namespace(relid)) : NULL;
+	return *rel != NULL && *nsp != NULL;
+}
+
 /* ----------------------------------------------------------------------------------- entering, leaving -- */
 
 void
@@ -920,6 +1039,9 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 	L->subcxt = CurTransactionContext;
 	L->started = NIL;
 	L->frozen_base = nfrozen;
+	L->render = false;
+	L->foreign = 0;
+	L->awaited = InvalidOid;
 	g->level = guard_depth;
 	guard_depth++;
 	MemoryContextSwitchTo(cxt);
@@ -978,6 +1100,33 @@ guard_enter(Guard *g, Oid role, GuardMode mode, const GuardEnv *env)
 	(void) set_config_option("transaction_read_only", "on", PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_LOCAL, true, 0, false);
 	freeze_portals(portals);
+	if (mode == GUARD_RENDER)
+	{
+		L->seen.callback = guard_saw_error;
+		L->seen.arg = L;
+		L->seen.previous = error_context_stack;
+		error_context_stack = &L->seen;
+		L->render = true;
+	}
+}
+
+/*
+ * A recipe's guard is closed: guard_saw_error leaves error_context_stack. On top when phasevec leaves the guard
+ * itself; after an error, the PG_CATCH that caught it has already put back the stack of its PG_TRY, from before the
+ * guard, and it is no longer there. It is looked for all the same, and unlinked wherever it is.
+ */
+static void
+drop_seen(Level *L)
+{
+	if (!L->render)
+		return;
+	L->render = false;
+	for (ErrorContextCallback **at = &error_context_stack; *at != NULL; at = &(*at)->previous)
+		if (*at == &L->seen)
+		{
+			*at = L->seen.previous;
+			break;
+		}
 }
 
 /* Roll back the innermost guard: its subtransaction (and any left inside it), its cursors thawed. */
@@ -986,6 +1135,7 @@ unwind_one(void)
 {
 	Level	   *L = &levels[--guard_depth];
 
+	drop_seen(L);
 	thaw_to(L->frozen_base);
 	/* off the stack first: guard_subxact sees the rollback of a guard no longer open */
 	while (IsSubTransaction() && GetCurrentSubTransactionId() >= L->subid)
@@ -998,22 +1148,72 @@ unwind_one(void)
 void
 guard_leave(Guard *g)
 {
+	Level	   *L;
+	int			foreign;
+	Oid			awaited;
+
 	if (g->level != guard_depth - 1 || GetCurrentSubTransactionId() != levels[g->level].subid)
 		elog(ERROR, "phasevec: a guard left out of order");
+	L = &levels[g->level];
+	foreign = L->render ? L->foreign : 0;
+	awaited = L->awaited;
 	unwind_one();
+
+	/*
+	 * (twenty-second review, RT22P-UPD-1) The recipe ran to its end, but an error not its own was raised inside it and
+	 * caught there: what it returned is not the row's text. The error it caught is raised again, with its code (a
+	 * lock_not_available is retried by the update's step, phasevec._update_step, as one the recipe did not catch).
+	 */
+	if (foreign != 0)
+	{
+		char	   *nsp;
+		char	   *rel;
+		bool		named = awaited_names(awaited, &nsp, &rel);
+
+		ereport(ERROR,
+				(errcode(foreign),
+				 errmsg("phasevec: the recipe caught an error that was not its own (SQLSTATE %s): what it rendered "
+						"then is not the row's text", unpack_sql_state(foreign)),
+				 named ? errdetail("It was waiting for a lock on %s.%s. A lock another session holds, a cancel, or "
+								   "the server short of a resource ends a render even when the recipe, or a function "
+								   "it calls, catches it: phasevec notes, serves and judges no text rendered past such "
+								   "an error.", nsp, rel) :
+				 errdetail("A lock another session holds, a cancel, or the server short of a resource ends a render "
+						   "even when the recipe, or a function it calls, catches it: phasevec notes, serves and "
+						   "judges no text rendered past such an error."),
+				 named ? err_generic_string(PG_DIAG_SCHEMA_NAME, nsp) : 0,
+				 named ? err_generic_string(PG_DIAG_TABLE_NAME, rel) : 0,
+				 errhint("Run it again when that has passed.")));
+	}
 }
 
 ErrorData *
 guard_catch(int mark, MemoryContext cxt)
 {
 	ErrorData  *e;
+	Oid			awaited = InvalidOid;
 
 	MemoryContextSwitchTo(cxt);
 	e = CopyErrorData();
 	FlushErrorState();
+	for (int i = guard_depth - 1; i >= mark && i >= 0 && !OidIsValid(awaited); i--)
+		if (levels[i].render)
+			awaited = levels[i].awaited;
 	while (guard_depth > mark)
 		unwind_one();
 	MemoryContextSwitchTo(cxt);
+	/* a lock failure in a recipe, caught or not: the relation it waited for (twenty-second review) */
+	if (e->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE && e->table_name == NULL)
+	{
+		char	   *nsp;
+		char	   *rel;
+
+		if (awaited_names(awaited, &nsp, &rel))
+		{
+			e->schema_name = nsp;
+			e->table_name = rel;
+		}
+	}
 	return e;
 }
 
@@ -1058,6 +1258,7 @@ guard_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 		pop_pin();
 	while (guard_depth > 0 && levels[guard_depth - 1].subid >= mySubid)
 	{
+		drop_seen(&levels[guard_depth - 1]);
 		thaw_to(levels[guard_depth - 1].frozen_base);
 		guard_depth--;
 	}

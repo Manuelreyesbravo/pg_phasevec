@@ -50,6 +50,13 @@ extern void guard_leave(Guard *g);
 extern int	guard_mark(void);
 extern ErrorData *guard_catch(int mark, MemoryContext cxt);
 
+/*
+ * An error that comes from the server or another session, not from what the code computes (eleventh review). A
+ * proof that ends in one is not judged; a recipe in which one is raised renders no text, even if it catches it
+ * (twenty-second review): guard_leave() raises it again.
+ */
+extern bool guard_error_not_its_own(int sqlerrcode);
+
 /* Settings only (no identity, no read-only): the pinned ones for a whole call, in a nest level of their own. */
 extern int	guard_pin_settings(void);
 extern void guard_unpin_settings(int nest);

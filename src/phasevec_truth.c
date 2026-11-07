@@ -1117,22 +1117,7 @@ not_a_verdict(const ErrorData *e)
 {
 	if (e->funcname != NULL && strcmp(e->funcname, "exec_stmt_raise") == 0)
 		return false;
-	if (e->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
-		return true;
-	switch (ERRCODE_TO_CATEGORY(e->sqlerrcode))
-	{
-		case ERRCODE_CONNECTION_EXCEPTION:
-		case ERRCODE_TRANSACTION_ROLLBACK:
-		case ERRCODE_INSUFFICIENT_RESOURCES:
-		case ERRCODE_OPERATOR_INTERVENTION:
-		case ERRCODE_SYSTEM_ERROR:
-		case ERRCODE_CONFIG_FILE_ERROR:
-		case ERRCODE_FDW_ERROR:
-		case ERRCODE_INTERNAL_ERROR:
-			return true;
-		default:
-			return false;
-	}
+	return guard_error_not_its_own(e->sqlerrcode);
 }
 
 /*

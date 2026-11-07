@@ -24,6 +24,15 @@
 #    named, nothing changed, and that transaction commits. In the twentieth review's second cut only the watched
 #    table was taken with NOWAIT; the update then waited for the index or the recipe's table, and the deadlock
 #    detector aborted the other transaction (the update went on to 0.20.0).
+# 6. (twenty-second review, RT22P-UPD-1) A recipe that reads a table through a function that catches every error and
+#    returns a fallback text, while another session holds that table: the update stops, named, nothing changed, and
+#    the message names the table the step waited for and not a table locked apart. Once the lock is gone the update
+#    goes through, every row is noted as _render() renders it, and a refuted claim stays refuted after a write that
+#    changes nothing. In the twenty-first review's cut the 1 ms lock_timeout of the update's step raised inside the
+#    function, which caught it: the update noted the fallback text for every row, bound the refuted claims to it, and
+#    the first write of such a row brought it back to brief() as 'unproven'.
+# 7. The same recipe after the update, for a writer with a lock_timeout of its own: the write fails with
+#    lock_not_available and notes nothing; before, it noted the fallback text as the row's.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -61,6 +70,16 @@ INSERT INTO notas SELECT g, 'n' || g FROM generate_series(1, 20) g;
 INSERT INTO hallazgos SELECT g, 'h' || g FROM generate_series(1, 20) g;
 INSERT INTO side SELECT g, 's' || g FROM generate_series(1, 20) g;
 CREATE FUNCTION side_label(int) RETURNS text LANGUAGE sql STABLE AS 'SELECT s.label FROM public.side s WHERE s.id = $1';
+CREATE FUNCTION side_label_or(int) RETURNS text LANGUAGE plpgsql STABLE AS $f$
+DECLARE l text;
+BEGIN
+    SELECT s.label INTO l FROM public.side s WHERE s.id = $1;
+    RETURN l;
+EXCEPTION WHEN OTHERS THEN
+    RETURN '(label unavailable)';
+END
+$f$;
+CREATE TABLE apart (id int);
 SELECT phasevec.watch('notas', 'notas'::regclass, 'id', 'r.body', 'r1');
 SELECT phasevec.watch('hallazgos', 'hallazgos'::regclass, 'id', :'recipe', 'r1');
 SQL
@@ -173,4 +192,74 @@ SQL
         nok "$ddl (recipe ${recipes[$i]}) then write: writer '$(tr '\n' ' ' <"$W/ddl.out")', update '${up:0:200}' at $ver, again '${again:0:200}'"
     fi
 done
+# 6. a recipe that catches the update's lock failure (RT22P-UPD-1)
+fresh "r.body || ' / ' || public.side_label_or(r.id)"
+q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+SELECT phasevec.assert('hallazgos', '1', 'SELECT true');
+SELECT phasevec.assert('hallazgos', '2', 'SELECT true');
+SELECT phasevec.refute('hallazgos', '1', 'deleted');
+SELECT phasevec.refute('hallazgos', '3', 'deleted');
+SQL
+q >"$W/lk.out" 2>&1 <<'SQL' &
+BEGIN;
+LOCK TABLE side IN ACCESS EXCLUSIVE MODE;
+SELECT pg_sleep(2);
+COMMIT;
+SQL
+lk=$!
+q >/dev/null 2>&1 <<'SQL' &
+BEGIN;
+LOCK TABLE apart IN ACCESS EXCLUSIVE MODE;
+SELECT pg_sleep(3);
+COMMIT;
+SQL
+ap=$!
+pause 0.5
+ln -sfn "$PWD/pg_phasevec.so" "$W/lib/pg_phasevec.so"
+up=$(PGOPTIONS="$PGOPTIONS -c statement_timeout=20s" q -c "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" 2>&1)
+ver=$(version)
+wait $lk $ap
+again=$(PGOPTIONS="$PGOPTIONS -c statement_timeout=20s" q -c "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" 2>&1)
+# PostgreSQL 18 gives no context for a lock wait: the guard cannot name the table, and the message lists the
+# relations a recipe could read (the one apart too)
+apart_named=no
+[ "$(q -c "SELECT current_setting('server_version_num')::int >= 190000")" = "t" ] || apart_named=n/a
+[ "$apart_named" = "no" ] && echo "$up" | grep "^DETAIL" | grep -q "apart" && apart_named=yes
+off=$(q -c "SELECT count(*) FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch AND w.name = 'hallazgos'
+             LEFT JOIN phasevec._render('hallazgos', NULL) r ON r.key = s.key
+            WHERE s.text_hash IS DISTINCT FROM r.text_hash" 2>&1)
+q -c "UPDATE hallazgos SET body = body WHERE id IN (1, 3)" >/dev/null 2>&1
+verdicts=$(q -c "SELECT string_agg(t.key || ':' || phasevec._verdict(t), ',' ORDER BY t.key) FROM phasevec.truth t
+                  WHERE t.key IN ('1', '3')" 2>&1)
+briefed=$(q -c "SELECT count(*) FROM phasevec.brief('hallazgos', 100000) WHERE key IN ('1', '3')" 2>&1)
+if [ "$ver" = "0.19.0" ] && echo "$up" | grep -q "locked by another session: nothing was changed" \
+   && echo "$up" | grep "^DETAIL" | grep -q "side" && [ "$apart_named" != "yes" ] \
+   && [ "$(version)" = "0.20.0" ] && [ -z "$(echo "$again" | grep -i 'error')" ] && [ "$off" = "0" ] \
+   && [ "$verdicts" = "1:refuted,3:refuted" ] && [ "$briefed" = "0" ]; then
+    ok "a recipe that catches the update's lock failure: the update stops named (the table it waited for; one locked apart: $apart_named), then notes the rows as rendered; refuted claims stay retired"
+else
+    nok "recipe catching the lock failure: update at $ver '${up:0:300}', again '${again:0:200}', apart named $apart_named, rows off $off, verdicts '$verdicts', in brief $briefed"
+fi
+
+# 7. the same recipe, a writer with a lock_timeout of its own, after the update
+q >/dev/null 2>&1 <<'SQL' &
+BEGIN;
+LOCK TABLE side IN ACCESS EXCLUSIVE MODE;
+SELECT pg_sleep(2);
+COMMIT;
+SQL
+lk=$!
+pause 0.5
+before=$(q -c "SELECT encode(s.text_hash, 'hex') FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch
+                WHERE w.name = 'hallazgos' AND s.key = '2'")
+wr=$(PGOPTIONS="$PGOPTIONS -c lock_timeout=100ms" q -c "UPDATE hallazgos SET body = 'h2 again' WHERE id = 2" 2>&1)
+wait $lk
+after=$(q -c "SELECT encode(s.text_hash, 'hex') FROM phasevec.sources s JOIN phasevec.watches w ON w.id = s.watch
+               WHERE w.name = 'hallazgos' AND s.key = '2'")
+body=$(q -c "SELECT body FROM hallazgos WHERE id = 2")
+if echo "$wr" | grep -q "ERROR" && echo "$wr" | grep -q "not its own" && [ "$before" = "$after" ] && [ "$body" = "h2" ]; then
+    ok "a write whose recipe caught a lock failure fails and notes nothing"
+else
+    nok "write with a recipe that caught a lock failure: '${wr:0:300}', noted $before -> $after, body '$body'"
+fi
 exit $fallas

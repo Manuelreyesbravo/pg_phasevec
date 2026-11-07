@@ -1061,12 +1061,18 @@ $f$;
 -- nothing changed. The steps: 'shape' (_key_shape, its answer), 'trigger' (the TRUNCATE trigger with its own NOWAIT,
 -- _truncate_trigger's answer), 'render' (every row noted again where its text reads otherwise now). The rest of the
 -- update writes only phasevec's own tables, which it holds, and the system catalogs. Dropped at the end of this script.
+-- (twenty-second review, RT22P-UPD-1) A recipe that reads through a function of its own with an EXCEPTION clause
+-- caught the lock failure and rendered its fallback text: the step noted it for every row, and the claims retired
+-- below were bound to it. phasevec's guard now ends a render in which such an error was raised, caught or not
+-- (src/phasevec_guard.c, guard_leave), with the error's code: here it is retried like any other lock failure.
 CREATE FUNCTION phasevec._update_step(p_watch int, p_step text) RETURNS text
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp SET lock_timeout = '1ms' AS $f$
 DECLARE
     w       record;
     x       record;
     holders text;
+    nsp     text;
+    rel     text;
 BEGIN
     SELECT y.name, y.source, y.key_col INTO w FROM phasevec.watches y WHERE y.id = p_watch;
     FOR attempt IN 1..5 LOOP
@@ -1086,13 +1092,30 @@ BEGIN
             IF attempt < 5 THEN
                 PERFORM pg_sleep(0.02 * 2 ^ (attempt - 1));
             ELSE
+                -- (twenty-second review) Only what this step reads: the relation whose lock it waited for (the
+                -- error's table: phasevec's guard names it, caught by the recipe or not), the watched table, its
+                -- indexes and its TOAST table. Until this review every AccessExclusiveLock in the database was listed.
+                -- When the error names no table (PostgreSQL 18 gives no context for a lock wait, from which the guard
+                -- reads it), any relation the recipe could read: not another session's temporary one (a recipe uses
+                -- none), not one that is not committed yet, not phasevec's own.
+                GET STACKED DIAGNOSTICS nsp = SCHEMA_NAME, rel = TABLE_NAME;
+                rel := nullif(rel, $q$$q$);
                 SELECT string_agg(DISTINCT format('%s (%s %s)', l.pid,
                                                   CASE WHEN l.granted THEN 'holds' ELSE 'waits for' END,
                                                   l.relation::regclass), ', ')
                   INTO holders
                   FROM pg_locks l
                  WHERE l.locktype = $q$relation$q$ AND l.mode = $q$AccessExclusiveLock$q$ AND l.pid <> pg_backend_pid()
-                   AND l.database = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database());
+                   AND l.database = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
+                   AND (l.relation IN (SELECT w.source::oid
+                                      UNION ALL SELECT i.indexrelid FROM pg_index i WHERE i.indrelid = w.source
+                                      UNION ALL SELECT c.reltoastrelid FROM pg_class c WHERE c.oid = w.source
+                                      UNION ALL SELECT c.oid FROM pg_class c
+                                                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                                                 WHERE n.nspname = nsp AND c.relname = rel)
+                        OR (rel IS NULL AND EXISTS (SELECT 1 FROM pg_class c
+                                                     WHERE c.oid = l.relation AND c.relpersistence <> $q$t$q$
+                                                       AND c.relnamespace <> $q$phasevec$q$::regnamespace)));
                 RAISE EXCEPTION 'phasevec: the update to 0.20.0 found what watch % reads (table %, its indexes, what its '
                                 'recipe reads) locked by another session: nothing was changed', w.name, w.source
                     USING ERRCODE = 'lock_not_available',
