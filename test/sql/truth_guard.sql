@@ -146,6 +146,8 @@ CREATE ROLE pv_g_ops;
 GRANT USAGE ON SCHEMA phasevec TO pv_g_ops;
 GRANT SELECT ON notes TO pv_g_ops;
 GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv_g_ops;
+-- (twenty-sixth review) adopting changes claims: a steward of the watch's adopts
+SELECT phasevec.steward($w$notes$w$, $r$pv_g_ops$r$);
 SET ROLE pv_g_ops;
 SELECT key FROM phasevec.adopt($w$notes$w$, $r$pv_g_author$r$);
 SELECT key, proof, former_author, adopted, note FROM phasevec.adopt($w$notes$w$, $r$pv_g_ops$r$, ARRAY[$k$4$k$]);

@@ -107,7 +107,9 @@ SELECT phasevec.verify_one($w$notes17$w$, $k$7$k$, 5000) AS verify_one_7;
 UPDATE phasevec.truth SET asserted_by_oid = NULL WHERE key IN ($k$7$k$, $k$8$k$);
 SELECT key, adopted FROM phasevec.adopt($w$notes17$w$, $r$pv17_au$r$, ARRAY[$k$7$k$, $k$8$k$]) ORDER BY key;
 SELECT key, verdict, phasevec._verdict(t) FROM phasevec.truth t WHERE key IN ($k$7$k$, $k$8$k$) ORDER BY key;
--- an assert() makes it a claim again
+-- an assert() makes it a claim again: (twenty-sixth review) by a steward of the watch, its author
+-- gone
+SELECT phasevec.steward($w$notes17$w$, $r$pv17_au$r$);
 SET ROLE pv17_au;
 SELECT phasevec.assert($w$notes17$w$, $k$7$k$, $p$true$p$);
 RESET ROLE;

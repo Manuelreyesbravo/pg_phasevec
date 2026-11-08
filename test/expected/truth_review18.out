@@ -94,6 +94,13 @@ GRANT USAGE ON SCHEMA phasevec TO pv18_au;
 GRANT SELECT ON mem18 TO pv18_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz),
                           phasevec.adopt(text, regrole, text[], text[]) TO pv18_au;
+-- (twenty-sixth review) adopting changes claims: a steward of the watch's adopts
+SELECT phasevec.steward($w$mem18$w$, $r$pv18_au$r$);
+ steward 
+---------
+ t
+(1 row)
+
 SET ROLE pv18_au;
 SELECT key, adopted FROM phasevec.adopt($w$mem18$w$, $r$pv18_au$r$) ORDER BY key;
  key | adopted 

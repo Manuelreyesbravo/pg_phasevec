@@ -43,7 +43,9 @@ SELECT * FROM phasevec.truth_coverage($w$mem19$w$) ORDER BY 1;
 -- the name back on its OID: it is that author again
 ALTER ROLE pv19_rn2 RENAME TO pv19_rn;
 SELECT key, phasevec._verdict(t) FROM phasevec.truth t WHERE key = $k$5$k$;
--- an assert() makes key 1 a claim again, of its new author
+-- an assert() makes key 1 a claim again, of its new author: (twenty-sixth review) a steward of the
+-- watch's, as its author is gone (no role that sees the row takes it any more)
+SELECT phasevec.steward($w$mem19$w$, $r$pv19_au$r$);
 GRANT USAGE ON SCHEMA phasevec TO pv19_au;
 GRANT SELECT ON mem19 TO pv19_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv19_au;

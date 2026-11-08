@@ -45,7 +45,7 @@ CREATE EXTENSION pg_phasevec;
 SELECT extversion, array_length(extconfig, 1) AS marked FROM pg_extension WHERE extname = $e$pg_phasevec$e$;
  extversion | marked 
 ------------+--------
- 0.20.0     |     19
+ 0.20.0     |     20
 (1 row)
 
 DROP EXTENSION pg_phasevec;

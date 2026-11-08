@@ -122,7 +122,14 @@ SELECT key, phasevec._verdict(t) FROM phasevec.truth t WHERE key = $k$5$k$;
  5   | verified
 (1 row)
 
--- an assert() makes key 1 a claim again, of its new author
+-- an assert() makes key 1 a claim again, of its new author: (twenty-sixth review) a steward of the
+-- watch's, as its author is gone (no role that sees the row takes it any more)
+SELECT phasevec.steward($w$mem19$w$, $r$pv19_au$r$);
+ steward 
+---------
+ t
+(1 row)
+
 GRANT USAGE ON SCHEMA phasevec TO pv19_au;
 GRANT SELECT ON mem19 TO pv19_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv19_au;

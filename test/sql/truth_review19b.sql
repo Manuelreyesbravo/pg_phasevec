@@ -15,6 +15,8 @@ GRANT USAGE ON SCHEMA phasevec TO pv19b_au, pv19b_mal, pv19b_wr, pv19b_nobody;
 GRANT SELECT ON n19b TO pv19b_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv19b_au;
 GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv19b_au;
+-- (twenty-sixth review) adopting changes claims: a steward of the watch's adopts
+SELECT phasevec.steward($w$n19b$w$, $r$pv19b_au$r$);
 
 -- (a) R19-PRIV-1. The author's SECURITY DEFINER wrapper, hardened (SET search_path), with a fixed proof that names
 -- '>' unqualified. A caller without the author's rights sets its own search_path (its schema first, with an operator

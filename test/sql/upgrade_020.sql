@@ -30,6 +30,8 @@ SELECT count(*) AS run FROM phasevec.verify($w$notes$w$, p_every => interval $i$
 -- adopt() names their author; granted, the author adopts them itself (every proof comes back); then they run as
 -- it, bound
 GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv_up_asker;
+-- (twenty-sixth review) adopting changes claims: the table's owner names the author a steward
+SELECT phasevec.steward($w$notes$w$, $r$pv_up_asker$r$);
 SET ROLE pv_up_asker;
 SELECT key, proof, adopted, note FROM phasevec.adopt($w$notes$w$, $r$pv_up_asker$r$) ORDER BY key;
 RESET ROLE;

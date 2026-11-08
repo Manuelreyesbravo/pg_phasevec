@@ -124,6 +124,10 @@ PG_FUNCTION_INFO_V1(phasevec_adopt);
 PG_FUNCTION_INFO_V1(phasevec_refute);
 PG_FUNCTION_INFO_V1(phasevec_supersede);
 PG_FUNCTION_INFO_V1(phasevec_unsupersede);
+PG_FUNCTION_INFO_V1(phasevec_steward);
+PG_FUNCTION_INFO_V1(phasevec_update_lock_routine);
+PG_FUNCTION_INFO_V1(phasevec_update_lock_routine_now);
+PG_FUNCTION_INFO_V1(phasevec_update_lock_table_now);
 
 static TimeoutId prove_timeout = MAX_TIMEOUTS;
 static volatile sig_atomic_t prove_fired = false;
@@ -4005,13 +4009,15 @@ phasevec_verify_one(PG_FUNCTION_ARGS)
  * proof never verifies until asserted again. SPI connected, as anyone; writes as the owner.
  * (twenty-fifth review, RT25PC-AUTH-1) The author must read the table with no proof too, and the
  * claim the key has is changed only when it is the author's to change (_assert_set, _claim_mine:
- * `sees`, whether the author sees the row). adopt() (`adopting`) decides that itself: it takes only
- * orphans, for an author whose privileges its caller holds.
+ * `sees`, whether the author sees the row). (twenty-sixth review) `caller` is the role whose right
+ * to change the claim is checked: the author for assert(), adopt()'s caller for adopt(), which no
+ * longer skips the check (RT26PA-1). A row is seen only when it exists, with or without row-level
+ * security (RT26PA-2: a key with no row is no one's to claim first).
  */
 static void
-assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool proof_null, Datum topic,
-			 bool topic_null, Datum support, bool support_null, Datum expires, bool expires_null,
-			 ArrayType *env, bool adopting)
+assert_claim(Oid owner, Oid author, Oid caller, Datum watch, Datum key, Datum proof,
+			 bool proof_null, Datum topic, bool topic_null, Datum support, bool support_null,
+			 Datum expires, bool expires_null, ArrayType *env)
 {
 	MemoryContext keep = CurrentMemoryContext;
 	Oid			types[11] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, JSONBOID, TIMESTAMPTZOID, OIDOID,
@@ -4023,12 +4029,14 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 	Target		t;
 	char	   *k = TextDatumGetCString(key);
 	bool		sees;
+	bool		caller_sees_it;
 
 	become(owner, &was);
 	load_target(watch, false, &t, keep);
 	unbecome(&was);
 	must_read(&t, author);
-	sees = !rls_for(&t, author) || key_visible(&t, author, GUARD_READER, NULL, k);
+	sees = key_visible(&t, author, GUARD_READER, NULL, k);
+	caller_sees_it = caller == author ? sees : key_visible(&t, caller, GUARD_READER, NULL, k);
 	if (!proof_null && sees)
 	{
 		char	   *one[1] = {k};
@@ -4052,9 +4060,8 @@ assert_claim(Oid owner, Oid author, Datum watch, Datum key, Datum proof, bool pr
 	values[7] = seen ? PointerGetDatum(seen) : (Datum) 0;
 	nulls[7] = seen ? ' ' : 'n';
 	values[8] = PointerGetDatum(env);
-	values[9] = ObjectIdGetDatum(author);
-	nulls[9] = adopting ? 'n' : ' ';
-	values[10] = BoolGetDatum(sees);
+	values[9] = ObjectIdGetDatum(caller);
+	values[10] = BoolGetDatum(caller_sees_it);
 
 	become(owner, &was);
 	if (SPI_execute_with_args("SELECT phasevec._assert_set($1, $2, $3, $4, $5, $6, $7, $8, $9, "
@@ -4100,12 +4107,12 @@ phasevec_assert(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("phasevec: a claim needs a watch and a key")));
 	spi_connect();
-	assert_claim(owner, author, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
+	assert_claim(owner, author, author, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
 				 PG_ARGISNULL(2) ? (Datum) 0 : PG_GETARG_DATUM(2), PG_ARGISNULL(2),
 				 PG_ARGISNULL(3) ? (Datum) 0 : PG_GETARG_DATUM(3), PG_ARGISNULL(3),
 				 PG_ARGISNULL(4) ? (Datum) 0 : PG_GETARG_DATUM(4), PG_ARGISNULL(4),
 				 PG_ARGISNULL(5) ? (Datum) 0 : PG_GETARG_DATUM(5), PG_ARGISNULL(5),
-				 claim_env(author), false);
+				 claim_env(author));
 	SPI_finish();
 	PG_RETURN_VOID();
 }
@@ -4142,13 +4149,15 @@ claim_door(FunctionCallInfo fcinfo, const char *fn, int nkeys, Target *t, Oid *c
 }
 
 /*
- * Does the caller see the row of this key? (true with no row-level security: it reads the table)
- * SPI connected.
+ * Does the caller see the row of this key? SPI connected. (twenty-sixth review, RT26PA-2) The row
+ * must exist, with or without row-level security: until this review a table with none answered
+ * true for any key, and a reader granted refute() or supersede() claimed keys no row had yet; the
+ * author who then wrote the row was refused.
  */
 static bool
-caller_sees(const Target *t, Oid caller, bool rls, Datum key)
+caller_sees(const Target *t, Oid caller, Datum key)
 {
-	return !rls || key_visible(t, caller, GUARD_READER, NULL, TextDatumGetCString(key));
+	return key_visible(t, caller, GUARD_READER, NULL, TextDatumGetCString(key));
 }
 
 /* Run the owner's SQL for a claim door, then leave SPI. */
@@ -4182,7 +4191,7 @@ phasevec_refute(PG_FUNCTION_ARGS)
 	values[2] = PG_ARGISNULL(2) ? (Datum) 0 : PG_GETARG_DATUM(2);
 	nulls[2] = PG_ARGISNULL(2) ? 'n' : ' ';
 	values[3] = ObjectIdGetDatum(caller);
-	values[4] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	values[4] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(1)));
 	claim_write(owner, "SELECT phasevec._refute_set($1, $2, $3, $4, $5)", 5, types, values, nulls);
 	PG_RETURN_VOID();
 }
@@ -4206,8 +4215,8 @@ phasevec_supersede(PG_FUNCTION_ARGS)
 	values[3] = PG_ARGISNULL(3) ? (Datum) 0 : PG_GETARG_DATUM(3);
 	nulls[3] = PG_ARGISNULL(3) ? 'n' : ' ';
 	values[4] = ObjectIdGetDatum(caller);
-	values[5] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
-	values[6] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(2)));
+	values[5] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(1)));
+	values[6] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(2)));
 	claim_write(owner, "SELECT phasevec._supersede_set($1, $2, $3, $4, $5, $6, $7)", 7, types,
 				values, nulls);
 	PG_RETURN_VOID();
@@ -4228,10 +4237,95 @@ phasevec_unsupersede(PG_FUNCTION_ARGS)
 	values[0] = PG_GETARG_DATUM(0);
 	values[1] = PG_GETARG_DATUM(1);
 	values[2] = ObjectIdGetDatum(caller);
-	values[3] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	values[3] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(1)));
 	claim_write(owner, "SELECT phasevec._unsupersede_set($1, $2, $3, $4)", 4, types, values,
 				"    ");
 	PG_RETURN_VOID();
+}
+
+/*
+ * phasevec._update_lock_routine(oid) (twenty-sixth review, RT26PU-5): the lock DROP FUNCTION takes
+ * on a function (AccessExclusiveLock on the object, as AcquireDeletionLock takes it), waited for
+ * under lock_timeout, for the update script; its owner's only. Until this review the update took it
+ * with ALTER ... OWNER TO the owner the function had: a DDL command, which every event trigger saw,
+ * once per function and per try, and which a ddl_command_start trigger forbidding ALTER FUNCTION
+ * turned into the update's failure.
+ */
+Datum
+phasevec_update_lock_routine(PG_FUNCTION_ARGS)
+{
+	Oid			fn = PG_GETARG_OID(0);
+
+	if (!object_ownercheck(ProcedureRelationId, fn, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: only the owner of function %u locks it for the update", fn)));
+	LockDatabaseObject(ProcedureRelationId, fn, 0, AccessExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * The same lock, and a table's ACCESS EXCLUSIVE lock, only if they can be had at once: never
+ * queued, so no session that later waits for the update closes a cycle through it (RT26PU-1).
+ */
+Datum
+phasevec_update_lock_routine_now(PG_FUNCTION_ARGS)
+{
+	Oid			fn = PG_GETARG_OID(0);
+
+	if (!object_ownercheck(ProcedureRelationId, fn, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: only the owner of function %u locks it for the update", fn)));
+	PG_RETURN_BOOL(ConditionalLockDatabaseObject(ProcedureRelationId, fn, 0, AccessExclusiveLock));
+}
+
+Datum
+phasevec_update_lock_table_now(PG_FUNCTION_ARGS)
+{
+	Oid			rel = PG_GETARG_OID(0);
+
+	if (!object_ownercheck(RelationRelationId, rel, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("phasevec: only the owner of table %u locks it for the update", rel)));
+	PG_RETURN_BOOL(ConditionalLockRelationOid(rel, AccessExclusiveLock));
+}
+
+/*
+ * phasevec.steward(watch text, role regrole, grant boolean DEFAULT true) (twenty-sixth review): the
+ * table's owner names a steward of the watch, a role whose privileges change every claim of it, or
+ * no longer names it (_steward_set, as the owner, checks the caller). True when it changed
+ * something.
+ */
+Datum
+phasevec_steward(PG_FUNCTION_ARGS)
+{
+	Oid			types[4] = {TEXTOID, OIDOID, BOOLOID, OIDOID};
+	Datum		values[4];
+	Oid			caller = GetUserId();
+	Oid			owner = function_owner(fcinfo);
+	Who			was;
+	bool		isnull;
+	bool		changed;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("phasevec: steward() takes a watch, a role and whether it is granted")));
+	values[0] = PG_GETARG_DATUM(0);
+	values[1] = PG_GETARG_DATUM(1);
+	values[2] = PG_GETARG_DATUM(2);
+	values[3] = ObjectIdGetDatum(caller);
+	spi_connect();
+	become(owner, &was);
+	if (SPI_execute_with_args("SELECT phasevec._steward_set($1, $2, $3, $4)", 4, types, values, NULL,
+							  false, 1) != SPI_OK_SELECT || SPI_processed != 1)
+		elog(ERROR, "phasevec: the steward was not recorded");
+	changed = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	unbecome(&was);
+	SPI_finish();
+	PG_RETURN_BOOL(!isnull && changed);
 }
 
 static bool
@@ -4272,6 +4366,12 @@ in_text_array(ArrayType *a, const char *s)
  * and as a superuser's it would run with every right). The proofs run with the settings in effect where adopt() is
  * called, by assert()'s rule (claim_env): adopted through a wrapper with the SET clause of the one that asserted
  * them, they mean what they meant there.
+ * (twenty-sixth review, RT26PA-1, RT27-ADOPT-1) Adopting changes a claim: the caller must also be
+ * one who may change any claim of the watch (the table's owner's privileges, or a steward's:
+ * _claim_privileged), as for refute() of an orphan. An orphan whose row the caller does not see
+ * (row-level security) is not adopted and not returned, its proof included; one whose row the new
+ * author does not see is returned, not adopted. Until this review any role granted adopt() took
+ * every orphan of the watch for itself, on rows it could not see, and was handed their proofs.
  */
 Datum
 phasevec_adopt(PG_FUNCTION_ARGS)
@@ -4289,6 +4389,8 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	SPITupleTable *orphans;
 	uint64		norphans;
 	ArrayType  *env;
+	bool		rls_caller,
+				rls_author;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -4308,6 +4410,26 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	spi_connect();
 	become(owner, &was);
 	load_target(PG_GETARG_DATUM(0), false, &t, keep);
+	{
+		Oid			pt[3] = {INT4OID, OIDOID, OIDOID};
+		Datum		pv[3] = {Int32GetDatum(t.watch), ObjectIdGetDatum(caller),
+		ObjectIdGetDatum(t.relowner)};
+		bool		isnull;
+
+		if (SPI_execute_with_args("SELECT phasevec._claim_privileged($1, $2, $3)", 3, pt, pv, NULL,
+								  false, 1) != SPI_OK_SELECT || SPI_processed != 1)
+			elog(ERROR, "phasevec: the stewards could not be read");
+		if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull))
+			|| isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("phasevec: role \"%s\" may not adopt the claims of watch %s",
+							role_name(caller), t.name),
+					 errdetail("Adopting changes a claim whose author is gone: a role with the "
+							   "privileges of the watched table's owner, or of a steward of the "
+							   "watch (phasevec.steward()), adopts."),
+					 errhint("The table's owner adopts, or names a steward of the watch.")));
+	}
 
 	/*
 	 * (twentieth review, RT20M-4) The watched table first, then the claims' rows, as every verifier takes them and as
@@ -4340,6 +4462,8 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 	orphans = SPI_tuptable;
 	norphans = SPI_processed;
 	must_read(&t, author);
+	rls_caller = rls_for(&t, caller);
+	rls_author = rls_for(&t, author);
 	for (uint64 i = 0; i < norphans; i++)
 	{
 		HeapTuple	tup = orphans->vals[i];
@@ -4363,6 +4487,9 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 		const char *note;
 
 		if (keys && !in_text_array(keys, k))
+			continue;
+		/* a row the caller does not see: not taken, and nothing of it handed over */
+		if (rls_caller && !key_visible(&t, caller, GUARD_READER, NULL, k))
 			continue;
 		{
 			Oid			rt[2] = {INT4OID, TEXTOID};
@@ -4390,10 +4517,12 @@ phasevec_adopt(PG_FUNCTION_ARGS)
 			note = "not adopted: it was refuted or asserted again while adopt() waited for it";
 		else if (su && !in_text_array(su_keys, k))
 			note = "not adopted: its author would be a superuser; name the key in superuser_keys to adopt it";
+		else if (rls_author && !key_visible(&t, author, GUARD_READER, NULL, k))
+			note = "not adopted: its row is not one the new author sees";
 		else
 		{
-			assert_claim(owner, author, PG_GETARG_DATUM(0), key, proof, n_proof, topic, n_topic,
-						 support, n_support, exp, n_exp, env, true);
+			assert_claim(owner, author, caller, PG_GETARG_DATUM(0), key, proof, n_proof, topic,
+						 n_topic, support, n_support, exp, n_exp, env);
 			adopted = true;
 			note = su ? "adopted: it runs with a superuser's rights" : "adopted";
 		}

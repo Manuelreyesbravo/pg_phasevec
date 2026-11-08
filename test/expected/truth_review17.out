@@ -233,7 +233,14 @@ SELECT key, verdict, phasevec._verdict(t) FROM phasevec.truth t WHERE key IN ($k
  8   | unproven | unproven
 (2 rows)
 
--- an assert() makes it a claim again
+-- an assert() makes it a claim again: (twenty-sixth review) by a steward of the watch, its author
+-- gone
+SELECT phasevec.steward($w$notes17$w$, $r$pv17_au$r$);
+ steward 
+---------
+ t
+(1 row)
+
 SET ROLE pv17_au;
 SELECT phasevec.assert($w$notes17$w$, $k$7$k$, $p$true$p$);
  assert 

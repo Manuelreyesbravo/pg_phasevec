@@ -41,6 +41,9 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 GRANT EXECUTE ON FUNCTION phasevec.refute(text, text, text) TO pv_ar_au;
 GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv_ar_au;
 GRANT EXECUTE ON FUNCTION phasevec.verify_one(text, text, int, float8) TO pv_ar_au;
+-- (twenty-sixth review) a claim whose author is gone is changed by the table's owner or a steward
+-- of the watch only: the two that race adopt() are stewards
+SELECT phasevec.steward('w', 'pv_ar_au'), phasevec.steward('w', 'pv_ar_b');
 SET ROLE pv_ar_gone;
 SELECT phasevec.assert('w', '1',
        $p$SELECT coalesce((SELECT n.body LIKE 'ok%' FROM public.notes n WHERE n.id = 1), false)$p$);

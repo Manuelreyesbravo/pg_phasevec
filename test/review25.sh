@@ -15,7 +15,8 @@
 # 3. (RT25PC-AUTH-1) Two tenants under row-level security and a role with no SELECT: none changes
 #    another's claim, or a claim on a row it does not see, by assert(), refute(), supersede() or
 #    unsupersede(); an author changes its own, a member of the author's role and the table's owner
-#    change it too, and a claim whose author is gone is changed by a role that sees its row. Until
+#    change it too, and a claim whose author is gone by a steward of the watch (twenty-sixth
+#    review; until then by a role that saw its row). Until
 #    this review every one of them went through.
 # 4. (RT25PC-INFO-2) supersede() refuses a cycle (2-3-2, 4-5-6-4), also from two sessions at once,
 #    and refuses to run at REPEATABLE READ.
@@ -329,19 +330,23 @@ if [ -z "$o1$o2$o3$o4" ] && [ "$st" = "$want" ]; then
 else
     nok "allowed changes: '${o1:0:150}' '${o2:0:150}' '${o3:0:150}' '${o4:0:150}'; '$st'"
 fi
-# tb can no longer revive what the owner retired; a claim whose author is gone is changed by a
-# role that sees its row
+# tb can no longer revive what the owner retired; (twenty-sixth review) a claim whose author is
+# gone is changed by no role that only sees its row, and by a steward of the watch
 o5=$(qu pv_r25_tb -c "$A, '11', 'SELECT true')" 2>&1)
 q -c "REVOKE pv_r25_tb FROM pv_r25_deputy" -c "ALTER ROLE pv_r25_tb RENAME TO pv_r25_tb_gone"
 o6=$(qu pv_r25_ta -c "$A, '15', NULL)" 2>&1)
 o7=$(qu pv_r25_deputy -c "$A, '15', NULL)" 2>&1)
+q -c "SELECT phasevec.steward('notas', 'pv_r25_deputy')" >/dev/null
+o8=$(qu pv_r25_deputy -c "$A, '15', NULL)" 2>&1)
+q -c "SELECT phasevec.steward('notas', 'pv_r25_deputy', false)" >/dev/null
 q -c "ALTER ROLE pv_r25_tb_gone RENAME TO pv_r25_tb"
 if grep -q 'may not change the claim on key 11' <<<"$o5" \
-   && grep -q 'may not change the claim on key 15' <<<"$o6" && [ -z "$o7" ]; then
+   && grep -q 'may not change the claim on key 15' <<<"$o6" \
+   && grep -q 'may not change the claim on key 15' <<<"$o7" && [ -z "$o8" ]; then
     ok "the owner's retirement is not tb's to revive; a claim of an author gone is changed by" \
-       "a role that sees the row"
+       "a steward, not by a role that sees the row"
 else
-    nok "after: tb '${o5:0:150}', ta '${o6:0:150}', deputy '${o7:0:150}'"
+    nok "after: tb '${o5:0:150}', ta '${o6:0:150}', deputy '${o7:0:150}', steward '${o8:0:150}'"
 fi
 
 # 4. supersede() closes no cycle
