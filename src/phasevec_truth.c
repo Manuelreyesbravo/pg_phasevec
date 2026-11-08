@@ -125,6 +125,7 @@ PG_FUNCTION_INFO_V1(phasevec_refute);
 PG_FUNCTION_INFO_V1(phasevec_supersede);
 PG_FUNCTION_INFO_V1(phasevec_unsupersede);
 PG_FUNCTION_INFO_V1(phasevec_steward);
+PG_FUNCTION_INFO_V1(phasevec_rebind);
 PG_FUNCTION_INFO_V1(phasevec_cluster);
 PG_FUNCTION_INFO_V1(phasevec_update_lock_routine);
 PG_FUNCTION_INFO_V1(phasevec_update_lock_routine_now);
@@ -802,9 +803,11 @@ caller_writes(const Target *t, Oid owner, Oid caller, const char *key)
 	if (has_privs_of_role(caller, t->relowner))
 		return false;
 	become(owner, &was);
+	/* (twenty-eighth review, RT28PA-REUSE-1) a dead claim (its row is gone) is no claim here */
 	if (SPI_execute_with_args("SELECT 1 FROM phasevec.truth x "
 							  "WHERE x.watch OPERATOR(pg_catalog.=) $1 "
-							  "AND x.key OPERATOR(pg_catalog.=) $2", 2, at, av, NULL, true, 1)
+							  "AND x.key OPERATOR(pg_catalog.=) $2 "
+							  "AND NOT phasevec._claim_dead(x)", 2, at, av, NULL, true, 1)
 		!= SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the claim could not be read");
 	claimed = SPI_processed > 0;
@@ -4445,8 +4448,49 @@ in_text_array(ArrayType *a, const char *s)
 }
 
 /*
+ * phasevec.rebind(watch text DEFAULT NULL) (twenty-eighth review, RV29-1, RV29-2): after a copy of
+ * the cluster that is not trusted as the original is, the table's owner (a superuser: every watch)
+ * makes an orphan of every claim of the watch whose author is not the table's owner, and ends its
+ * stewards (_rebind_set, as the extension's owner, checks the caller). Per watch, how many.
+ */
+Datum
+phasevec_rebind(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			types[2] = {TEXTOID, OIDOID};
+	Datum		values[2];
+	char		nulls[3] = "  ";
+	Oid			caller = GetUserId();
+	Oid			owner = function_owner(fcinfo);
+	Who			was;
+
+	InitMaterializedSRF(fcinfo, 0);
+	values[0] = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+	nulls[0] = PG_ARGISNULL(0) ? 'n' : ' ';
+	values[1] = ObjectIdGetDatum(caller);
+	spi_connect();
+	become(owner, &was);
+	if (SPI_execute_with_args("SELECT r.watch, r.claims, r.stewards "
+							  "FROM phasevec._rebind_set($1, $2) r", 2, types, values, nulls, false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "phasevec: the claims could not be rebound");
+	unbecome(&was);
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		Datum		v[3];
+		bool		n[3];
+
+		for (int j = 0; j < 3; j++)
+			v[j] = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, j + 1, &n[j]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, v, n);
+	}
+	SPI_finish();
+	return (Datum) 0;
+}
+
+/*
  * The orphans of a watch ($1): a proof whose author is unknown or no longer the role it was, or
- * (twenty-seventh review) was that role in another cluster and installation (_from_here()).
+ * (twenty-seventh review) was that role in another cluster and installation (_from_here()), or
+ * (twenty-eighth review) is about a row that is gone (_claim_dead).
  */
 #define ORPHANS_SQL \
 	"SELECT x.key, x.proof, x.topic, x.support, x.expires_at, x.asserted_by::pg_catalog.text " \
@@ -4454,7 +4498,7 @@ in_text_array(ArrayType *a, const char *s)
 	"AND phasevec._claim_state(x.retired_at, x.proof, x.halted) OPERATOR(pg_catalog.=) " \
 	"ANY ('{judged,halted}'::pg_catalog.text[]) " \
 	"AND x.verdict OPERATOR(pg_catalog.<>) 'replaced' " \
-	"AND (NOT phasevec._from_here(x.asserted_in, x.asserted_cluster) " \
+	"AND (NOT phasevec._from_here(x.asserted_in, x.asserted_cluster) OR phasevec._claim_dead(x) " \
 	"OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r " \
 	"WHERE r.oid OPERATOR(pg_catalog.=) x.asserted_by_oid " \
 	"AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by)) "

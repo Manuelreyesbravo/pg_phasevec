@@ -92,7 +92,8 @@ SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key;
  5   | verified
 (3 rows)
 
--- the row gone: the same; back, the same verdict
+-- the row gone: the same. (twenty-eighth review, RT28PA-REUSE-1) Back under its key, it is another
+-- row: the refutation was about the one deleted, and reads 'unproven' (until then 'refuted').
 DELETE FROM notes WHERE id = 3;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, 10, interval '1 day') ORDER BY key;
  key | verdict  |                   error                    
@@ -104,7 +105,7 @@ INSERT INTO notes VALUES (3, $t$claim 3$t$);
 SELECT key, verdict, phasevec._verdict(t) FROM phasevec.truth t WHERE key = $k$3$k$;
  key | verdict | _verdict 
 -----+---------+----------
- 3   | refuted | refuted
+ 3   | refuted | unproven
 (1 row)
 
 -- asserted again: due, and judged

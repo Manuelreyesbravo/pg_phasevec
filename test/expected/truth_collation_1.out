@@ -37,7 +37,7 @@ SELECT key, body FROM phasevec._render($w$wc$w$, ARRAY[$k$ALICE$k$]) ORDER BY ke
 -- a forged row is no oracle: the hidden key's verdict is not shown, whatever text is guessed
 SELECT g.key, g.guess, phasevec._verdict(ROW(:wc_id, g.key, NULL, NULL, NULL, NULL, NULL, NULL, 'refuted', NULL, NULL,
            now(), NULL, NULL, sha256(convert_to(g.guess, 'UTF8')), NULL, NULL, false, NULL, NULL, NULL, NULL, NULL,
-           '0.20.0', NULL, NULL, NULL)::phasevec.truth)
+           '0.20.0', NULL, NULL, NULL, false, NULL)::phasevec.truth)
   FROM (VALUES ($k$ALICE$k$, $g$salary is 90000$g$), ($k$ALICE$k$, $g$salary is 91000$g$), ($k$carol$k$, $g$hidden too$g$)) g(key, guess);
 RESET ROLE;
 GRANT SELECT ON phasevec.truth TO pv17c_a;

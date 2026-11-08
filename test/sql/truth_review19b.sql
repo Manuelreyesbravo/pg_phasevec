@@ -121,7 +121,9 @@ SELECT key, verdict FROM phasevec.verify($w$n19b$w$, 10, $e$0$e$) WHERE key IN (
 SELECT key, verdict FROM phasevec.brief($w$n19b$w$, 100000) WHERE key IN ($k$6$k$, $k$7$k$, $k$8$k$) ORDER BY key;
 
 -- (d) R19-F9. A TRUNCATE (by a writer granted it) empties what the watch noted: no claim of a row that is gone reads
--- 'verified', and truth_coverage() counts no row. The same rows inserted again read as they did. In the eighteenth
+-- 'verified', and truth_coverage() counts no row. (twenty-eighth review, RT28PA-REUSE-1) The same rows inserted
+-- again are other rows: their claims are dead, and none reads 'verified' (until then they read as they did). In the
+-- eighteenth
 -- cut the watch trigger did not fire for a TRUNCATE: _verdict() and truth_coverage() served 'verified' for rows that
 -- no longer existed, and truth_coverage() counted them after verify() too.
 SELECT tgname FROM pg_trigger WHERE tgrelid = $t$n19b$t$::regclass ORDER BY 1;

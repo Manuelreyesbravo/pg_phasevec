@@ -28,7 +28,8 @@ UPDATE notes SET body = replace(replace(body, $t$ (edited)+$t$, $t$$t$), $t$ (ed
 SELECT key, verdict, phasevec._verdict(t) FROM phasevec.truth t ORDER BY key;
 SELECT count(*) AS due FROM phasevec.verify($w$notes$w$, 10, interval '1 day');
 SELECT key, verdict FROM phasevec.brief($w$notes$w$) ORDER BY key;
--- the row gone: the same; back, the same verdict
+-- the row gone: the same. (twenty-eighth review, RT28PA-REUSE-1) Back under its key, it is another
+-- row: the refutation was about the one deleted, and reads 'unproven' (until then 'refuted').
 DELETE FROM notes WHERE id = 3;
 SELECT key, verdict, error FROM phasevec.verify($w$notes$w$, 10, interval '1 day') ORDER BY key;
 INSERT INTO notes VALUES (3, $t$claim 3$t$);

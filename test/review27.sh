@@ -20,7 +20,8 @@
 #    not "holds what pg_phasevec 0.19.0 wrote".
 # 6. (RT27PA-4) ALTER TABLE ... OWNER TO ends the stewards the former owner named; the new owner
 #    names them again. (RT27PA-2) A revoked steward changes nothing it did not author; what it
-#    authored stays its own, and the owner changes it.
+#    authored stays in its name, and the owner changes it. (twenty-eighth review, RT28PA-REVOKE-1)
+#    A claim it took as a steward alone, it no longer changes either (until then it did).
 # 7. (RT27PA-3, RT27PL-1) A pg_dump restored into another cluster whose roles have the same OIDs
 #    and names: every claim is an orphan, every steward no one; the owner adopts them. Restored into
 #    another database of the same cluster, they are kept.
@@ -287,11 +288,12 @@ g1=$(qu pv_r27_st -c "SELECT phasevec.refute('notas', '5', 'no longer a steward'
 g2=$(qu pv_r27_st -c "SELECT phasevec.assert('notas', '3', NULL)" 2>&1)
 g3=$(qu pv_r27_ta -c "SELECT phasevec.assert('notas', '3', 'SELECT true')" 2>&1)
 g4=$(qu pv_r27_own2 -c "SELECT phasevec.refute('notas', '3', 'the owner')" 2>&1)
-if [ "$(refusal "$g1")" = "may not change the claim on key 5" ] && [ -z "$g2$g4" ] \
+if [ "$(refusal "$g1")" = "may not change the claim on key 5" ] && [ -z "$g4" ] \
+   && [ "$(refusal "$g2")" = "may not change the claim on key 3" ] \
    && [ "$(refusal "$g3")" = "may not change the claim on key 3" ] \
    && [ "$(claims "'3', '5'")" = "3:pv_r27_own2 5:pv_r27_ta" ]; then
-    ok "a revoked steward changes no claim it did not author; one it authored stays its own" \
-       "until the owner changes it"
+    ok "a revoked steward changes no claim, one it took as a steward included; the owner" \
+       "changes it"
 else
     nok "revoked steward: '${g1:0:120}' own '${g2:0:120}' ta '${g3:0:120}' owner '${g4:0:120}';" \
         "$(claims "'3', '5'")"
