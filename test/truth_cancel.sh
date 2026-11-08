@@ -44,6 +44,7 @@ CREATE FUNCTION public.ok(k int) RETURNS boolean LANGUAGE sql STABLE AS $$ SELEC
 CREATE TABLE notes1 (id int PRIMARY KEY, body text);
 INSERT INTO notes1 SELECT g, 'n' || g FROM generate_series(1, 60) g;
 GRANT SELECT ON facts, notes1 TO pv_c_a, pv_c_b, pv_c_v;
+GRANT UPDATE ON facts, notes1 TO pv_c_a, pv_c_b, pv_c_v;
 SELECT phasevec.watch('w1', 'notes1'::regclass, 'id', 'r.body', 'r1');
 DO $$ BEGIN
   FOR k IN 1..60 LOOP

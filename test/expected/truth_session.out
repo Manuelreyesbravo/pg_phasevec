@@ -42,6 +42,7 @@ CREATE ROLE pv_t_author;
 GRANT USAGE ON SCHEMA phasevec TO pv_t_author;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_t_author;
 GRANT SELECT ON notes, stock, orders, ledger TO pv_t_author;
+GRANT UPDATE ON notes TO pv_t_author;
 SET ROLE pv_t_author;
 SET search_path = public;
 SELECT (SELECT qty FROM stock WHERE item = $i$widget$i$) > 0 AS in_stock, NOT EXISTS (SELECT 1 FROM orders WHERE open) AS none_open;

@@ -63,11 +63,12 @@ CREATE TABLE facts (id int PRIMARY KEY, ok boolean NOT NULL);
 INSERT INTO facts SELECT g, true FROM generate_series(1, 200) g;
 CREATE FUNCTION public.ok(k int) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT ok FROM public.facts WHERE id = k $$;
 GRANT SELECT ON facts TO pv_k_a, pv_k_p, pv_k_v; GRANT SELECT, UPDATE ON facts TO pv_k_w;
+GRANT UPDATE ON facts TO pv_k_a, pv_k_p, pv_k_v;
 GRANT EXECUTE ON FUNCTION public.ok(int) TO PUBLIC;
 DO $$ BEGIN FOR i IN 1..4 LOOP
   EXECUTE format('CREATE TABLE notes%s (id int PRIMARY KEY, body text)', i);
   EXECUTE format('INSERT INTO notes%s SELECT g, %L || g FROM generate_series(1, 200) g', i, 'note ');
-  EXECUTE format('GRANT SELECT ON notes%s TO pv_k_a, pv_k_p, pv_k_v', i);
+  EXECUTE format('GRANT SELECT, UPDATE ON notes%s TO pv_k_a, pv_k_p, pv_k_v', i);
   PERFORM phasevec.watch('w' || i, ('notes' || i)::regclass, 'id', 'r.body', 'r1');
 END LOOP; END $$;
 SQL

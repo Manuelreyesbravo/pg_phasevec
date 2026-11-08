@@ -12,6 +12,7 @@ CREATE ROLE pv17_au;
 GRANT USAGE ON SCHEMA phasevec TO pv17_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv17_au;
 GRANT SELECT ON notes17 TO pv17_au;
+GRANT UPDATE ON notes17 TO pv17_au;
 CREATE FUNCTION public.pv17_one() RETURNS int LANGUAGE sql AS $f$ SELECT 1 $f$;
 
 -- (a) VI-1. Two settings, and one whose value holds a newline and reads as both: two claims, two identities. In the

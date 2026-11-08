@@ -40,6 +40,7 @@ INSERT INTO inv VALUES (1, false);
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes VALUES (1, 'no invoice is overdue');
 GRANT SELECT ON ctl, inv, notes TO pv_o_a, pv_o_v;
+GRANT UPDATE ON ctl, inv, notes TO pv_o_a, pv_o_v;
 -- each statement in a new snapshot: ctl only sets how long this run sleeps before it reads inv
 CREATE FUNCTION public.no_overdue() RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE s float8;

@@ -36,6 +36,7 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 GRANT EXECUTE ON FUNCTION phasevec.verify(text, integer, interval, interval, integer, double precision),
                           phasevec.verify_one(text, text, integer, double precision) TO pv_os_v;
 GRANT SELECT ON notes, invoices, logins TO pv_os_a, pv_os_v;
+GRANT UPDATE ON notes TO pv_os_a;
 \c -
 SET ROLE pv_os_a;
 SELECT phasevec.assert($w$h1$w$, $k$1$k$, $p$NOT EXISTS (SELECT 1 FROM public.invoices WHERE overdue)$p$);

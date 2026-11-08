@@ -14,6 +14,7 @@ CREATE ROLE pv20_other;
 CREATE ROLE pv20_grp;
 GRANT USAGE ON SCHEMA phasevec TO pv20_au, pv20_other;
 GRANT SELECT ON n20 TO pv20_au;
+GRANT UPDATE ON n20 TO pv20_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv20_au;
 
 -- (a) RT20M-2. The author's wrapper sets DateStyle = ISO (the output only: the field order is the one it replaces),

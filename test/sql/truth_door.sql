@@ -19,6 +19,7 @@ CREATE ROLE pv_verifier;
 CREATE ROLE pv_low;
 GRANT USAGE ON SCHEMA phasevec TO pv_admin, pv_verifier, pv_low;
 GRANT SELECT ON notes TO pv_admin, pv_low;
+GRANT UPDATE ON notes TO pv_admin, pv_low;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_admin, pv_low;
 GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, float8),
                           phasevec.verify_one(text, text, int, float8) TO pv_verifier;

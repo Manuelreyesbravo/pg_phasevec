@@ -19,6 +19,7 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 GRANT SELECT ON pv_shared TO pv_author;
 -- an author vouches for the row's text as it reads it: it must be able to read the row
 GRANT SELECT ON notes TO pv_author;
+GRANT UPDATE ON notes TO pv_author;
 
 -- the author says two things: one it can check, one that reads what only the verifier can
 SET ROLE pv_author;

@@ -28,6 +28,7 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, 'claim ' || g FROM generate_series(1, 40) g;
 GRANT SELECT ON notes TO pv_drop_a;
+GRANT UPDATE ON notes TO pv_drop_a;
 SELECT phasevec.watch('w', 'notes'::regclass, 'id', 'r.body', 'r1');
 SET ROLE pv_drop_a;
 SELECT phasevec.assert('w', g::text, 'pg_sleep(0.1) IS NOT NULL') FROM generate_series(1, 40) g;

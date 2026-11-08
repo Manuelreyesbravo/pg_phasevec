@@ -48,6 +48,7 @@ INSERT INTO notes VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, '03/04/2026')
 SELECT phasevec.watch('notes', 'notes'::regclass, 'id', 'r.body', 'r1');
 GRANT USAGE ON SCHEMA phasevec TO pv_r20_au, pv_r20_other;
 GRANT SELECT ON notes TO pv_r20_au;
+GRANT UPDATE ON notes TO pv_r20_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz),
     phasevec.supersede(text, text, text, text), phasevec.verify(text, int, interval, interval, int, float8),
     phasevec.verify_one(text, text, int, float8), phasevec.adopt(text, regrole, text[], text[]) TO pv_r20_au;
@@ -92,8 +93,10 @@ CREATE TABLE gone (id int PRIMARY KEY, body text);
 INSERT INTO gone VALUES (1, 'a'), (2, 'b');
 SELECT phasevec.watch('gone', 'gone'::regclass, 'id', 'r.body', 'r1');
 GRANT SELECT ON gone TO pv_r20_other;
+GRANT UPDATE ON gone TO pv_r20_other;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_r20_other;
 GRANT SELECT ON gone TO pv_r20_au;
+GRANT UPDATE ON gone TO pv_r20_au;
 SQL
 as pv_r20_other -c "SELECT phasevec.assert('gone', '1', 'SELECT true'), phasevec.assert('gone', '2', 'SELECT true')" >/dev/null
 q -c "UPDATE phasevec.truth SET asserted_by = 'nobody_now' WHERE watch = (SELECT id FROM phasevec.watches WHERE name = 'gone')" >/dev/null

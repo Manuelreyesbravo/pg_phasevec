@@ -32,6 +32,7 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT i, 'claim ' || i FROM generate_series(1, 50) i;
 GRANT SELECT ON notes TO pv_mem_a;
+GRANT UPDATE ON notes TO pv_mem_a;
 SELECT phasevec.watch('w', 'notes'::regclass, 'id', 'r.body', 'r1');
 SET ROLE pv_mem_a;
 SELECT phasevec.assert('w', i::text, 'true') FROM generate_series(1, 50) i;

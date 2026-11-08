@@ -70,11 +70,13 @@ END LOOP; END $$;
 DO $$ BEGIN FOR i IN 1..6 LOOP
   EXECUTE format('CREATE TABLE notes%s (id int PRIMARY KEY, body text)', i);
   EXECUTE format('INSERT INTO notes%s SELECT g, %L || g FROM generate_series(1, 200) g', i, 'note ');
-  EXECUTE format('GRANT SELECT ON notes%s TO pv_l_a, pv_l_b, pv_l_c, pv_l_s, pv_l_h, pv_l_v', i);
+  EXECUTE format('GRANT SELECT, UPDATE ON notes%s TO pv_l_a, pv_l_b, pv_l_c, pv_l_s, pv_l_h, '
+                 'pv_l_v', i);
   EXECUTE format('GRANT SELECT, UPDATE ON notes%s TO pv_l_w', i);
   PERFORM phasevec.watch('w' || i, ('notes' || i)::regclass, 'id', 'r.body', 'r1');
 END LOOP; END $$;
 GRANT SELECT ON facts, parted TO pv_l_a, pv_l_b, pv_l_c, pv_l_s, pv_l_h, pv_l_v;
+GRANT UPDATE ON facts, parted TO pv_l_a, pv_l_b, pv_l_c, pv_l_s, pv_l_h, pv_l_v;
 GRANT EXECUTE ON FUNCTION public.ok(int) TO PUBLIC;
 SQL
 fallas=0

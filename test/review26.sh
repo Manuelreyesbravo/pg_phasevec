@@ -139,11 +139,17 @@ q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 ALTER TABLE notas ADD COLUMN tenant name DEFAULT 'pv_r26_ta';
 UPDATE notas SET tenant = 'pv_r26_tb' WHERE id > 10;
 ALTER TABLE notas ENABLE ROW LEVEL SECURITY;
-CREATE POLICY p ON notas FOR SELECT USING (tenant = current_user OR current_user = 'pv_r26_rd');
+-- (twenty-seventh review) x, a steward in case 5, sees every row too: a steward's right reaches
+-- the rows row-level security does not keep it from
+CREATE POLICY p ON notas FOR SELECT
+    USING (tenant = current_user OR current_user IN ('pv_r26_rd', 'pv_r26_x'));
 ALTER TABLE notas OWNER TO pv_r26_owner;
 GRANT USAGE ON SCHEMA phasevec
   TO pv_r26_ta, pv_r26_tb, pv_r26_rd, pv_r26_wr, pv_r26_owner, pv_r26_x;
 GRANT SELECT ON notas TO pv_r26_ta, pv_r26_tb, pv_r26_rd, pv_r26_x;
+-- (twenty-seventh review) a tenant writes its own rows: what makes it claim one first
+CREATE POLICY pw ON notas FOR UPDATE USING (tenant = current_user);
+GRANT UPDATE ON notas TO pv_r26_ta, pv_r26_tb;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz),
   phasevec.refute(text, text, text), phasevec.supersede(text, text, text, text),
   phasevec.unsupersede(text, text), phasevec.adopt(text, regrole, text[], text[])
@@ -202,6 +208,7 @@ CREATE TABLE plain (id int PRIMARY KEY, body text);
 INSERT INTO plain SELECT g, 'p' || g FROM generate_series(1, 5) g;
 SELECT phasevec.watch('plain', 'plain'::regclass, 'id', 'r.body', 'r1');
 GRANT SELECT ON plain TO pv_r26_rd, pv_r26_wr;
+GRANT UPDATE ON plain TO pv_r26_wr;
 GRANT INSERT ON plain TO pv_r26_wr;
 SQL
 p1=$(qu pv_r26_rd -c "SELECT phasevec.refute('plain', '500', 'reserved')" 2>&1)

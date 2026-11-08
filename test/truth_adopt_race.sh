@@ -37,6 +37,7 @@ INSERT INTO notes SELECT g, 'ok ' || g FROM generate_series(1, 4) g;
 SELECT phasevec.watch('w', 'notes'::regclass, 'id', 'r.body', 'r1');
 GRANT USAGE ON SCHEMA phasevec TO pv_ar_au, pv_ar_b, pv_ar_gone;
 GRANT SELECT ON notes TO pv_ar_au, pv_ar_b, pv_ar_gone;
+GRANT UPDATE ON notes TO pv_ar_au, pv_ar_b, pv_ar_gone;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_ar_au, pv_ar_b, pv_ar_gone;
 GRANT EXECUTE ON FUNCTION phasevec.refute(text, text, text) TO pv_ar_au;
 GRANT EXECUTE ON FUNCTION phasevec.adopt(text, regrole, text[], text[]) TO pv_ar_au;

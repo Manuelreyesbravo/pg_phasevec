@@ -37,6 +37,7 @@ GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, fl
 CREATE TABLE facts (id int PRIMARY KEY, ok boolean NOT NULL);
 INSERT INTO facts SELECT g, true FROM generate_series(1, 200) g;
 GRANT SELECT ON facts TO pv_p_a, pv_p_v; GRANT SELECT, UPDATE ON facts TO pv_p_w;
+GRANT UPDATE ON facts TO pv_p_a, pv_p_v;
 CREATE FUNCTION public.chk(k int) RETURNS boolean LANGUAGE plpgsql STABLE PARALLEL SAFE
   AS $f$ BEGIN RETURN (SELECT ok FROM public.facts WHERE id = k); END $f$;
 -- a: the nested query runs in a parallel worker (debug_parallel_query)
@@ -49,9 +50,11 @@ ANALYZE big;
 CREATE FUNCTION public.chkbig(k int) RETURNS SETOF boolean LANGUAGE plpgsql STABLE PARALLEL SAFE
   AS $f$ BEGIN RETURN QUERY SELECT public.chk(k) FROM public.big WHERE id = k; END $f$;
 GRANT SELECT ON big TO pv_p_a, pv_p_v;
+GRANT UPDATE ON big TO pv_p_a, pv_p_v;
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, 'note ' || g FROM generate_series(1, 20) g;
 GRANT SELECT ON notes TO pv_p_a, pv_p_v;
+GRANT UPDATE ON notes TO pv_p_a, pv_p_v;
 SELECT phasevec.watch('w1', 'notes'::regclass, 'id', 'r.body', 'r1');
 -- settings of the author's own role (it may set them itself: all are USERSET)
 ALTER ROLE pv_p_a SET debug_parallel_query = on;

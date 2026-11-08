@@ -96,14 +96,18 @@ verdicts() {
                   FROM phasevec.truth t ${2:-}"
 }
 # The extension as the catalog has it: every object of phasevec's schema, its definition, comment
-# and grants.
+# and grants. (twenty-seventh review) phasevec._here() returns a value made with each installation:
+# its definition is compared without it.
 SHAPE=$(cat <<'SQL'
 WITH n AS (SELECT 'phasevec'::regnamespace AS ns),
 x AS (SELECT oid FROM pg_extension WHERE extname = 'pg_phasevec')
 SELECT string_agg(l, E'\n' ORDER BY l) FROM (
   SELECT 'f ' || p.oid::regprocedure || ' ' || coalesce(p.proacl::text, '-') || ' ' ||
          coalesce(obj_description(p.oid, 'pg_proc'), '-') || E'\n' ||
-         CASE WHEN p.prokind = 'a' THEN '' ELSE pg_get_functiondef(p.oid) END AS l
+         CASE WHEN p.prokind = 'a' THEN ''
+              WHEN p.proname = '_here'
+              THEN regexp_replace(pg_get_functiondef(p.oid), '''[0-9a-f-]{36}''', '''-''')
+              ELSE pg_get_functiondef(p.oid) END AS l
     FROM pg_proc p, n WHERE p.pronamespace = n.ns
   UNION ALL
   SELECT 'r ' || c.relname || ' ' || c.relkind::text || c.relpersistence::text || ' ' ||
@@ -265,6 +269,9 @@ CREATE POLICY p ON notas FOR SELECT
 GRANT USAGE ON SCHEMA phasevec
     TO pv_r25_ta, pv_r25_tb, pv_r25_mallory, pv_r25_deputy, pv_r25_owner;
 GRANT SELECT ON notas TO pv_r25_ta, pv_r25_tb, pv_r25_deputy;
+-- (twenty-seventh review) a tenant writes its own rows: what makes it claim one first
+CREATE POLICY pw ON notas FOR UPDATE USING (tenant = current_user);
+GRANT UPDATE ON notas TO pv_r25_ta, pv_r25_tb;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz),
   phasevec.verify(text, int, interval, interval, int, float8), phasevec.refute(text, text, text),
   phasevec.supersede(text, text, text, text), phasevec.unsupersede(text, text),

@@ -56,6 +56,7 @@ INSERT INTO inv VALUES (1, false);
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, 'note ' || g FROM generate_series(1, 4) g;
 GRANT SELECT ON jobs, inv, notes TO pv_w_a, pv_w_b, pv_w_v;
+GRANT UPDATE ON jobs, inv, notes TO pv_w_a, pv_w_b, pv_w_v;
 SELECT phasevec.watch('jobs', 'jobs'::regclass, 'id', 'r.body', 'r1');
 SELECT phasevec.watch('inv', 'notes'::regclass, 'id', 'r.body', 'r1');
 SELECT phasevec.watch('big', 'notes'::regclass, 'id', 'r.body', 'r1');

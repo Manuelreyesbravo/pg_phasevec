@@ -32,7 +32,9 @@ CREATE ROLE pv_ph_b;
 GRANT USAGE ON SCHEMA phasevec TO pv_ph_a, pv_ph_b;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_ph_a, pv_ph_b;
 GRANT SELECT ON notes TO pv_ph_a, pv_ph_b;
+GRANT UPDATE ON notes TO pv_ph_a, pv_ph_b;
 GRANT SELECT ON invoices TO pv_ph_b;
+GRANT UPDATE ON invoices TO pv_ph_b;
 -- the author asserts from a session with no placeholder
 \c -
 SET ROLE pv_ph_a;

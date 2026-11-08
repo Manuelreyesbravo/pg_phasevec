@@ -46,6 +46,7 @@ INSERT INTO inv VALUES (1, false);
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, 'note ' || g FROM generate_series(1, 30) g;
 GRANT SELECT ON inv, notes TO pv_u_a, pv_u_b, pv_u_v;
+GRANT UPDATE ON inv, notes TO pv_u_a, pv_u_b, pv_u_v;
 SELECT phasevec.watch('inv', 'notes'::regclass, 'id', 'r.body', 'r1');
 SET ROLE pv_u_a;
 SELECT phasevec.assert('inv', '1', 'NOT EXISTS (SELECT 1 FROM public.inv WHERE overdue)');

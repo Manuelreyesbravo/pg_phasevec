@@ -14,6 +14,7 @@ CREATE ROLE pv_author;
 GRANT USAGE ON SCHEMA phasevec TO pv_author;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_author;
 GRANT SELECT ON notes TO pv_author;
+GRANT UPDATE ON notes TO pv_author;
 CREATE SCHEMA pv_author AUTHORIZATION pv_author;
 SET ROLE pv_author;
 -- sleeps in short naps and swallows every cancel

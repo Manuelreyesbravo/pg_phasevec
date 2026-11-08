@@ -17,6 +17,7 @@ CREATE ROLE pv_tl_author;
 GRANT USAGE ON SCHEMA phasevec TO pv_tl_author;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_tl_author;
 GRANT SELECT ON notes TO pv_tl_author;
+GRANT UPDATE ON notes TO pv_tl_author;
 SET ROLE pv_tl_author;
 SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$JSON_VALUE('"b"', '$' RETURNING pg_temp.e) < JSON_VALUE('"a"', '$' RETURNING pg_temp.e)$p$);
 SELECT phasevec.assert($w$notes$w$, $k$2$k$, $p$JSON_VALUE('{"a":-1}', '$.a' RETURNING pg_temp.d NULL ON ERROR) IS NULL$p$);

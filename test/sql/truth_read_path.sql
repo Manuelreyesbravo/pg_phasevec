@@ -14,6 +14,9 @@ CREATE TABLE rnotes (id int PRIMARY KEY, body text);
 INSERT INTO rnotes VALUES (1, $t$seen$t$), (2, $t$hidden by a policy$t$);
 ALTER TABLE rnotes ENABLE ROW LEVEL SECURITY;
 CREATE POLICY rnotes_seen ON rnotes FOR SELECT USING (id <> 2 OR current_user = $r$pv_rp_author$r$);
+-- (twenty-seventh review) a first claim needs the row's UPDATE too: its writer's policy
+CREATE POLICY rnotes_written ON rnotes FOR UPDATE
+    USING (id <> 2 OR current_user = $r$pv_rp_author$r$);
 SELECT phasevec.watch($w$notes$w$, $w$notes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
 SELECT phasevec.watch($w$rnotes$w$, $w$rnotes$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
 SELECT count(phasevec.record(x.w, x.key, $n$r1$n$, x.text_hash, 7, ARRAY[1, 2, 3, 4]::smallint[]))
@@ -26,6 +29,7 @@ CREATE ROLE pv_rp_plain NOLOGIN;             -- the watched table and phasevec.t
 GRANT USAGE ON SCHEMA phasevec TO pv_rp_author, pv_rp_plain;
 GRANT SELECT ON notes TO pv_rp_plain;
 GRANT SELECT ON notes, rnotes TO pv_rp_author;
+GRANT UPDATE ON notes, rnotes TO pv_rp_author;
 GRANT SELECT ON phasevec.truth TO pv_rp_plain;
 CREATE ROLE pv_rp_none NOLOGIN;              -- phasevec.truth only
 GRANT USAGE ON SCHEMA phasevec TO pv_rp_none;

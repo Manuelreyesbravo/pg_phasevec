@@ -38,6 +38,7 @@ CREATE TABLE beats (at timestamptz);
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes VALUES (1, 'no unpaid invoice is past due'), (2, 'no heartbeat is stamped in the future');
 GRANT SELECT ON ctl, inv, beats, notes TO pv_cc_a, pv_cc_v;
+GRANT UPDATE ON ctl, inv, beats, notes TO pv_cc_a, pv_cc_v;
 -- ctl.s makes the first judgment slow (the one the second verifier waits behind); the second reads s = 0
 CREATE FUNCTION public.no_overdue() RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN PERFORM pg_sleep((SELECT c.s FROM public.ctl c)); RETURN NOT EXISTS (SELECT 1 FROM public.inv WHERE due < now() AND NOT paid); END $$;
@@ -117,6 +118,7 @@ CREATE FUNCTION public.tag(int) RETURNS text LANGUAGE plpgsql STABLE AS
 CREATE TABLE notes2 (id int PRIMARY KEY, body text);
 INSERT INTO notes2 VALUES (4, 'no heartbeat is stamped in the future');
 GRANT SELECT ON notes2 TO pv_cc_a, pv_cc_v;
+GRANT UPDATE ON notes2 TO pv_cc_a, pv_cc_v;
 GRANT EXECUTE ON FUNCTION phasevec.verify(text, int, interval, interval, int, float8) TO pv_cc_v;
 SELECT phasevec.watch('w2', 'notes2'::regclass, 'id', $r$r.body || coalesce(public.tag(r.id), '')$r$, 'r1');
 SET ROLE pv_cc_a;
@@ -158,6 +160,7 @@ CREATE FUNCTION public.nap() RETURNS text LANGUAGE plpgsql STABLE AS
 CREATE TABLE notes3 (id int PRIMARY KEY, body text);
 INSERT INTO notes3 VALUES (5, 'no heartbeat is stamped in the future');
 GRANT SELECT ON notes3 TO pv_cc_a, pv_cc_v;
+GRANT UPDATE ON notes3 TO pv_cc_a, pv_cc_v;
 SELECT phasevec.watch('w3', 'notes3'::regclass, 'id', $r$r.body || public.nap()$r$, 'r1');
 SET ROLE pv_cc_a;
 SELECT phasevec.assert('w3', '5', 'public.no_future_beat()');

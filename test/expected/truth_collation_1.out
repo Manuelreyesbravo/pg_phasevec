@@ -26,7 +26,9 @@ SELECT phasevec.refute($w$wc$w$, $k$ALICE$k$, $r$x$r$);
 SELECT phasevec.refute($w$wc$w$, $k$carol$k$, $r$x$r$);
 -- a claim names one row: 'alice' is not 'ALICE', and 'Alice' is no row
 SELECT phasevec.assert($w$wc$w$, $k$alice$k$, $p$true$p$);
-SELECT phasevec.assert($w$wc$w$, $k$Alice$k$, $p$true$p$);
+-- (twenty-seventh review) and no claim is made on a key no row has, by anyone
+DO $d$BEGIN PERFORM phasevec.assert($w$wc$w$, $k$Alice$k$, $p$true$p$);
+EXCEPTION WHEN insufficient_privilege THEN RAISE NOTICE 'refused: no row is Alice'; END$d$;
 SELECT key, verdict FROM phasevec.verify($w$wc$w$, 10, $e$0$e$) ORDER BY key COLLATE "C";
 SET ROLE pv17c_a;
 SELECT k, body FROM notesc;
@@ -35,7 +37,7 @@ SELECT key, body FROM phasevec._render($w$wc$w$, ARRAY[$k$ALICE$k$]) ORDER BY ke
 -- a forged row is no oracle: the hidden key's verdict is not shown, whatever text is guessed
 SELECT g.key, g.guess, phasevec._verdict(ROW(:wc_id, g.key, NULL, NULL, NULL, NULL, NULL, NULL, 'refuted', NULL, NULL,
            now(), NULL, NULL, sha256(convert_to(g.guess, 'UTF8')), NULL, NULL, false, NULL, NULL, NULL, NULL, NULL,
-           '0.20.0')::phasevec.truth)
+           '0.20.0', NULL, NULL, NULL)::phasevec.truth)
   FROM (VALUES ($k$ALICE$k$, $g$salary is 90000$g$), ($k$ALICE$k$, $g$salary is 91000$g$), ($k$carol$k$, $g$hidden too$g$)) g(key, guess);
 RESET ROLE;
 GRANT SELECT ON phasevec.truth TO pv17c_a;

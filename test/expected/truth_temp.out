@@ -40,6 +40,7 @@ CREATE ROLE pv_tt_author;
 GRANT USAGE ON SCHEMA phasevec TO pv_tt_author;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_tt_author;
 GRANT SELECT ON notes, stock TO pv_tt_author;
+GRANT UPDATE ON notes TO pv_tt_author;
 SET ROLE pv_tt_author;
 SELECT phasevec.assert($w$notes$w$, $k$1$k$, $p$(SELECT qty FROM pg_temp.sv WHERE item = 'widget') > 0$p$);
  assert 

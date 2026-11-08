@@ -18,6 +18,7 @@ CREATE ROLE pv19_rn;
 CREATE ROLE "Pv19 Odd";
 GRANT USAGE ON SCHEMA phasevec TO pv19_au, pv19_keep, pv19_rn, "Pv19 Odd";
 GRANT SELECT ON mem19 TO pv19_au, pv19_keep, pv19_rn, "Pv19 Odd";
+GRANT UPDATE ON mem19 TO pv19_au, pv19_keep, pv19_rn, "Pv19 Odd";
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz)
    TO pv19_au, pv19_keep, pv19_rn, "Pv19 Odd";
 SET ROLE pv19_au;
@@ -48,6 +49,7 @@ SELECT key, phasevec._verdict(t) FROM phasevec.truth t WHERE key = $k$5$k$;
 SELECT phasevec.steward($w$mem19$w$, $r$pv19_au$r$);
 GRANT USAGE ON SCHEMA phasevec TO pv19_au;
 GRANT SELECT ON mem19 TO pv19_au;
+GRANT UPDATE ON mem19 TO pv19_au;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv19_au;
 SET ROLE pv19_au;
 SELECT phasevec.assert($w$mem19$w$, $k$1$k$, $p$SELECT true$p$);

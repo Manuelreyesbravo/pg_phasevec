@@ -31,6 +31,7 @@ GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timesta
 CREATE TABLE notes (id int PRIMARY KEY, body text);
 INSERT INTO notes SELECT g, 'claim ' || g FROM generate_series(1, 4) g;
 GRANT SELECT ON notes TO pv_bind_au;
+GRANT UPDATE ON notes TO pv_bind_au;
 SELECT phasevec.watch('w', 'notes'::regclass, 'id', 'r.body', 'r1');
 UPDATE phasevec.watches SET max_age = '1 day' WHERE name = 'w';
 SQL

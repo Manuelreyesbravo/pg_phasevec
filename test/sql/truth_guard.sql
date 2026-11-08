@@ -12,6 +12,7 @@ CREATE ROLE pv_g_author;
 GRANT USAGE ON SCHEMA phasevec TO pv_g_author;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_g_author;
 GRANT SELECT ON notes TO pv_g_author;
+GRANT UPDATE ON notes TO pv_g_author;
 
 -- (1) brief() ran the recipe as its caller, with full rights: the table's owner swapped a column's type for one
 -- whose cast to text is its own code, and a superuser reading the brief made the owner superuser. The recipe runs
@@ -85,6 +86,7 @@ DO $d$ BEGIN
 END $d$;
 CREATE TABLE events (id int PRIMARY KEY, title text, due timestamptz);
 GRANT SELECT ON events TO pv_g_author;
+GRANT UPDATE ON events TO pv_g_author;
 GRANT SELECT, UPDATE ON events TO pv_g_writer;
 SET TimeZone = $z$America/Santiago$z$;
 INSERT INTO events VALUES (1, $t$release freeze starts$t$, $d$2026-11-20 10:00-03$d$);
@@ -107,6 +109,7 @@ RESET TimeZone;
 
 CREATE TABLE deadlines (id int PRIMARY KEY, what text, due date);
 GRANT SELECT ON deadlines TO pv_g_author;
+GRANT UPDATE ON deadlines TO pv_g_author;
 GRANT SELECT, UPDATE ON deadlines TO pv_g_writer;
 INSERT INTO deadlines VALUES (1, $t$patch deadline$t$, $d$2026-11-05$d$);
 SELECT phasevec.watch($w$dl$w$, $w$deadlines$w$::regclass, $k$id$k$, $r$r.what$r$, $n$r1$n$) > 0 AS watch;
@@ -134,6 +137,7 @@ CREATE ROLE pv_g_throwaway;
 GRANT USAGE ON SCHEMA phasevec TO pv_g_throwaway;
 GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz) TO pv_g_throwaway;
 GRANT SELECT ON notes TO pv_g_throwaway;
+GRANT UPDATE ON notes TO pv_g_throwaway;
 SET ROLE pv_g_throwaway;
 SELECT phasevec.assert($w$notes$w$, $k$4$k$, $p$(SELECT count(*) FROM pg_catalog.pg_authid) > 0$p$);
 RESET ROLE;

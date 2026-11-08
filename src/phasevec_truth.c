@@ -125,6 +125,7 @@ PG_FUNCTION_INFO_V1(phasevec_refute);
 PG_FUNCTION_INFO_V1(phasevec_supersede);
 PG_FUNCTION_INFO_V1(phasevec_unsupersede);
 PG_FUNCTION_INFO_V1(phasevec_steward);
+PG_FUNCTION_INFO_V1(phasevec_cluster);
 PG_FUNCTION_INFO_V1(phasevec_update_lock_routine);
 PG_FUNCTION_INFO_V1(phasevec_update_lock_routine_now);
 PG_FUNCTION_INFO_V1(phasevec_update_lock_table_now);
@@ -738,6 +739,93 @@ key_visible(const Target *t, Oid role, GuardMode mode, const GuardEnv *env, cons
 	char	  **seen;
 
 	return visible_keys(t, role, mode, env, text_array(one, 1), &seen, CurrentMemoryContext) > 0;
+}
+
+/*
+ * (twenty-seventh review, RT27PA-1) Does the role's row-level security let it UPDATE the row of
+ * this key? The row is taken FOR KEY SHARE as the role, in the guard (a row-locking clause asks
+ * for UPDATE on the table, and applies the role's SELECT and UPDATE USING policies, as an UPDATE
+ * would), and let go at once: the guard's subtransaction is rolled back, the lock and whatever a
+ * policy's function did with it. The guard makes the transaction read-only, which a row-locking
+ * clause is not; only the statement below runs with it off. A row another transaction is deleting,
+ * or changing the key of, is waited for, as a foreign key check waits. SPI connected.
+ */
+static bool
+key_writable(const Target *t, Oid role, const char *key)
+{
+	Guard		g;
+	MemoryContext cx = CurrentMemoryContext;
+	volatile int mark = guard_mark();
+	char	   *one[1] = {(char *) key};
+	Oid			at[2];
+	Datum		av[2];
+	int			nargs;
+	char	   *sql = psprintf(VISIBLE_SQL " FOR KEY SHARE OF r", t->key_col, t->src,
+							   keys_where(t, text_array(one, 1), at, av, &nargs));
+	bool		found;
+
+	must_be_keyed(t, true);
+	PG_TRY();
+	{
+		guard_enter(&g, role, GUARD_READER, NULL);
+		XactReadOnly = false;
+		if (SPI_execute_with_args(sql, nargs, at, av, NULL, false, 1) != SPI_OK_SELECT)
+			elog(ERROR, "phasevec: the row could not be read");
+		found = SPI_processed > 0;
+		XactReadOnly = true;
+		guard_leave(&g);
+	}
+	PG_CATCH();
+	{
+		ReThrowError(guard_catch(mark, cx));
+	}
+	PG_END_TRY();
+	return found;
+}
+
+/*
+ * (twenty-seventh review, the owner's rule (b): no claim by coming first) May the caller make the
+ * first claim on this key by writing its row: UPDATE on the watched table, and the row passing its
+ * row-level security for an UPDATE (key_writable)? Asked only when it decides: the caller does not
+ * have the table owner's privileges (who may claim any row that exists) and the key has no claim
+ * (read as the extension's owner); otherwise false, which the owner's SQL does not read
+ * (_claim_mine). Reading a row is never enough. SPI connected.
+ */
+static bool
+caller_writes(const Target *t, Oid owner, Oid caller, const char *key)
+{
+	Who			was;
+	Oid			at[2] = {INT4OID, TEXTOID};
+	Datum		av[2] = {Int32GetDatum(t->watch), CStringGetTextDatum(key)};
+	bool		claimed;
+
+	if (has_privs_of_role(caller, t->relowner))
+		return false;
+	become(owner, &was);
+	if (SPI_execute_with_args("SELECT 1 FROM phasevec.truth x "
+							  "WHERE x.watch OPERATOR(pg_catalog.=) $1 "
+							  "AND x.key OPERATOR(pg_catalog.=) $2", 2, at, av, NULL, true, 1)
+		!= SPI_OK_SELECT)
+		elog(ERROR, "phasevec: the claim could not be read");
+	claimed = SPI_processed > 0;
+	unbecome(&was);
+	if (claimed)
+		return false;
+	if (pg_class_aclcheck(t->relid, caller, ACL_UPDATE) != ACLCHECK_OK)
+		return false;
+	return key_writable(t, caller, key);
+}
+
+/*
+ * phasevec._cluster() (twenty-seventh review, RT27PA-3, RT27PL-1): this cluster's system
+ * identifier, which every database of it and a physical replica share, and a cluster pg_upgrade
+ * makes or one a dump is restored into do not. An author or a steward recorded elsewhere (and in
+ * another installation, phasevec._here()) is no one here.
+ */
+Datum
+phasevec_cluster(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) GetSystemIdentifier());
 }
 
 /* key_visible from outside SPI */
@@ -4020,23 +4108,26 @@ assert_claim(Oid owner, Oid author, Oid caller, Datum watch, Datum key, Datum pr
 			 Datum expires, bool expires_null, ArrayType *env)
 {
 	MemoryContext keep = CurrentMemoryContext;
-	Oid			types[11] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, JSONBOID, TIMESTAMPTZOID, OIDOID,
-	BYTEAOID, TEXTARRAYOID, OIDOID, BOOLOID};
-	Datum		values[11];
-	char		nulls[12] = "           ";
+	Oid			types[12] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, JSONBOID, TIMESTAMPTZOID, OIDOID,
+	BYTEAOID, TEXTARRAYOID, OIDOID, BOOLOID, BOOLOID};
+	Datum		values[12];
+	char		nulls[13] = "            ";
 	bytea	   *seen = NULL;
 	Who			was;
 	Target		t;
 	char	   *k = TextDatumGetCString(key);
 	bool		sees;
 	bool		caller_sees_it;
+	bool		writes;
 
 	become(owner, &was);
 	load_target(watch, false, &t, keep);
 	unbecome(&was);
 	must_read(&t, author);
 	sees = key_visible(&t, author, GUARD_READER, NULL, k);
-	caller_sees_it = caller == author ? sees : key_visible(&t, caller, GUARD_READER, NULL, k);
+	caller_sees_it = !rls_for(&t, caller) ? true :
+		caller == author ? sees : key_visible(&t, caller, GUARD_READER, NULL, k);
+	writes = caller_writes(&t, owner, caller, k);
 	if (!proof_null && sees)
 	{
 		char	   *one[1] = {k};
@@ -4062,10 +4153,11 @@ assert_claim(Oid owner, Oid author, Oid caller, Datum watch, Datum key, Datum pr
 	values[8] = PointerGetDatum(env);
 	values[9] = ObjectIdGetDatum(caller);
 	values[10] = BoolGetDatum(caller_sees_it);
+	values[11] = BoolGetDatum(writes);
 
 	become(owner, &was);
 	if (SPI_execute_with_args("SELECT phasevec._assert_set($1, $2, $3, $4, $5, $6, $7, $8, $9, "
-							  "$10, $11)", 11, types, values, nulls, false, 1) != SPI_OK_SELECT)
+							  "$10, $11, $12)", 12, types, values, nulls, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "phasevec: the claim was not recorded");
 	unbecome(&was);
 }
@@ -4149,15 +4241,16 @@ claim_door(FunctionCallInfo fcinfo, const char *fn, int nkeys, Target *t, Oid *c
 }
 
 /*
- * Does the caller see the row of this key? SPI connected. (twenty-sixth review, RT26PA-2) The row
- * must exist, with or without row-level security: until this review a table with none answered
- * true for any key, and a reader granted refute() or supersede() claimed keys no row had yet; the
- * author who then wrote the row was refused.
+ * Is the caller not kept from the row of this key by row-level security? (True without it; the
+ * owner's SQL checks that the row exists, phasevec.sources.) SPI connected. (twenty-sixth review,
+ * RT26PA-2) A key with no row is no one's to claim first. (twenty-seventh review) The row's
+ * existence is the SQL's to check, alike for every caller (RT28-RESERVE-PRIV); this is what a
+ * steward's right reaches (RT28-STEWARD-ORACLE).
  */
 static bool
-caller_sees(const Target *t, Oid caller, Datum key)
+caller_sees(const Target *t, Oid caller, bool rls, Datum key)
 {
-	return key_visible(t, caller, GUARD_READER, NULL, TextDatumGetCString(key));
+	return !rls || key_visible(t, caller, GUARD_READER, NULL, TextDatumGetCString(key));
 }
 
 /* Run the owner's SQL for a claim door, then leave SPI. */
@@ -4177,9 +4270,9 @@ claim_write(Oid owner, const char *sql, int n, Oid *types, Datum *values, const 
 Datum
 phasevec_refute(PG_FUNCTION_ARGS)
 {
-	Oid			types[5] = {TEXTOID, TEXTOID, TEXTOID, OIDOID, BOOLOID};
-	Datum		values[5];
-	char		nulls[6] = "     ";
+	Oid			types[6] = {TEXTOID, TEXTOID, TEXTOID, OIDOID, BOOLOID, BOOLOID};
+	Datum		values[6];
+	char		nulls[7] = "      ";
 	Target		t;
 	Oid			caller,
 				owner;
@@ -4191,8 +4284,11 @@ phasevec_refute(PG_FUNCTION_ARGS)
 	values[2] = PG_ARGISNULL(2) ? (Datum) 0 : PG_GETARG_DATUM(2);
 	nulls[2] = PG_ARGISNULL(2) ? 'n' : ' ';
 	values[3] = ObjectIdGetDatum(caller);
-	values[4] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(1)));
-	claim_write(owner, "SELECT phasevec._refute_set($1, $2, $3, $4, $5)", 5, types, values, nulls);
+	values[4] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	values[5] = BoolGetDatum(caller_writes(&t, owner, caller,
+											 TextDatumGetCString(PG_GETARG_DATUM(1))));
+	claim_write(owner, "SELECT phasevec._refute_set($1, $2, $3, $4, $5, $6)", 6, types, values,
+				nulls);
 	PG_RETURN_VOID();
 }
 
@@ -4200,9 +4296,9 @@ phasevec_refute(PG_FUNCTION_ARGS)
 Datum
 phasevec_supersede(PG_FUNCTION_ARGS)
 {
-	Oid			types[7] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, OIDOID, BOOLOID, BOOLOID};
-	Datum		values[7];
-	char		nulls[8] = "       ";
+	Oid			types[8] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, OIDOID, BOOLOID, BOOLOID, BOOLOID};
+	Datum		values[8];
+	char		nulls[9] = "        ";
 	Target		t;
 	Oid			caller,
 				owner;
@@ -4215,9 +4311,11 @@ phasevec_supersede(PG_FUNCTION_ARGS)
 	values[3] = PG_ARGISNULL(3) ? (Datum) 0 : PG_GETARG_DATUM(3);
 	nulls[3] = PG_ARGISNULL(3) ? 'n' : ' ';
 	values[4] = ObjectIdGetDatum(caller);
-	values[5] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(1)));
-	values[6] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(2)));
-	claim_write(owner, "SELECT phasevec._supersede_set($1, $2, $3, $4, $5, $6, $7)", 7, types,
+	values[5] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	values[6] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(2)));
+	values[7] = BoolGetDatum(caller_writes(&t, owner, caller,
+											 TextDatumGetCString(PG_GETARG_DATUM(1))));
+	claim_write(owner, "SELECT phasevec._supersede_set($1, $2, $3, $4, $5, $6, $7, $8)", 8, types,
 				values, nulls);
 	PG_RETURN_VOID();
 }
@@ -4226,8 +4324,8 @@ phasevec_supersede(PG_FUNCTION_ARGS)
 Datum
 phasevec_unsupersede(PG_FUNCTION_ARGS)
 {
-	Oid			types[4] = {TEXTOID, TEXTOID, OIDOID, BOOLOID};
-	Datum		values[4];
+	Oid			types[5] = {TEXTOID, TEXTOID, OIDOID, BOOLOID, BOOLOID};
+	Datum		values[5];
 	Target		t;
 	Oid			caller,
 				owner;
@@ -4237,9 +4335,11 @@ phasevec_unsupersede(PG_FUNCTION_ARGS)
 	values[0] = PG_GETARG_DATUM(0);
 	values[1] = PG_GETARG_DATUM(1);
 	values[2] = ObjectIdGetDatum(caller);
-	values[3] = BoolGetDatum(caller_sees(&t, caller, PG_GETARG_DATUM(1)));
-	claim_write(owner, "SELECT phasevec._unsupersede_set($1, $2, $3, $4)", 4, types, values,
-				"    ");
+	values[3] = BoolGetDatum(caller_sees(&t, caller, rls, PG_GETARG_DATUM(1)));
+	values[4] = BoolGetDatum(caller_writes(&t, owner, caller,
+											 TextDatumGetCString(PG_GETARG_DATUM(1))));
+	claim_write(owner, "SELECT phasevec._unsupersede_set($1, $2, $3, $4, $5)", 5, types, values,
+				"     ");
 	PG_RETURN_VOID();
 }
 
@@ -4344,16 +4444,20 @@ in_text_array(ArrayType *a, const char *s)
 	return false;
 }
 
-/* The orphans of a watch ($1): a proof whose author is unknown or no longer the role it was. */
+/*
+ * The orphans of a watch ($1): a proof whose author is unknown or no longer the role it was, or
+ * (twenty-seventh review) was that role in another cluster and installation (_from_here()).
+ */
 #define ORPHANS_SQL \
 	"SELECT x.key, x.proof, x.topic, x.support, x.expires_at, x.asserted_by::pg_catalog.text " \
 	"FROM phasevec.truth x WHERE x.watch OPERATOR(pg_catalog.=) $1 " \
 	"AND phasevec._claim_state(x.retired_at, x.proof, x.halted) OPERATOR(pg_catalog.=) " \
 	"ANY ('{judged,halted}'::pg_catalog.text[]) " \
 	"AND x.verdict OPERATOR(pg_catalog.<>) 'replaced' " \
-	"AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r " \
+	"AND (NOT phasevec._from_here(x.asserted_in, x.asserted_cluster) " \
+	"OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r " \
 	"WHERE r.oid OPERATOR(pg_catalog.=) x.asserted_by_oid " \
-	"AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by) "
+	"AND r.rolname OPERATOR(pg_catalog.=) x.asserted_by)) "
 
 /*
  * phasevec.adopt(watch text, author regrole, keys text[] DEFAULT NULL, superuser_keys text[] DEFAULT NULL)
