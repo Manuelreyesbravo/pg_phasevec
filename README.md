@@ -399,6 +399,76 @@ SELECT watch, verdict, baseline, current, drift, k, sample, via, nprobe, m FROM 
   `adopt()` by a role that is neither the owner nor a steward must fail and change nothing.
 
 
+* **No claim by coming first; a steward is the owner's, and reaches the rows it sees; an author
+  is its cluster's; pg_upgrade takes the database; the update's first wait is queued again
+  (twenty-seventh review).** The owner of the project made rule (b) precise: nobody gets a claim
+  by arriving first, and reading a row is never enough.
+  * *The first claim on a row went to whoever came first and saw it (RT27PA-1,
+    RT28-DECISION-FIRSTCLAIM).* A role with `SELECT` alone, or a tenant reading a shared row,
+    claimed every row that had no claim yet (one `refute()` per row, or `assert()` with no
+    proof), and the role that wrote the row was then refused. A key with no claim now gets one
+    only from a role with an explicit privilege over its row: the table's owner's, a steward's
+    (on a row row-level security does not keep it from), or `UPDATE` on the watched table with
+    the row passing the caller's row-level security for an `UPDATE` (its `SELECT` and `UPDATE`
+    `USING` policies). The row is taken `FOR KEY SHARE` as the caller, in the guard, and let go
+    at once. `UPDATE` on some columns only is not `UPDATE` on the table.
+  * *The owner and the stewards claimed keys no row had (RT28-RESERVE-PRIV).* A first claim, by
+    anyone, needs the row to exist (`phasevec.sources` has it).
+  * *A steward under row-level security learned the replacement chain of hidden keys
+    (RT28-STEWARD-ORACLE).* Its `supersede()` of a hidden key ran the cycle check, whose error
+    named hidden keys, or succeeded. A steward's right now reaches the rows it is not kept from by
+    row-level security; on any other it is refused like any other role, alike in the chain or
+    not. (`adopt()` already left such rows.)
+  * *A tenant learned that a hidden key held a claim 0.19.0 wrote (RT28-MIGRATED-ORACLE).* The
+    per-key 0.19.0 check ran before the claim check. Every door now takes the claim, checks it,
+    and only then says it is 0.19.0's.
+  * *Revoking a steward (RT27PA-2) and changing the table's owner (RT27PA-4, RT27PL-INFO-1).* A
+    steward counts while the role that named it, as the table's owner, still owns the table
+    (`phasevec.stewards.named_by`): `ALTER TABLE ... OWNER TO` ends every steward the former owner
+    named, until the new owner names it. A revoked steward (`steward(..., false)`, or a membership
+    revoked) changes nothing from then on; a claim it was the last to make (an `assert()`, a
+    `refute()`) stays in its name, and its author, the owner and the stewards change it, as any
+    claim. The owner chose this.
+  * *A restore into another cluster gave a re-created role the claims and the stewardships of the
+    role it named (RT27PA-3, RT27PL-1).* Roles were matched by OID and name, and a role with
+    `CREATEROLE` there made one under the stored OID and name (`lo_create()` to move the OID
+    counter; or roles made in the same order in two fresh clusters). Every author and steward is
+    now also bound to where it was recorded: the cluster (`phasevec._cluster()`, its system
+    identifier, which every database of it and a physical replica share) or this installation
+    (`phasevec._here()`, a value made with the extension, which `pg_upgrade` keeps and `pg_dump`
+    does not). Recorded in neither, it is no one: the claim is an orphan for the owner to
+    `adopt()`, the steward is named again. A restore into another database of the same cluster
+    keeps them.
+  * *`pg_upgrade` refused every database with pg_phasevec (RT27PL-2).* `phasevec.watches.lexical`
+    was `regconfig` since 0.6.0, and `pg_upgrade` refuses a table column of a `reg*` type other
+    than `regclass`, `regrole` and `regtype`, whatever it holds: 0.19.0 had the same problem. The
+    column is now the configuration's schema-qualified name (`text`), found when it is used; the
+    update converts it. Authors, stewards and verdicts come through `pg_upgrade`. A configuration
+    renamed or dropped since names none: rows are noted without their lexical reading
+    (`find_hybrid()` says the reading is partial) until `phasevec.lexical()` names one again; a
+    write is not refused for it (a dropped one refused every write until now).
+  * *Replication between two 0.20.0 servers labelled every row 0.19.0's (RT27PL-3).* Every write
+    of 0.20.0 now leaves a new mark in the row (`written`); an apply whose row has none, or keeps
+    the one it had (a publisher with no such column), is 0.19.0's and reads so, as before
+    (RT26PL-1); one with a new mark keeps the publisher's `data_version`, and `migrate()` finds
+    nothing to bring.
+  * *With `lock_timeout = 0` the update still starved (RT28-LT0-1, RT27PU-1).* The twenty-sixth
+    review's "the caller wrote" was "the transaction has an id", and `ALTER EXTENSION` writes
+    `pg_extension` before it runs the script: the id was always there, so every first wait was
+    bounded (half the `deadlock_timeout`), and readers that each held `phasevec.watches` 1.5 s
+    and overlapped kept it out until `statement_timeout`. The script now asks `pg_locks` whether
+    the caller's transaction holds a lock of its own (anything but its transaction ids): a lone
+    `ALTER EXTENSION` holds none, and its first wait is queued with no bound again.
+
+  `test/review27.sh` plays them, 13 checks; 11 fail on b197a13 (a revoked steward's own claims,
+  and 0.19.0 refused by `pg_upgrade`, are controls). Case 8 runs a real `pg_upgrade` from 18 to
+  19 when `PG_OLD` names the older binaries. Regression tests and shell suites whose authors held
+  only `SELECT` now grant them `UPDATE` on the watched table (and `truth_read_path` an `UPDATE`
+  policy); in `review26.sh` the steward of case 5 sees the rows it changes. `review25.sh` compares
+  a fresh install and the update without `_here()`'s value, which is each installation's own. The
+  fuzzer's `INV-AUTHOR` follows the rule (`Model.writes`, `steward_reaches`), with a step that
+  revokes and grants `ygg_autor`'s `UPDATE`.
+
 * **A verdict is about a claim, and the claim is the text its author read.** `assert()` reads the row through the watch's recipe (rendered as above) and records the hash of that text (`truth.asserted_for`) with its author. A verdict judges that text, the proof, the author and its settings together, and records a binding of the four (`truth.verified_for`), each part framed so that no two claims bind alike (seventeenth review). A writer who edits the row afterwards changes the text, not the claim: the key reads `unproven`, `verify()` does not judge the new text whatever the proof reads, and it is a claim again when its author (or `adopt()`) asserts it again. Until 0.19.0 a row edited after it was verified kept `verified`, and `brief()` served its new text as verified; the first cut verified any new text again when the proof did not read the row (`test/sql/truth_binding.sql`, `test/sql/truth_claim.sql`). An author must be able to `SELECT` the table it asserts about (and, with row-level security, see the row), at `assert()` and at every `verify()`.
 * **The row is read, not a cache.** `verify()` reads the live row before and after the proof, each time with a new snapshot. `brief()` hashes the line it serves and serves it as `verified` only if it is the text the verdict judged. `phasevec.sources.text_hash`, kept by the watch trigger, is not evidence: a change the trigger never saw (`ALTER TABLE ... DISABLE TRIGGER`, `session_replication_role = replica`, `TRUNCATE` and a new `INSERT`, `ALTER COLUMN ... TYPE ... USING`, a renamed column with a new one under its name, a hand-edited dump) reads `unproven` in `brief()` and is not verified by `verify()` (`test/sql/truth_claim.sql`, `test/dump_roundtrip.sh`).
 * **A writer never waits on a verifier, and two verifiers do not wait on each other.** Whether a verdict still holds is read, not written: a `verified` or `refuted` whose row's text is not the one it judged reads `unproven` (`_verdict()`), and `verify()` takes such a claim first. `verify()` takes each claim's row before it judges it, and leaves one another transaction holds (another `verify()`, an uncommitted `assert()`): two `verify()` calls of one watch share it out. In the fifth cut a trigger on `phasevec.sources` wrote the verdict as the text changed, so a write waited on every open transaction that had judged that key, and two `verify()` calls of one watch locked its verdicts in different orders. Under writes (three clients editing texts, one editing them and back, two closing tasks) and two `verify()` loops over 1000 proofs, 20 s: a writer took 14.6-23.2 ms per edit (0.19.0: 0.17 ms; now 0.18-0.19 ms), 44-60% of the `verify()` calls died as deadlocks, each losing every verdict it had reached (0.19.0 and now: none; now 876-900 calls in 20 s, 0.19.0: 552) (`test/truth_locks.sh`). Measured again for the seventh review (PostgreSQL 19, 1000 claims each reading its row, three clients editing texts, one editing them and back, two closing tasks, two `verify()` loops over all of them, 15 s, three interleaved rounds on a loaded host): an edit took 0.18-0.19 ms (sixth cut 0.19-0.28 ms, 0.19.0 0.14-0.15 ms), with no deadlock and no failed call in any of the three; the two loops made 730-822 `verify()` calls (sixth cut 904-1150, 0.19.0 348-359). A claim whose row comes back to the text it judged is judged again now, where the sixth cut had written it off as `unproven`. Without writers a `verify()` of the 1000 claims took ~69 ms then (sixth cut ~65 ms, 0.19.0 ~30 ms; medians of four); for what it takes since the eighth review, see the cost below.
@@ -415,7 +485,10 @@ SELECT watch, verdict, baseline, current, drift, k, sample, via, nprobe, m FROM 
 **Upgrading from 0.19.0** (`test/sql/upgrade_020.sql`). The update refuses a database that is not UTF8, and one with a watch outside the supported configurations, naming each (above). Every `verified` goes back to `unproven`, with the reason in `last_error`: it was reached with the verifier's rights, about no claim. `refuted` stays refuted, about the text the row has now. A claim `refute()` refuted is retired, as `refute()` retires one now (eighteenth review): 0.19.0 recorded `refuted` in two places that its columns tell apart. `refute()` always gave a reason (`last_error`) and stamped `verified_at` and `changed_at` with one `now()`; `verify()` recorded a proof's `false` with no reason, and its error at a `verified_at` later than the `assert()` that set `changed_at`. So a refuted claim with a reason judged in the instant it last changed is retired, and so is one with no proof; a replaced claim whose last verdict had a reason is retired too (0.19.0 cannot tell its `refute()` from a proof's error once `supersede()` changed `changed_at`). The safe side: the only claims this retires that `refute()` did not are those a proof refuted by an error in the transaction that asserted it, and an `assert()` judges them again. What the columns cannot show is a claim `refute()` refuted under 0.19.0 that the next `verify()` judged `verified` again: it is a `verified` claim, back to `unproven` above, and `adopt()` asserts it again; the application that retired it must refute it again after the update (yggdrasil does, in step T2c of its procedure). Every row of every watch is rendered again in the pinned settings; a text that reads otherwise now (a recipe that prints a date, a time, a float or a money value, or calls a function the table's owner may not run) is noted again: its reading turns stale and its verdict `unproven`. A `refuted` claim, and every claim the update retires, is bound to the text as rendered here, so it stays `refuted` (twenty-first review). The upgrade fails if a recipe cannot run as its table's owner, read-only. Proofs asserted before 0.20.0 have no author and do not run until they are asserted again. `phasevec.adopt(watch, author)` asserts them again in the name of the role it is given: the caller must hold that role's privileges (be it, `SET ROLE` to it, or be granted it); it is the owner's to run or to grant; it returns every proof with its former author; and a superuser becomes the author only of the keys named in `p_superuser_keys` (an orphaned proof may be anyone's SQL, and a role can orphan its own on purpose). Adopt as the least-privileged role that can read what the proofs read. Naming an author in `phasevec.truth` by hand is not enough, a claim is also the text its author read. Calls of `verify()` and `verify_one()` keep working, except with `p_timeout_ms => 0`. `brief()` is granted alone; grants on `_brief_keys` are gone. A trigger of your own that asserts claims must fire on every column the recipe reads: an edit of a column it does not watch leaves the claim `unproven` until it is asserted again. A recipe that writes, or that the table's owner cannot run, now fails wherever it runs, including in the watch trigger on every write to the table. A database that ran an unpublished cut of 0.20.0 cannot be updated in place to this one (same version): drop and create the extension, or dump and restore the database (its proofs then wait for `adopt()`). **Reconnect after the update** (or restart the server): a session that loaded the library of 0.19.0 keeps it, and the new watch trigger is not in it. Its writes to a watched table are refused with a message that says so (the trigger is in a library of its own, `pg_phasevec_observe`, installed with the extension, which no older session has loaded); its calls of the new C functions (`verify()`, `brief()`, `recall()`, ...) fail with "could not find function" (`test/upgrade_reconnect.sh`). **Run the update alone**: `ALTER EXTENSION pg_phasevec UPDATE` in a transaction of its own, at READ COMMITTED (twenty-fourth review: it refuses REPEATABLE READ and SERIALIZABLE), with a `lock_timeout` that says how long it may wait (it waits for the writers of watched tables and for any open transaction that holds a lock on phasevec's tables or functions, holding nothing of phasevec's while it waits; it then waits for each of the rest at most half the `deadlock_timeout`, giving up the try rather than any other session; `0` waits until it has everything), retried if it times out (it then stops with `phasevec: the update to 0.20.0 could not take phasevec's tables within lock_timeout`, or `... phasevec's function ...`, naming the sessions that hold it, and nothing is changed); with no object outside the extension that refers to a function it drops (it names them all, and stops); not in one transaction with DDL on a watched table (`CREATE TRIGGER`, `DROP TRIGGER`, `ALTER TABLE`): that DDL waits for the table's writers while the update holds the extension's tables they are waiting for, a deadlock that aborts one side. The update itself takes the extension's tables in the order its writers do (`test/upgrade_locks.sh`), and no watched table (twentieth review, `test/upgrade_writers.sh`): it gives each watch its `TRUNCATE` trigger only where the table is free at that moment, and for each table that was being written it prints (a `WARNING`) the statement to run afterwards, one per watch, each in its own transaction: `SELECT phasevec.watch_truncate('<watch>');` (it waits for that table's writers, bounded by `lock_timeout`; true when it made the trigger, false when it was there; it is the extension owner's to run, or to grant to the table's owner together with `EXECUTE` on `phasevec._truncate_trigger(int, boolean)` and `SELECT (id, name, source)` on `phasevec.watches`, which shows that role every watch's name and table). While it holds phasevec's tables the update waits for no lock on what a watch reads (twenty-first review): when another session holds a lock on any of it (a watched table, its indexes, what a recipe reads) for more than 0.3 s, it stops with `... locked by another session: nothing was changed` and the sessions to wait for, and is run again once they end. The watches that still lack it: `SELECT w.name FROM phasevec.watches w WHERE NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = w.source AND t.tgname = 'phasevec_watch_' || w.id || '_truncate')`. A trigger or function of yours that asserts claims as `SECURITY DEFINER` makes its owner the author of every claim it asserts from the update on (a superuser owner: proofs that run as superuser, and a verifier that may not act as it never judges them); `adopt()` does not take those back, its author is known. Make it assert through a function owned by the role that should author the proofs before the update (on 0.19.0 `assert()` has the same signature), then `adopt()` what was asserted before, and check that every claim with a proof, not replaced, has that author. A proof or a recipe that called a volatile system function outside the reviewed list (`nextval`, `currval`, `pg_read_file`, ...) or `txid_current()`, ran a command other than those above, read a cursor its caller had open, or read a temporary table or called a temporary function, now fails (a proof is refuted with the reason). A temporary table cannot be watched. A watch over a table with `FORCE ROW LEVEL SECURITY` now renders every row (as the owner, without the policies).
 (twenty-sixth review) `adopt()` changes claims: its caller must also be the watched table's owner
 or a steward of the watch, and it takes only claims on rows the caller sees. After a restore into
-another cluster every steward is no one until the table's owner names it again.
+another cluster every steward is no one until the table's owner names it again, and every claim an
+orphan until it adopts it (twenty-seventh review: also when a role there has the same OID and
+name). `pg_upgrade` keeps them (twenty-seventh review: until then it refused every database with
+pg_phasevec, 0.19.0's too, for the type of `watches.lexical`).
 
 **Moving a 0.19.0 database by `pg_dump`** (twenty-fifth review, `test/review25.sh`). Restore the
 dump where 0.20.0 is installed (`pg_dump` names no version: the restore makes 0.20.0 and copies in
@@ -428,35 +501,46 @@ watch refuses, naming `phasevec.migrate()`. Proofs then wait for `adopt()`, as a
 The update also stops, naming them all, on a column outside the extension that stores the row
 type of `phasevec.truth` or `phasevec.watches`; when it stops on a lock it names the sessions,
 and the prepared transactions (`pg_prepared_xacts`), that hold it.
-Moving it by logical replication (twenty-sixth review): every row the subscription writes reads
-as 0.19.0's, also after a first `migrate()`; run `migrate()` again after cut-over, with the
-subscription dropped. After `DROP EXTENSION ... CASCADE`, `CREATE EXTENSION` and a data-only
+Moving it by logical replication (twenty-sixth review): every row a 0.19.0 publisher's
+subscription writes reads as 0.19.0's, also after a first `migrate()`; run `migrate()` again after
+cut-over, with the subscription dropped (twenty-seventh review: a 0.20.0 publisher's rows keep
+their version). After `DROP EXTENSION ... CASCADE`, `CREATE EXTENSION` and a data-only
 restore of phasevec's tables, `migrate()` makes each watch's triggers again.
 
-**Who changes a claim** (twenty-sixth review). A key has one claim, and the claim belongs to the
-role that last made it what it is: the one that asserted it, retired it with `refute()`, or made
-it a placeholder with `supersede()`. That role (or a role with its privileges, while it is still
-the same role, by OID and name) changes it; so does the owner of the watched table (or a role with
-its privileges); and so does a steward of the watch, a role the table's owner names with
-`SELECT phasevec.steward('watch', 'role');` and takes back with `phasevec.steward('watch',
-'role', false)`. No one else changes it, whoever sees the row, and also when its author is gone
-(dropped, renamed, restored into another cluster, or asserted before 0.20.0): such a claim waits
-for the owner or a steward, who settles it or gives it back to its author with `adopt()`. A key
-with no claim gets one from a role granted the author functions that sees its row, which must
-exist.
+**Who changes a claim** (twenty-seventh review). A key has one claim, and nobody gets it by coming
+first: a key with no claim gets one only from a role with an explicit privilege over its row, which
+must exist, namely the watched table's owner (or a role with its privileges), a steward of the
+watch, or a role that holds `UPDATE` on the table and whose row-level security lets it `UPDATE`
+that row; reading a row is never enough. A claim that exists belongs to the role that last made it
+what it is (the one that asserted it, retired it with `refute()`, or made it a placeholder with
+`supersede()`), and is changed by that role or one with its privileges, while it is still that
+role (same OID and name, recorded in this cluster or this installation), by the table's owner, and
+by a steward: a role the table's owner names with `SELECT phasevec.steward('watch', 'role');` and
+takes back with `phasevec.steward('watch', 'role', false)`, which counts while that owner still
+owns the table and reaches only the rows row-level security does not keep it from. A claim whose
+author is gone (dropped, renamed, restored into another cluster, asserted before 0.20.0) waits for
+the owner or a steward, who settles it or gives it to an author with `adopt()`. A steward revoked
+keeps the claims it made in its name, and the owner and the other stewards change them.
 
 **Limits.**
 
-* A key has one claim, and the first claim on a row that has none goes to a role granted the
-  author functions that sees the row (twenty-sixth review: a row that exists; no claim with an
-  author is taken any more). A role that sees other tenants' rows, granted `assert()` or
-  `refute()`, can therefore make the first claim on them: grant the author functions to roles
-  that see only the rows they author, and let the table's owner or a steward settle the rest.
-  A steward changes every claim of its watch, also on rows row-level security hides from it (it
-  is shown none of them: `adopt()` leaves them, and `supersede()` to a row it does not see reads
-  as to a row that does not exist). The extension's owner reads `phasevec.stewards`. A steward is
-  a role by OID and name, like an author: after a restore into another cluster, name the
-  stewards again. `supersede()` runs only at READ COMMITTED.
+* A key has one claim. The first claim on a row goes to a role that may `UPDATE` it
+  (twenty-seventh review), so a writer that only `INSERT`s, or holds `UPDATE` on some columns,
+  does not make it: grant `UPDATE` on the table (row-level security still decides which rows), or
+  let the owner or a steward make it. The check takes the row `FOR KEY SHARE` as the caller and
+  lets it go: it waits, as a foreign key check does, for a transaction that is deleting the row or
+  changing its key. A steward changes the claims of its watch on the rows row-level security does
+  not keep it from, and is refused on the others like any role; the cycle check of its
+  `supersede()` reads the chain through rows it does not see, and its error names only the two
+  keys it gave. Name a login role a steward, not a group: whoever may grant the group makes new
+  stewards (RT27PA-INFO-1). A steward counts while the role that named it owns the table. The
+  extension's owner reads `phasevec.stewards`. A steward, like an author, is a role by OID and
+  name in its cluster (or its installation, through `pg_upgrade`): after a restore into another
+  cluster, name the stewards again and `adopt()` the claims. A physical copy of a cluster shares
+  its identifier: a cluster promoted from a replica and grown apart is still "the same cluster"
+  for a dump of the other. A claim recorded before a `pg_upgrade` and restored after it into
+  another database is an orphan there (another cluster, another installation): `adopt()` it.
+  `supersede()` runs only at READ COMMITTED.
 * Two `ALTER EXTENSION pg_phasevec UPDATE` at once: the second fails with PostgreSQL's `tuple
   concurrently updated`, raised before its script runs (when it writes the extension's row), and
   changes nothing. While the update waits for a lock (with `lock_timeout = 0`, for as long as it
@@ -466,11 +550,11 @@ exist.
   another in one transaction: run it before the database takes writes again, or a transaction
   that writes two of those tables can deadlock with it (one of the two is aborted, nothing of it
   changed).
-* Every row a logical replication worker writes into `phasevec.truth` or `phasevec.watches`
-  reads as 0.19.0's until `migrate()` (twenty-sixth review, RT26PL-1), whatever the publisher's
-  version: run `migrate()` after cut-over, with the subscription dropped. Between two 0.20.0
-  servers this sends each replicated `verified` back to `unproven` (judged again by the next
-  `verify()`); `migrate()` judges a replicated row by 0.19.0's columns.
+* A row a 0.19.0 publisher's subscription writes into `phasevec.truth` or `phasevec.watches`
+  reads as 0.19.0's until `migrate()` (twenty-sixth review, RT26PL-1): run `migrate()` after
+  cut-over, with the subscription dropped. A 0.20.0 publisher's rows keep their version
+  (twenty-seventh review); their authors and stewards are another cluster's, so on a subscriber
+  in another cluster every claim is an orphan and reads `unproven` until the owner adopts it.
 * A recipe renders a text or nothing (twenty-second review): an `ERROR` that comes from the server or another session (a lock another session holds, a deadlock, a cancel or timeout, the server short of a resource, an internal error) raised while it renders ends the statement that rendered it, even when the recipe catches it and returns a fallback; a write to the table then fails, where before it noted the fallback as the row's text. A `RAISE` of the recipe's own with such a code is its own. A message of class 53 (insufficient resources) is taken by its code alone, so one that is only logged (`out of file descriptors`) also ends the render. A recipe that catches `lock_not_available` and tries again in a loop holds the update to 0.20.0, which reads under a `lock_timeout` of 1 ms, until the update's `statement_timeout`: run the update with one. A recipe that reads the session's timeouts (`current_setting('lock_timeout')`) can render otherwise during the update, which notes that text.
 * The update to 0.20.0 (twenty-fourth review) takes, before it changes anything, phasevec's tables and every function of phasevec's (its catalog row, and its object lock in `DROP FUNCTION`'s mode). Once it holds them, it waits at most half the `deadlock_timeout` its session reads, at most 100 ms (or the caller's `lock_timeout`, if shorter), for anything else, with its own deadlock check after 1 ms. A wait that lasts longer ends it with PostgreSQL's own `canceling statement due to lock timeout` (or `deadlock detected`), nothing changed, and it is run again. Examples: a `VACUUM FULL` or `REINDEX` of a system catalog, or another transaction's uncommitted catalog entry with the same name as one the update creates. The bound protects the other sessions from the deadlock detector only if their `deadlock_timeout` is at least the update's session's: a role given a shorter one (`ALTER ROLE ... SET deadlock_timeout`, a superuser's) can still be the one aborted, in the window of a wait that began before it. The deadlock check that finds a cycle as the update begins to wait runs 1 ms in; another session's check that falls inside that millisecond aborts that session. Under holders that keep every lock longer than the bound reaches (half the `deadlock_timeout`) on both sides, the update tries on until its `lock_timeout`: end them, or run it when they are shorter. An object made over a function the update drops between its check and its `DROP` (it holds the function's lock by then, which PostgreSQL takes to record such a dependency) is not expected; if one is, the `DROP` fails with PostgreSQL's own message, nothing changed. A watch whose recipe fails on its rows during the update (an error of its own, or of its rows) stops the update for the whole database, every such watch named, until its owner fixes it or the watch is dropped. A recipe's own `RAISE` of the out-of-resources class (53) is still taken for the server's: the guard reads that class by its code alone.
   (twenty-sixth review) Once it holds something, it tries each lock first without queueing,
@@ -478,18 +562,23 @@ exist.
   go of everything and the next waits for that lock first, holding nothing (RT26PU-1). What stays:
   a session queued ahead of the update (not a holder) closes a cycle only through queue order,
   which the deadlock detector rearranges without aborting anyone. If the caller's transaction
-  wrote before the update (a migration tool's one transaction, or an update from before 0.19.0 in
-  one `ALTER EXTENSION`), the first wait is bounded too and a deadlock in it ends the update;
-  with `lock_timeout = 0` holders of `phasevec.watches` that each keep it longer than the bound
-  and overlap can then starve it: run the update in a transaction of its own. Event triggers see
-  the script's own DDL (`CREATE FUNCTION`, six `ALTER FUNCTION ... SET search_path`, ...), not one
-  per function lock: a policy trigger that forbids `ALTER FUNCTION` still stops the update.
+  holds a lock it took before the update (it read or wrote a table, took an advisory lock: a
+  migration tool's one transaction, or an update from before 0.19.0 in one `ALTER EXTENSION`;
+  twenty-seventh review: read from `pg_locks`, not from the transaction's id), the first wait is
+  bounded too and a deadlock in it ends the update; with `lock_timeout = 0` holders of
+  `phasevec.watches` that each keep it longer than the bound and overlap can then starve it: run
+  the update in a transaction of its own. Event triggers see the script's own DDL (`CREATE
+  FUNCTION`, six `ALTER FUNCTION ... SET search_path`, ...), not one per function lock: a policy
+  trigger that forbids `ALTER FUNCTION` still stops the update. Every event trigger fires for the
+  script's DDL (some 75 `CREATE FUNCTION`, 25 `COMMENT`, 18 `DROP FUNCTION`, 11 `REVOKE`): one
+  that raises stops the update, and one that names its own table without a schema fails inside
+  it, under the script's `search_path` (RT27PU-INFO-3).
 * A render evaluates the recipe twice for each row (once for the text, once for its hash: PostgreSQL inlines the subquery that names it). A recipe that is not deterministic (`random()`, `clock_timestamp()`) can have its text and its hash disagree.
 * A proof that catches `query_canceled` keeps its worker until it returns: the clock decides the verdict and cannot stop such a proof. The verifier waits for it its clock and 5 s more, records it refuted, and ends the worker (`TerminateBackgroundWorker`), which code that ignores interrupts (an extension's C function) can outlast, holding its slot of `max_worker_processes` until it returns. Grant `assert()` only to roles whose code you would run as them.
 * `assert()` takes its author from whoever calls it. A trigger function that is not `SECURITY DEFINER` runs with the rights of whoever fires it, so its owner can assert in the name of anyone who writes that table, as it can do anything else with those rights: PostgreSQL's own trigger trap. phasevec cannot see who wrote the calling code.
 * `_verdict(t)`, for SQL that reads `phasevec.truth` directly, compares the claim with the trigger's cache, not with the row: after a change the trigger never saw it says `verified` until the next `verify()` of the key, or its horizon. `brief()` and `verify()` read the row. It answers `NULL` for a claim whose watched table the caller may not `SELECT` (or whose row a policy hides from it): SQL that reads `phasevec.truth` as such a role reads `NULL` where it read a verdict before 0.20.0 (`coalesce(phasevec._verdict(t), 'unproven')` reads it as unproven). It decides who may see on every call, from the catalogs as they are (sixteenth review): under row-level security it reads the watch and looks the row up as the caller, two queries a row.
 * `next()` and `audit_sample()` (fill and audit, not reading) run as their caller and use the extension's own internals and tables (`_todo`, `_watch`, `readings`, `kstate`): they are the owner's, or a role's that is granted those too. Granted alone, they are refused.
-* A restore trusts its dump: a dump edited by hand can also rewrite `phasevec.truth`. After a restore into another cluster the roles have other OIDs, so every proof reads its author as gone until `adopt()`.
+* A restore trusts its dump: a dump edited by hand can also rewrite `phasevec.truth`. After a restore into another cluster every proof reads its author as gone until `adopt()`, whatever OIDs the roles have there (twenty-seventh review).
 * The guard refuses functions when an expression is set up (PostgreSQL's function-execute hook). A PL/pgSQL expression a session's transaction already ran before a guard is cached without that check: a recipe that reaches that same cached expression in the writer's or reader's session is not refused (a proof's session runs nothing outside a guard). Functions that are not the system's (an extension's C function such as `dblink`) are not classified: they run with the role's rights. `random()` draws from the generator of the session the code runs in (a proof's worker's; a recipe moves its writer's sequence), which it cannot seed.
 * A cursor a client opened through the extended protocol (a named portal, as JDBC uses with a fetch size) is not listed by `pg_cursors`: the guard refuses to run its query, but rows it already holds in memory (a portal over `INSERT ... RETURNING` read in part) can be read by a recipe that renders in that session, and it can close it; a proof's session has no such cursor.
 * The settings a proof does not take from its author (resources, the planner, `max_stack_depth`, `work_mem`, the session's timeouts) are its worker's -- but for parallelism, which the worker pins off (thirteenth review) --, a new session's of its author: they can decide whether a proof runs out of memory, stack or time (refuted), not what it computes.
