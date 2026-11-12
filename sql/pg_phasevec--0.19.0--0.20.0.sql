@@ -2730,6 +2730,156 @@ ALTER FUNCTION phasevec._ivf_absorb(integer, integer, text)
 ALTER FUNCTION phasevec._ivf_find(integer, integer, bit, smallint[], integer, integer, integer, integer, real)
     SET search_path = pg_catalog, pg_temp;
 
+-- (package review, RT29PL-2) No foreign key between phasevec's own tables. pg_dump orders the data of
+-- an extension's configuration tables by their foreign keys, but records that order only as the
+-- order of the archive, not as a dependency of one table's data on another's: pg_restore -j N
+-- loaded phasevec.truth, phasevec.sources and phasevec.readings in parallel with phasevec.watches,
+-- their COPY failed on the extension's own foreign keys, and the restored database had its watches
+-- and no claims (each key then read as a key with no claim, and its first writer claimed it). The
+-- restore is now independent of the order in which pg_restore loads the tables. What the foreign
+-- keys did is done here instead, at the only times it matters: a watch that is deleted (DROP TABLE
+-- of its table, phasevec's sql_drop trigger) takes everything of it along (_watch_gone), and a
+-- watch's or a reader's id is not changed or deleted while anything refers to it (_ids_kept). Every
+-- row of these tables is written by phasevec's own functions, each of which finds its watch and
+-- reader first, under the locks it takes on the watched table.
+CREATE FUNCTION phasevec._watch_gone() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    -- rows with triggers that count (readings, sources) first, then what those triggers count.
+    -- Row by row, with no transition table: phasevec's guard walks every query it plans, and a
+    -- transition table is not an object it can name.
+    DELETE FROM phasevec.readings x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.sources x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.truth x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.stewards x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.usefulness x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.recall_baseline x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.audits x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.lexstats x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.lexdocs x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.ivf_cents x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.ivf_lists x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.ivf_added x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.npu_snaps x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.attempts x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.kstate x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.counts x WHERE x.watch = OLD.id;
+    DELETE FROM phasevec.count_deltas x WHERE x.watch = OLD.id;
+    RETURN NULL;
+END;
+$f$;
+CREATE FUNCTION phasevec._ids_kept() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.id IS DISTINCT FROM OLD.id THEN
+            RAISE EXCEPTION 'phasevec: the id of a row of %.% is not changed', TG_TABLE_SCHEMA, TG_TABLE_NAME
+                USING ERRCODE = 'foreign_key_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+    -- DELETE of a reader (a deleted watch takes its rows along: _watch_gone)
+    IF EXISTS (SELECT 1 FROM phasevec.watches x WHERE x.reader = OLD.id)
+       OR EXISTS (SELECT 1 FROM phasevec.readings x WHERE x.reader = OLD.id)
+       OR EXISTS (SELECT 1 FROM phasevec.audits x WHERE x.reader = OLD.id) THEN
+        RAISE EXCEPTION 'phasevec: reader % is named by a watch, a reading or an audit: it is not deleted', OLD.id
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;
+    RETURN OLD;
+END;
+$f$;
+REVOKE ALL ON FUNCTION phasevec._watch_gone() FROM PUBLIC;
+REVOKE ALL ON FUNCTION phasevec._ids_kept() FROM PUBLIC;
+DO $d$
+DECLARE
+    c record;
+    n int := 0;
+BEGIN
+    FOR c IN SELECT k.conrelid::regclass::text AS t, k.conname FROM pg_constraint k
+              WHERE k.contype = 'f' AND k.connamespace = 'phasevec'::regnamespace
+                AND k.confrelid IN ('phasevec.watches'::regclass, 'phasevec.readers'::regclass)
+              ORDER BY k.conrelid, k.conname LOOP
+        EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I', c.t, c.conname);
+        n := n + 1;
+    END LOOP;
+    IF n <> 20 THEN
+        RAISE EXCEPTION 'phasevec: % foreign keys between phasevec''s tables were dropped, 20 were expected', n;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint k WHERE k.contype = 'f' AND k.connamespace = 'phasevec'::regnamespace) THEN
+        RAISE EXCEPTION 'phasevec: a foreign key between phasevec''s tables is left';
+    END IF;
+END
+$d$;
+CREATE TRIGGER phasevec_watch_gone AFTER DELETE ON phasevec.watches
+    FOR EACH ROW EXECUTE FUNCTION phasevec._watch_gone();
+CREATE TRIGGER phasevec_ids_kept BEFORE UPDATE OF id ON phasevec.watches
+    FOR EACH ROW EXECUTE FUNCTION phasevec._ids_kept();
+CREATE TRIGGER phasevec_ids_kept BEFORE UPDATE OF id OR DELETE ON phasevec.readers
+    FOR EACH ROW EXECUTE FUNCTION phasevec._ids_kept();
+
+-- (package review, RT29PL-2) What the triggers count (phasevec.kstate, phasevec.counts) is counted
+-- once per COPY, after its rows, and not row by row. pg_restore loads phasevec.watches,
+-- phasevec.sources and phasevec.readings with COPY, with -j N each in a transaction of its own: a
+-- row counted while the rows of the other two tables were not committed yet was counted against
+-- what that transaction saw (a reading with no row read 'orphan', a row with no reading 'pending'),
+-- and the counts of a parallel restore drifted from a recount (coverage_check()). Now a COPY FROM
+-- into one of the three counts nothing row by row; at its end it takes phasevec.kstate (so the
+-- recounts of two such loads follow each other) and recounts every watch from what is committed
+-- then, as _recount() does when a watch is made. The last load to end sees all the others'. A
+-- COPY into these tables is the owner's (or a superuser's) only; phasevec writes them with INSERT.
+CREATE FUNCTION phasevec._copying(p_rel oid) RETURNS boolean
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+    SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_progress_copy c
+                    WHERE c.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+                      AND c.relid OPERATOR(pg_catalog.=) p_rel
+                      AND c.command OPERATOR(pg_catalog.=) 'COPY FROM')
+$f$;
+CREATE OR REPLACE FUNCTION phasevec._counted() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF TG_OP = 'INSERT' AND phasevec._copying(TG_RELID) THEN
+        RETURN NULL;  -- counted at the end of the COPY (_copied)
+    END IF;
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        PERFORM phasevec._refresh(OLD.watch, OLD.key);
+    END IF;
+    IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND (NEW.watch, NEW.key) IS DISTINCT FROM (OLD.watch, OLD.key)) THEN
+        PERFORM phasevec._refresh(NEW.watch, NEW.key);
+    END IF;
+    RETURN NULL;
+END;
+$f$;
+CREATE OR REPLACE FUNCTION phasevec._watch_changed() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF TG_OP = 'INSERT' AND phasevec._copying(TG_RELID) THEN
+        RETURN NULL;  -- counted at the end of the COPY (_copied)
+    END IF;
+    PERFORM phasevec._recount(NEW.id);
+    RETURN NULL;
+END;
+$f$;
+CREATE FUNCTION phasevec._copied() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF NOT phasevec._copying(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+    LOCK TABLE phasevec.kstate IN EXCLUSIVE MODE;
+    -- a statement of its own, after the lock: its snapshot sees every load committed before it
+    PERFORM phasevec._recount(w.id) FROM phasevec.watches w ORDER BY w.id;
+    RETURN NULL;
+END;
+$f$;
+REVOKE ALL ON FUNCTION phasevec._copying(oid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION phasevec._copied() FROM PUBLIC;
+CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.watches
+    FOR EACH STATEMENT EXECUTE FUNCTION phasevec._copied();
+CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.sources
+    FOR EACH STATEMENT EXECUTE FUNCTION phasevec._copied();
+CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.readings
+    FOR EACH STATEMENT EXECUTE FUNCTION phasevec._copied();
+
 -- The caller's lock_timeout and deadlock_timeout again (the update's own from _update_lock, above).
 SELECT pg_catalog.set_config($q$lock_timeout$q$, phasevec._update_lock_timeout(), true);
 SELECT pg_catalog.set_config($q$deadlock_timeout$q$, phasevec._update_deadlock_timeout(), true);
