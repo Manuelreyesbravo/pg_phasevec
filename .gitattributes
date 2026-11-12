@@ -1,0 +1,4 @@
+# Left out of `git archive` (the PGXN zip): CI configuration and repository housekeeping.
+.github         export-ignore
+.gitignore      export-ignore
+.gitattributes  export-ignore
