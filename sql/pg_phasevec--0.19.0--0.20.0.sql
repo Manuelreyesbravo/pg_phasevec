@@ -784,11 +784,21 @@ COMMENT ON COLUMN phasevec.truth.by_steward IS
     'review): it changes the claim only while it is still one.';
 -- A claim made where its key had no row (by its author, or the owner) records the nil UUID, which
 -- no row is born with: the first row the key then has is another.
+-- (package review, RT29PA-DEAD-LEAK/-VERDICT) The one test of whether a claim is alive, for every
+-- reader: _verdict_of() before any other verdict, the doors (recall(), disputes(), replacement(),
+-- brief()) and every search's filter of replaced, refuted and expired keys. Until then
+-- _verdict_of() tested it only for 'verified' and 'refuted', after 'replaced' and 'expired', and
+-- the doors and the searches not at all: a dead claim's topic and support reached recall() for
+-- the next tenant's row under its key, and its 'replaced' or expiry hid that row from brief() and
+-- search. No SET clause and every operator named by its schema, so that it is inlined into its
+-- callers (each of them pins its own search_path).
 CREATE FUNCTION phasevec._claim_dead(t phasevec.truth) RETURNS boolean
-LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+LANGUAGE sql STABLE AS $f$
     SELECT t.asserted_row IS NOT NULL
        AND EXISTS (SELECT 1 FROM phasevec.sources s
-                    WHERE s.watch = t.watch AND s.key = t.key AND s.born <> t.asserted_row)
+                    WHERE s.watch OPERATOR(pg_catalog.=) t.watch
+                      AND s.key OPERATOR(pg_catalog.=) t.key
+                      AND s.born OPERATOR(pg_catalog.<>) t.asserted_row)
 $f$;
 COMMENT ON FUNCTION phasevec._claim_dead(phasevec.truth) IS
     'Another row is under the claim''s key than the one its author made it about: that row is '
@@ -942,7 +952,11 @@ $f$;
 -- a larger transaction): under load a writer went from 0.2 ms to 13-36 ms, and failed on lock_timeout.
 CREATE FUNCTION phasevec._verdict_of(t phasevec.truth) RETURNS text
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
-    SELECT CASE WHEN t.verdict = $q$replaced$q$ THEN $q$replaced$q$
+    SELECT CASE -- (package review, RT29PA-DEAD-VERDICT) a claim about a row that is gone says
+                -- nothing about the row under its key now, whatever it read: 'replaced' and
+                -- 'expired' included, a retired one too (phasevec._claim_dead, inlined)
+                WHEN phasevec._claim_dead(t) THEN $q$unproven$q$
+                WHEN t.verdict = $q$replaced$q$ THEN $q$replaced$q$
                 -- (twelfth review) Freshness is judged at the moment of reading: clock_timestamp(), not now(). now()
                 -- is when the reader's transaction began: in a long READ COMMITTED transaction brief() and
                 -- truth_coverage() served 'verified' past max_age (and past expires_at) for as long as it stayed
@@ -968,14 +982,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
                 -- Checked here, when read: DROP ROLE fires no event trigger (a role is the cluster's, not a
                 -- database's), and a role dropped from another database of the cluster is gone from this one too. A
                 -- retired claim (no proof) is nobody's verdict.
-                -- (twenty-eighth review, RT28PA-REUSE-1) a claim about a row that is gone says
-                -- nothing about the row under its key now, a retired one included
-                -- (phasevec._claim_dead, inlined)
-                WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.asserted_row IS NOT NULL
-                 AND EXISTS (SELECT 1 FROM phasevec.sources s
-                              WHERE s.watch = t.watch AND s.key = t.key
-                                AND s.born <> t.asserted_row)
-                THEN $q$unproven$q$
+                -- (twenty-eighth review, RT28PA-REUSE-1: a dead claim, first above)
                 WHEN t.verdict IN ($q$verified$q$, $q$refuted$q$) AND t.proof IS NOT NULL
                  AND t.asserted_by_oid IS NOT NULL
                  AND (pg_catalog.to_regrole(pg_catalog.quote_ident(t.asserted_by))
@@ -2285,7 +2292,8 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
            CASE WHEN phasevec._verdict_of(t) = $q$verified$q$ THEN t.asserted_for END
       FROM phasevec.watches w
       JOIN phasevec.sources s ON s.watch = w.id
-      LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = s.key
+      -- (package review, RT29PA-DEAD-VERDICT) a dead claim is no claim of this row
+      LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = s.key AND NOT phasevec._claim_dead(t)
       LEFT JOIN phasevec.usefulness u ON u.watch = w.id AND u.key = s.key
      WHERE w.name = p_watch
        AND coalesce(phasevec._verdict_of(t), $q$unproven$q$) IN ($q$verified$q$, $q$unproven$q$)
@@ -2311,11 +2319,15 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
               WHERE p_visible IS NULL OR x.key = ANY (p_visible)),
     th AS (SELECT h.key, t.topic AS tp, t.support AS sp, t.verified_at AS va,
                   coalesce(phasevec._verdict_of(t), $q$unproven$q$) AS v
-             FROM hits h CROSS JOIN w LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = h.key),
+             -- (package review, RT29PA-DEAD-LEAK) a dead claim's topic, support and stamp are
+             -- about a row that is gone, maybe another tenant's: no claim of this row
+             FROM hits h CROSS JOIN w LEFT JOIN phasevec.truth t ON t.watch = w.id AND t.key = h.key
+                                                                AND NOT phasevec._claim_dead(t)),
     vivas AS (SELECT t.topic, t.key, s.text_hash FROM phasevec.truth t CROSS JOIN w
                 JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
                WHERE t.watch = w.id AND t.topic IN (SELECT th.tp FROM th WHERE th.tp IS NOT NULL)
                  AND (p_visible IS NULL OR t.key = ANY (p_visible))
+                 AND NOT phasevec._claim_dead(t)
                  AND phasevec._verdict_of(t) IN ($q$verified$q$, $q$unproven$q$)),
     disp AS (SELECT a.key, array_agg(b.key ORDER BY b.key) AS keys
                FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key <> a.key AND b.text_hash <> a.text_hash
@@ -2340,6 +2352,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
           JOIN phasevec.sources s ON s.watch = t.watch AND s.key = t.key
          WHERE t.watch = (phasevec._watch(p_watch)).id AND t.topic IS NOT NULL
            AND (p_visible IS NULL OR t.key = ANY (p_visible))
+           AND NOT phasevec._claim_dead(t)
            AND phasevec._verdict_of(t) IN ($q$verified$q$, $q$unproven$q$))
     SELECT a.topic, a.key, b.key FROM vivas a JOIN vivas b ON b.topic = a.topic AND b.key > a.key
      WHERE a.text_hash <> b.text_hash
@@ -2355,6 +2368,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $f$
         SELECT c.step + 1, t.replaced_by, t.reason, c.seen || t.replaced_by
           FROM c JOIN phasevec.truth t ON t.watch = (phasevec._watch(p_watch)).id AND t.key = c.key
          WHERE t.verdict = $q$replaced$q$ AND c.step < 50 AND NOT t.replaced_by = ANY (c.seen)
+           AND NOT phasevec._claim_dead(t)
            AND (p_visible IS NULL OR t.replaced_by = ANY (p_visible)))
     SELECT step, key, reason FROM c ORDER BY step
 $f$;
@@ -2691,6 +2705,42 @@ BEGIN
     END LOOP;
     IF n <> 7 THEN
         RAISE EXCEPTION $q$phasevec: % read paths compare expires_at with now(), 7 were expected$q$, n;
+    END IF;
+END
+$d$;
+
+-- (package review, RT29PA-DEAD-VERDICT) Every search hides a key whose claim is replaced, refuted or
+-- expired; a dead claim (phasevec._claim_dead: its row is gone, another is under its key) hid the
+-- next row under that key, maybe another tenant's, from find(), find_ivf(), find_hybrid(),
+-- find_npu(), alike(), search() and the recall measure, and _replacements() served a dead claim's
+-- replacement in its place. Each such filter now skips a dead claim, as _verdict_of() does; nothing
+-- else in these functions is touched. (src/phasevec_ivf.c, VALIDATE_TRUTH, does the same.)
+DO $d$
+DECLARE
+    f   record;
+    def text;
+    n   int := 0;
+    m   int;
+BEGIN
+    FOR f IN SELECT p.oid, pg_get_functiondef(p.oid) AS def FROM pg_proc p
+              WHERE p.pronamespace = $q$phasevec$q$::regnamespace
+                AND p.prosrc ~ $q$NOT EXISTS \(SELECT 1 FROM phasevec\.truth$q$
+              ORDER BY p.oid LOOP
+        m := (SELECT count(*) FROM regexp_matches(f.def,
+                  $q$NOT EXISTS \(SELECT 1 FROM phasevec\.truth (\w+)\s+WHERE $q$, $q$g$q$));
+        def := regexp_replace(f.def, $q$NOT EXISTS \(SELECT 1 FROM phasevec\.truth (\w+)\s+WHERE $q$,
+                              $q$NOT EXISTS (SELECT 1 FROM phasevec.truth \1 WHERE NOT phasevec._claim_dead(\1) AND $q$,
+                              $q$g$q$);
+        IF def LIKE $q$%JOIN phasevec.truth tr ON tr.watch = w.id AND tr.verdict = 'replaced'%$q$ THEN
+            def := replace(def, $q$JOIN phasevec.truth tr ON tr.watch = w.id AND tr.verdict = 'replaced'$q$,
+                           $q$JOIN phasevec.truth tr ON tr.watch = w.id AND tr.verdict = 'replaced' AND NOT phasevec._claim_dead(tr)$q$);
+            m := m + 1;
+        END IF;
+        EXECUTE def;
+        n := n + m;
+    END LOOP;
+    IF n <> 11 THEN
+        RAISE EXCEPTION $q$phasevec: % search filters of claims were made to skip a dead claim, 11 were expected$q$, n;
     END IF;
 END
 $d$;

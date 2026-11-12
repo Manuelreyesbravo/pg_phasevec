@@ -48,6 +48,8 @@
 #include "port/atomics.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "nodes/value.h"
+#include "parser/parse_func.h"
 
 PG_MODULE_MAGIC;
 
@@ -2480,7 +2482,7 @@ static SPIPlanPtr g_validate = NULL;
  * 0.13 (no phasevec.truth): the truth filter goes in only where the table exists, and the plan is prepared again
  * when that changes (an ALTER EXTENSION ... UPDATE seen by a live backend).
  */
-static bool g_validate_truth = false;
+static int	g_validate_truth = 0;	/* 0: no phasevec.truth; 1: it; 2: and _claim_dead() */
 #define VALIDATE_SQL \
 	"SELECT c.i::int, r.familiarity, r.read_at, r.truncated " \
 	"FROM unnest($2::text[], $3::bytea[]) WITH ORDINALITY c(key, h, i) " \
@@ -2489,6 +2491,16 @@ static bool g_validate_truth = false;
 	"JOIN phasevec.sources s ON s.watch = $1 AND s.key = c.key AND s.text_hash = c.h"
 #define VALIDATE_TRUTH \
 	" WHERE NOT EXISTS (SELECT 1 FROM phasevec.truth tr WHERE tr.watch = $1 AND tr.key = c.key " \
+	"  AND (tr.verdict IN ($q$replaced$q$, $q$refuted$q$) OR tr.expires_at <= clock_timestamp()))"
+/*
+ * 0.20.0 (package review, RT29PA-DEAD-VERDICT): a dead claim (its row is gone, another is under its
+ * key: phasevec._claim_dead) hides nothing, as in every other read path. Where the function is not
+ * there yet (0.19.0 and older, served by this library until ALTER EXTENSION ... UPDATE) the filter
+ * is the one above.
+ */
+#define VALIDATE_TRUTH_ALIVE \
+	" WHERE NOT EXISTS (SELECT 1 FROM phasevec.truth tr WHERE tr.watch = $1 AND tr.key = c.key " \
+	"  AND NOT phasevec._claim_dead(tr) " \
 	"  AND (tr.verdict IN ($q$replaced$q$, $q$refuted$q$) OR tr.expires_at <= clock_timestamp()))"
 
 /*
@@ -2560,7 +2572,18 @@ find_valid(int32 watch, int32 reader, const Question *Q, int nprobe, int m, int 
 		}
 		{
 			Oid			ns = get_namespace_oid("phasevec", true);
-			bool		truth = OidIsValid(ns) && OidIsValid(get_relname_relid("truth", ns));
+			Oid			rel = OidIsValid(ns) ? get_relname_relid("truth", ns) : InvalidOid;
+			int			truth = OidIsValid(rel) ? 1 : 0;
+
+			if (truth)
+			{
+				Oid			rowtype = get_rel_type_id(rel);
+
+				if (OidIsValid(LookupFuncName(list_make2(makeString(pstrdup("phasevec")),
+														 makeString(pstrdup("_claim_dead"))),
+											  1, &rowtype, true)))
+					truth = 2;
+			}
 
 			if (g_validate != NULL && g_validate_truth != truth)
 			{
@@ -2571,7 +2594,9 @@ find_valid(int32 watch, int32 reader, const Question *Q, int nprobe, int m, int 
 		}
 		if (g_validate == NULL)
 		{
-			SPIPlanPtr	p = SPI_prepare(g_validate_truth ? VALIDATE_SQL VALIDATE_TRUTH : VALIDATE_SQL, 4, vt);
+			SPIPlanPtr	p = SPI_prepare(g_validate_truth == 2 ? VALIDATE_SQL VALIDATE_TRUTH_ALIVE :
+										g_validate_truth == 1 ? VALIDATE_SQL VALIDATE_TRUTH :
+										VALIDATE_SQL, 4, vt);
 
 			if (p == NULL)
 				elog(ERROR, "phasevec ivf: cannot prepare the validation: %s", SPI_result_code_string(SPI_result));

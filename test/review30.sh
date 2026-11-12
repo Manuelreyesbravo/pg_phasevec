@@ -8,6 +8,10 @@
 #    Until then the data of phasevec.truth, .sources and .readings was loaded in parallel with
 #    phasevec.watches and failed on the extension's own foreign keys. DROP TABLE of a watched table
 #    still takes every row of its watch along.
+# 2. (RT29PA-DEAD-LEAK) recall() shows nothing of a dead claim (one tenant's topic and support,
+#    about its deleted row) to the tenant whose new row is under the key.
+# 3. (RT29PA-DEAD-VERDICT) A dead claim that read 'replaced' or 'expired' hides the next tenant's
+#    rows under its keys from no one: brief(), _verdict(), truth_coverage(), find().
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -113,6 +117,82 @@ if [ -z "$bad" ] && [ -z "$left" ]; then
     ok "pg_restore -j 1/2/4/8 brings back every row, verdict and count; DROP TABLE leaves nothing"
 else
     nok "restore:$bad; left after DROP TABLE: '$left' (want '${want:0:160}')"
+fi
+
+# 2 and 3: tenants on one table (ta: rows 1-10, tb: 11-20), owned by pv_r30_own
+fresh pv_r30
+q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+-- search() needs a reader process. It answers here with what the real one answered: the stub of
+-- test/sql/truth_sealed.sql (6), copied verbatim (test/search_capture.sh).
+CREATE OR REPLACE FUNCTION phasevec.search(p_watch text, p_question text, p_k int DEFAULT 10, p_partial boolean DEFAULT false,
+                                           p_m int DEFAULT 200, p_nprobe int DEFAULT 16)
+RETURNS TABLE (key text, score double precision, hamming int, state text, familiarity real, read_at timestamptz,
+               truncated boolean)
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+    IF p_watch <> 'hr' OR p_question <> 'salary' OR p_partial OR p_k < 5 THEN
+        RAISE EXCEPTION 'phasevec: search(%, %, %, %) was not captured', p_watch, p_question, p_k, p_partial;
+    END IF;
+    RETURN QUERY SELECT c.* FROM (VALUES
+        ('1', 0.7175652430905612::float8, 67, 'fresh', NULL::real, '2026-11-06 03:47:49.020802+00'::timestamptz, false),
+        ('2', 0.6675326958141382::float8, 64, 'fresh', NULL::real, '2026-11-06 03:47:49.064404+00'::timestamptz, false),
+        ('4', 0.5207186769014545::float8, 76, 'fresh', NULL::real, '2026-11-06 03:47:49.138397+00'::timestamptz, false),
+        ('5', 0.4808439675481502::float8, 76, 'fresh', NULL::real, '2026-11-06 03:47:49.178036+00'::timestamptz, false),
+        ('3', 0.4492523064285821::float8, 77, 'fresh', NULL::real, '2026-11-06 03:47:49.104384+00'::timestamptz, false))
+        c(key, score, hamming, state, familiarity, read_at, truncated);
+END $f$;
+CREATE TABLE hr (id int PRIMARY KEY, owner_name name NOT NULL, body text);
+ALTER TABLE hr OWNER TO pv_r30_own;
+INSERT INTO hr VALUES (1, 'pv_r30_ta', 'alice: the salary review is done'),
+                      (2, 'pv_r30_ta', 'bob: the salary review is not done'),
+                      (3, 'pv_r30_tb', 'alice: plan v1'),
+                      (4, 'pv_r30_tb', 'bob: plan v2, layoffs'),
+                      (5, 'pv_r30_ta', 'alice: plan v3');
+ALTER TABLE hr ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON hr USING (owner_name = current_user) WITH CHECK (owner_name = current_user);
+GRANT USAGE ON SCHEMA phasevec TO pv_r30_own, pv_r30_ta, pv_r30_tb;
+GRANT SELECT, INSERT, UPDATE, DELETE ON hr TO pv_r30_ta, pv_r30_tb;
+SELECT phasevec.watch('hr', 'hr'::regclass, 'id', 'r.body', 'r1');
+SELECT count(phasevec.record('hr', n.key, 'r1', n.text_hash, n.key::bigint,
+                             ARRAY[100 - n.key::int, n.key::int, 0, 0]::smallint[]))
+  FROM phasevec.next('hr') n;
+GRANT EXECUTE ON FUNCTION phasevec.assert(text, text, text, text, jsonb, timestamptz),
+  phasevec.supersede(text, text, text, text), phasevec.brief(text, int),
+  phasevec.truth_coverage(text), phasevec.recall(text, text, int, boolean)
+  TO pv_r30_ta, pv_r30_tb;
+SQL
+# ta: 2 (topic + support), 1 replaced by 5, 5 expired; then deletes 1, 2 and 5
+qu pv_r30_ta -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+SELECT phasevec.assert('hr', '2', NULL, 'alice-private-topic', '{"alice_note": "offer 95k, do not tell bob"}');
+SELECT phasevec.supersede('hr', '1', '5', 'v3 replaces');
+SELECT phasevec.assert('hr', '5', NULL, NULL, NULL, now() - interval '1 day');
+DELETE FROM hr WHERE id IN (1, 2, 5);
+SQL
+# tb writes its own rows under the same keys, with the same words (the reading still holds)
+qu pv_r30_tb -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+INSERT INTO hr VALUES (1, 'pv_r30_tb', 'alice: the salary review is done'),
+                      (2, 'pv_r30_tb', 'bob: the salary review is not done'),
+                      (5, 'pv_r30_tb', 'alice: plan v3');
+SQL
+dead=$(q -c "SELECT string_agg(key || ':' || phasevec._claim_dead(t), ' ' ORDER BY key) FROM phasevec.truth t")
+leak=$(qu pv_r30_tb -c "SELECT key || ':' || coalesce(topic, '-') || ':' || coalesce(support::text, '-')
+                          FROM phasevec.recall('hr', 'salary', 10) WHERE key = '2'" 2>&1)
+if [ "$dead" = "1:true 2:true 5:true" ] && [ "$leak" = "2:-:-" ]; then
+    ok "recall() shows nothing of a dead claim to the tenant whose row is under its key"
+else
+    nok "dead claim leak: claims '$dead', tb's recall of key 2 '${leak:0:200}'"
+fi
+br=$(qu pv_r30_tb -c "SELECT string_agg(key, ',' ORDER BY key) FROM phasevec.brief('hr')" 2>&1)
+vd=$(q -c "SELECT string_agg(key || ':' || phasevec._verdict(t), ' ' ORDER BY key) FROM phasevec.truth t")
+cv=$(qu pv_r30_tb -c "SELECT string_agg(verdict || ':' || n, ' ' ORDER BY verdict)
+                        FROM phasevec.truth_coverage('hr')" 2>&1)
+fd=$(q -c "SELECT string_agg(key, ',' ORDER BY key)
+             FROM phasevec.find('hr', 0, ARRAY[100, 0, 0, 0]::smallint[], 10, true)" 2>&1)
+if [ "$br" = "1,2,3,4,5" ] && [ "$vd" = "1:unproven 2:unproven 5:unproven" ] \
+   && [ "$cv" = "unproven:5" ] && [ "$fd" = "1,2,3,4,5" ]; then
+    ok "a dead claim that read replaced or expired hides no row: brief, _verdict, coverage, find"
+else
+    nok "dead verdict: tb's brief '$br', verdicts '$vd', tb's coverage '$cv', find '${fd:0:200}'"
 fi
 
 exit $fallas
