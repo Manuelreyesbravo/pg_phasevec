@@ -2930,19 +2930,30 @@ CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.sources
 CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.readings
     FOR EACH STATEMENT EXECUTE FUNCTION phasevec._copied();
 
--- The caller's lock_timeout and deadlock_timeout again (the update's own from _update_lock, above).
-SELECT pg_catalog.set_config($q$lock_timeout$q$, phasevec._update_lock_timeout(), true);
-SELECT pg_catalog.set_config($q$deadlock_timeout$q$, phasevec._update_deadlock_timeout(), true);
-DROP FUNCTION phasevec._update_step(int, text);
-DROP FUNCTION phasevec._update_lock();
-DROP FUNCTION phasevec._update_take(text, oid, boolean);
-DROP FUNCTION phasevec._update_holders(text, oid);
-DROP FUNCTION phasevec._update_lock_routine(oid);
-DROP FUNCTION phasevec._update_lock_routine_now(oid);
-DROP FUNCTION phasevec._update_lock_table_now(oid);
-DROP FUNCTION phasevec._update_caller_holds();
-DROP FUNCTION phasevec._update_lock_timeout();
-DROP FUNCTION phasevec._update_deadlock_timeout();
-DROP FUNCTION phasevec._update_dependents();
-DROP FUNCTION phasevec._update_routine(oid);
-DROP FUNCTION phasevec._update_who(int, text);
+-- (package review, RT29PU-1) The update's own helpers go, and only then do the caller's
+-- lock_timeout and deadlock_timeout come back (the update's own from _update_lock, above): until
+-- then they came back before these DROP FUNCTIONs, and a wait of an event trigger they fire (while
+-- every phasevec table is still held) ran under the caller's settings, not the update's bound, so
+-- a client could be the one the deadlock detector aborted.
+DO $d$
+DECLARE
+    lt text := phasevec._update_lock_timeout();
+    dt text := phasevec._update_deadlock_timeout();
+BEGIN
+    DROP FUNCTION phasevec._update_step(int, text);
+    DROP FUNCTION phasevec._update_lock();
+    DROP FUNCTION phasevec._update_take(text, oid, boolean);
+    DROP FUNCTION phasevec._update_holders(text, oid);
+    DROP FUNCTION phasevec._update_lock_routine(oid);
+    DROP FUNCTION phasevec._update_lock_routine_now(oid);
+    DROP FUNCTION phasevec._update_lock_table_now(oid);
+    DROP FUNCTION phasevec._update_caller_holds();
+    DROP FUNCTION phasevec._update_lock_timeout();
+    DROP FUNCTION phasevec._update_deadlock_timeout();
+    DROP FUNCTION phasevec._update_dependents();
+    DROP FUNCTION phasevec._update_routine(oid);
+    DROP FUNCTION phasevec._update_who(int, text);
+    PERFORM pg_catalog.set_config('lock_timeout', lt, true);
+    PERFORM pg_catalog.set_config('deadlock_timeout', dt, true);
+END
+$d$;

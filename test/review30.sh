@@ -12,6 +12,8 @@
 #    about its deleted row) to the tenant whose new row is under the key.
 # 3. (RT29PA-DEAD-VERDICT) A dead claim that read 'replaced' or 'expired' hides the next tenant's
 #    rows under its keys from no one: brief(), _verdict(), truth_coverage(), find().
+# 4. (RT29PU-1) The update's own DROP FUNCTIONs run under its bound, not the caller's
+#    lock_timeout and deadlock_timeout, which the caller has again once the update is done.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PG=${PG:-$HOME/pg19/bin}
@@ -193,6 +195,34 @@ if [ "$br" = "1,2,3,4,5" ] && [ "$vd" = "1:unproven 2:unproven 5:unproven" ] \
     ok "a dead claim that read replaced or expired hides no row: brief, _verdict, coverage, find"
 else
     nok "dead verdict: tb's brief '$br', verdicts '$vd', tb's coverage '$cv', find '${fd:0:200}'"
+fi
+
+# 4. the update's last DROP FUNCTIONs under its own bound; the caller's settings come back after
+fresh pv_r30 0.19.0
+use020
+q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE public.drops (what text, lt text, dt text);
+CREATE FUNCTION public.note_drops() RETURNS event_trigger LANGUAGE plpgsql AS $f$
+BEGIN
+    INSERT INTO public.drops SELECT o.object_identity, current_setting('lock_timeout'),
+                                    current_setting('deadlock_timeout')
+      FROM pg_event_trigger_dropped_objects() o
+     WHERE o.object_type = 'function' AND o.object_identity LIKE 'phasevec._update\_%';
+END $f$;
+CREATE EVENT TRIGGER note_drops ON sql_drop EXECUTE FUNCTION public.note_drops();
+SQL
+after=$(q -c "BEGIN" -c "SET LOCAL lock_timeout = '7s'" -c "SET LOCAL deadlock_timeout = '3s'" \
+          -c "ALTER EXTENSION pg_phasevec UPDATE TO '0.20.0'" \
+          -c "SELECT current_setting('lock_timeout') || '/' || current_setting('deadlock_timeout')" \
+          -c "COMMIT" 2>&1)
+seen=$(q -c "SELECT count(*) || ' drops, ' || count(*) FILTER (WHERE lt = '7s' OR dt = '3s')
+             || ' under the caller''s settings' FROM public.drops" 2>&1)
+q -c "DROP EVENT TRIGGER note_drops" >/dev/null
+if [ "$(q -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_phasevec'")" = 0.20.0 ] \
+   && [ "$seen" = "13 drops, 0 under the caller's settings" ] && [ "$after" = "7s/3s" ]; then
+    ok "the update's last DROP FUNCTIONs run under its bound; the caller's settings come back after"
+else
+    nok "final drops: '$seen', settings after the update '${after:0:200}'"
 fi
 
 exit $fallas
