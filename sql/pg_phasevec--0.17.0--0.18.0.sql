@@ -1,7 +1,7 @@
 -- pg_phasevec 0.17.0 -> 0.18.0: brief(), what a watch holds as still true, armed under a budget.
 \echo Use "ALTER EXTENSION pg_phasevec UPDATE TO '0.18.0'" to load this file. \quit
 
--- Proven in yggdrasil (sql/201, sql/205, 31-10): a working state kept as a watch (pending items, decisions,
+-- Proven on the author's own deployment (31-10): a working state kept as a watch (pending items, decisions,
 -- facts) is handed to a model as "what still holds", best first, inside a budget -- instead of a flat list that
 -- keeps serving what was closed, refuted or went stale. brief() is that, for any watch.
 --

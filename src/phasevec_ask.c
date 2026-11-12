@@ -215,7 +215,7 @@ phasevec_ask(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(hablar(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
 							".sock", false, "reader",
-							psprintf("Start it: systemctl --user start phasevec-lector-...@%s", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
+							psprintf("Start a reader for watch \"%s\" listening on that socket (reader/ has one).", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
 }
 
 /*
@@ -229,5 +229,5 @@ phasevec_npu_ask(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(hablar(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
 							".npu.sock", true, "NPU server",
-							psprintf("Start it: phasevec-npu --vigia %s ...", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
+							psprintf("Start the NPU server for watch \"%s\" on that socket.", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
 }

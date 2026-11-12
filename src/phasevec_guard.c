@@ -499,7 +499,7 @@ author_may_set(const struct config_generic *g, Oid author)
  * that set it (PostgreSQL keeps it: srole) is the author or a role with the author's privileges: the author's own
  * session, a SET clause of a function the author owns (PostgreSQL sets it as the function's owner, once the call is
  * the owner's), a SET inside such a function, or the session of a role that could have asserted as the author anyway
- * (yggdrasil's manu, a superuser, calling _afirmar of ygg_autor). A value a role WITHOUT the author's privileges set
+ * (a superuser calling the author's own wrapper function). A value a role WITHOUT the author's privileges set
  * (the session of the caller of the author's SECURITY DEFINER function, the startup options of that session, the SET
  * clause of that caller's own function) is not the author's, and is not recorded: the proof's session has the
  * author's own value for it. In the eighteenth cut the value recorded was the session's, read down PostgreSQL's

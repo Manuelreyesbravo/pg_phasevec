@@ -1,6 +1,6 @@
 -- pg_phasevec 0.5.0 -> 0.6.0: a watch can be read by its words too, and find_hybrid() asks both.
 --
--- F5 (yggdrasil sql/161, measured 2026-10-18) put find() against the RAG MIMIR serves over 39,420
+-- F5 (measured 2026-10-18) put find() against a RAG served over 39,420
 -- PostgreSQL commits and lost: recall@10 0.153 against 0.403. The reader (vec-0.1.0) searched worse
 -- than an off-the-shelf embedder outside the data it was trained on, which is the reader's to fix.
 -- But the questions also name what they look for by its words -- nbtree, pg_mcv_list,
@@ -17,7 +17,7 @@
 -- (k = 60, equal weights). The lexical ranking is BM25 with every term frequency taken as 1 (k1 = 1.2,
 -- b = 0.75), over the question's ten rarest words among those carried by at most 5 % of the rows:
 -- common words cost the most to look up and say the least. These constants were fixed before
--- measuring (yggdrasil sql/163) and are not tuned on any evaluation.
+-- measuring and are not tuned on any evaluation.
 --
 -- Both arms answer only with rows whose vector reading is fresh, so coverage keeps its meaning; and a
 -- watch read lexically with rows that have no lexical reading refuses to answer, as it refuses below

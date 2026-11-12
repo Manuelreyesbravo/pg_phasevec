@@ -3,7 +3,7 @@
 -- Until 0.18.0 every table of the extension was a plain member: pg_dump left out its rows and
 -- its sequences, so a dump of a database with watches restored the watches' triggers on the
 -- watched tables but not the watches, the readings, the sources or the truth they refer to.
--- (Found on 2026-11-05: the daily dump of the yggdrasil mind had no phasevec data at all; it
+-- (Found on 2026-11-05: the daily dump of the author's own deployment had no phasevec data at all; it
 -- was being covered by a separate \copy of all 19 tables.)
 --
 -- Marked: the tables that hold what users and maintenance functions wrote (readers, watches,

@@ -44,7 +44,7 @@ RESET ROLE;
 
 -- (b) MIND18-1. refute() of a claim with no text recorded (asserted before 0.20.0, never adopted; or with no proof)
 -- reads 'refuted': it is about the row's text when it was refuted. In the seventeenth cut they read 'unproven', and
--- yggdrasil served every memory deleted after the update.
+-- an application served every note deleted after the update.
 UPDATE phasevec.truth SET asserted_for = NULL, asserted_by_oid = NULL WHERE key = $k$8$k$;
 SELECT phasevec.refute($w$mem18$w$, $k$7$k$, $r$deleted after the update$r$);
 SELECT phasevec.refute($w$mem18$w$, $k$8$k$, $r$deleted after the update$r$);

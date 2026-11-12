@@ -1,6 +1,6 @@
 -- pg_phasevec 0.9.0: phasevec.search(watch, question, k) — the search as one SQL call, the database
 -- in the middle. Until now a question was read only by talking to the reader's socket, so whoever
--- asked had to reach that socket; a sandboxed caller (yggdrasil's acts, under Landlock) cannot, and
+-- asked had to reach that socket; a sandboxed caller (a process under Landlock, say) cannot, and
 -- should not. Now the database asks the watch's sealed reader for the question's codes (phasevec._ask,
 -- a superuser-set socket path) and runs find_ivf (or find, without an index) itself, in the CALLER's
 -- snapshot: the validation against phasevec.sources is the caller's transaction, as with find.

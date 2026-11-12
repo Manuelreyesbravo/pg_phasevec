@@ -65,7 +65,7 @@ SELECT key, array(SELECT e FROM unnest(proof_env) e
   FROM phasevec.truth WHERE key IN ($k$1$k$, $k$2$k$) ORDER BY key;
 SELECT key, verdict, error FROM phasevec.verify($w$n19b$w$, 10, $e$0$e$) WHERE key IN ($k$1$k$, $k$2$k$) ORDER BY key;
 
--- (b) MIND-ENV-1 under the same rule. A wrapper of the author with SET search_path (yggdrasil's _afirmar, here with
+-- (b) MIND-ENV-1 under the same rule. A wrapper of the author with SET search_path (an author's wrapper, here with
 -- the schema its proofs name) asserts key 3, called by a superuser's session whose own search_path is another. Key 4
 -- is the same claim from before 0.20.0 (no author, no settings), adopted through the author's wrapper of adopt() with
 -- the same SET clause; key 5 the same, adopted by the author's own session in the same search_path. All three record

@@ -3699,7 +3699,7 @@ require_no_writes(const char *what)
 	 * (sixteenth review) verify() records what it judges, in sessions of its own that commit each verdict (and start
 	 * background workers): its writes are not this transaction's, and READ ONLY did not stop them. A transaction (or a
 	 * session, default_transaction_read_only; or a standby) that says it writes nothing records nothing through
-	 * verify() either. yggdrasil's read-only acts ran every ygg_lector proof and committed 610 verdicts.
+	 * verify() either. A read-only role's sessions ran every proof and committed 610 verdicts.
 	 */
 	PreventCommandIfReadOnly(what);
 	PreventCommandDuringRecovery(what);
@@ -5257,8 +5257,8 @@ phasevec_door(PG_FUNCTION_ARGS)
 /*
  * phasevec._verdict(t phasevec.truth), for SQL that reads phasevec.truth directly: the truth a claim has now. (fifteenth
  * review) Until this cut it was SQL that ran as its caller: it read phasevec.watches and phasevec.sources and called
- * phasevec._bind, which 0.20.0 closes to PUBLIC, so a role granted phasevec.truth and the watched table (yggdrasil's
- * read-only reader) got "permission denied for function _bind" as soon as verify() wrote a fresh verdict, and one not
+ * phasevec._bind, which 0.20.0 closes to PUBLIC, so a role granted phasevec.truth and the watched table (a
+ * read-only reader role) got "permission denied for function _bind" as soon as verify() wrote a fresh verdict, and one not
  * granted the extension's tables got "permission denied for table watches". It is a door now, with the rule of the
  * others: a claim's verdict is shown to a role that may SELECT its watch's table (and, when row-level security filters
  * that table for the role, see the claim's row), and NULL to anyone else; then it is computed (phasevec._verdict_of,

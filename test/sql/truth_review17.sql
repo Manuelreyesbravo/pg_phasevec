@@ -61,7 +61,7 @@ RESET client_min_messages;
 -- (c) MIND-ENV-1, as the nineteenth review (R19-PRIV-1) settled it: a claim records the settings in effect where
 -- assert() was called, as its author had them there; the SET clause of the author's own function is the author's.
 -- Key 4 is asserted by the author's session; key 5 through a SECURITY DEFINER function of the author with SET
--- search_path = pg_catalog, pg_temp (yggdrasil's _afirmar): it records that search_path and its proof means what it
+-- search_path = pg_catalog, pg_temp (an author's wrapper): it records that search_path and its proof means what it
 -- means inside that function, where pv17_one() is not found: refuted (in the seventeenth and eighteenth cuts the
 -- clause was read past, and a caller without the author's rights chose the search_path of the author's proof:
 -- truth_review19b plays that, and the adopted copy of a wrapper's claim). Key 6: a SET inside such a function is the

@@ -1,6 +1,6 @@
 -- pg_phasevec 0.15.0: a replaced note hands its place to its replacement.
 --
--- Measured on 25-10 (yggdrasil, vara 623): hiding what is false works (0 of 21 old notes served), but in 5 of 21
+-- Measured on 25-10 (the author's own deployment): hiding what is false works (0 of 21 old notes served), but in 5 of 21
 -- the correction was worded so differently that the question never reached it: not in the top-10 before nor
 -- after. The old note was the top-1 and already knew who replaced it (truth.replaced_by); the search only hid it.
 --

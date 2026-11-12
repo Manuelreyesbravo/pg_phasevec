@@ -3,7 +3,7 @@
 
 -- pg_phasevec 0.1.0 -> 0.2.0
 --
--- Two things measured in F1 (yggdrasil sql/155-156), and fixed where the measurement pointed:
+-- Two things measured in F1 (on the author's own deployment), and fixed where the measurement pointed:
 --
 --   * find() over 1,000,000 readings took 1157 ms, and ~980 ms of it was coverage(): every
 --     question recounted the seven states of every row. Coverage is now kept by triggers, so

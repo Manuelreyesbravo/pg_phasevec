@@ -17,8 +17,8 @@
 --                                                         watch is NULL)
 --
 -- What is measured: for each sampled row, its own codes are the question (the row itself left out of
--- both answers). What is SERVED is the stored path: find_ivf with its nprobe and m, or find with its m (ygg's
--- own mind has no coarse index and is served by find with m 1000; a corpus by find with m 200). The TRUTH is find with m = every
+-- both answers). What is SERVED is the stored path: find_ivf with its nprobe and m, or find with its m (the
+-- author's own deployment has no coarse index and is served by find with m 1000; a corpus by find with m 200). The TRUTH is find with m = every
 -- live reading of the watch: find prefilters by Hamming distance (ORDER BY ham LIMIT m) and rescores only
 -- those m by cosine, so with a small m it is not exact. Measured on 31-10 (2000 rows, 256 dimensions,
 -- k = 10, 200 questions): served with m = 11 against the truth with every row, 0.33; against find with the

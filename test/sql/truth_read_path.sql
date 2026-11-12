@@ -1,6 +1,6 @@
 -- 0.20.0 (fifteenth review): every documented read path works for a role that may read the watched table and
 -- phasevec.truth, with no other grant, in a read-only session. In the fourteenth cut _verdict(t) was SQL that ran as its
--- caller and called _bind(), which 0.20.0 closes to PUBLIC: yggdrasil's read-only reader (NOLOGIN, pg_read_all_data)
+-- caller and called _bind(), which 0.20.0 closes to PUBLIC: a read-only reader role (NOLOGIN, pg_read_all_data)
 -- got "permission denied for function _bind" as soon as verify() wrote a fresh verdict, and a reader granted only the
 -- table and phasevec.truth got it too (and, past it, "permission denied for table sources"). _verdict is a door now:
 -- the verdict to a role that may SELECT the watch's table (and see the row, under row-level security), NULL to others.
@@ -23,8 +23,8 @@ SELECT count(phasevec.record(x.w, x.key, $n$r1$n$, x.text_hash, 7, ARRAY[1, 2, 3
   FROM (SELECT $w$notes$w$ AS w, n.* FROM phasevec.next($w$notes$w$) n
         UNION ALL SELECT $w$rnotes$w$, n.* FROM phasevec.next($w$rnotes$w$) n) x;
 CREATE ROLE pv_rp_author;
-CREATE ROLE pv_rp_lector NOLOGIN;            -- yggdrasil's reader: pg_read_all_data, nothing else
-GRANT pg_read_all_data TO pv_rp_lector;
+CREATE ROLE pv_rp_reader NOLOGIN;            -- a reader: pg_read_all_data, nothing else
+GRANT pg_read_all_data TO pv_rp_reader;
 CREATE ROLE pv_rp_plain NOLOGIN;             -- the watched table and phasevec.truth, nothing else
 GRANT USAGE ON SCHEMA phasevec TO pv_rp_author, pv_rp_plain;
 GRANT SELECT ON notes TO pv_rp_plain;
@@ -45,7 +45,7 @@ SELECT w.name, v.key, v.verdict FROM phasevec.watches w, phasevec.verify(w.name,
 
 -- (a) _verdict as each reader, in a read-only transaction
 BEGIN READ ONLY;
-SET LOCAL ROLE pv_rp_lector;
+SET LOCAL ROLE pv_rp_reader;
 SELECT w.name, t.key, phasevec._verdict(t) FROM phasevec.truth t JOIN phasevec.watches w ON w.id = t.watch ORDER BY 1, 2;
 COMMIT;
 BEGIN READ ONLY;
@@ -69,7 +69,7 @@ GRANT EXECUTE ON FUNCTION phasevec.brief(text, int), phasevec.alike(text, text, 
     phasevec.find_hybrid(text, text, bigint, smallint[], int, boolean, int, bit, int), phasevec.recall_check(text),
     phasevec.coverage(text), phasevec.coverage_check(text), phasevec.truncations(text),
     phasevec.dupes(text, double precision)
-  TO pv_rp_lector, pv_rp_plain;
+  TO pv_rp_reader, pv_rp_plain;
 CREATE FUNCTION pg_temp.read_paths() RETURNS TABLE (path text, outcome text) LANGUAGE plpgsql AS $f$
 DECLARE
     q text;
@@ -107,7 +107,7 @@ BEGIN
 END
 $f$;
 BEGIN READ ONLY;
-SET LOCAL ROLE pv_rp_lector;
+SET LOCAL ROLE pv_rp_reader;
 SELECT * FROM pg_temp.read_paths();
 COMMIT;
 BEGIN READ ONLY;
@@ -117,8 +117,8 @@ COMMIT;
 
 DROP TABLE notes, rnotes;
 DROP EXTENSION pg_phasevec;
-DROP OWNED BY pv_rp_author, pv_rp_lector, pv_rp_plain, pv_rp_none;
+DROP OWNED BY pv_rp_author, pv_rp_reader, pv_rp_plain, pv_rp_none;
 DROP ROLE pv_rp_author;
-DROP ROLE pv_rp_lector;
+DROP ROLE pv_rp_reader;
 DROP ROLE pv_rp_plain;
 DROP ROLE pv_rp_none;

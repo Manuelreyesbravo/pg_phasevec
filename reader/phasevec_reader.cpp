@@ -180,7 +180,7 @@ std::string sha256_of(const std::string &path) {
 // and this is detected here, in the process, from what llama.cpp actually sees and loaded, never
 // taken from a flag on trust.
 //
-// The number of threads is not part of it: measured (ygg mun_sello_hilos, 2026-10-15), 220 texts read
+// The number of threads is not part of it: measured (2026-10-15), 220 texts read
 // on the CPU with 4 threads and re-read with 8 and with 16 give the same 256-bit code, every one. If
 // that ever changes, the threads must enter the signature, or the signature lies.
 struct Compute {
@@ -377,7 +377,7 @@ struct Reader {
         // --no-repack: the weights are read from the GGUF's mmap instead of copied into anonymous
         // memory in the layout of the CPU's faster kernels: page cache the kernel can hand to other
         // processes (anonymous memory 1 GB instead of 4.9), 1.44 times slower. It CHANGES THE BITS
-        // (ygg mun_norepack_bits: 28 of 220 readings reproduced), so it is part of the compute
+        // (28 of 220 readings reproduced), so it is part of the compute
         // signature (detect_compute) and a reader sealed with repacking refuses it.
         mp.use_extra_bufts = !o.no_repack;
         model = llama_model_load_from_file(o.model.c_str(), mp);

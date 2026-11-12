@@ -1370,13 +1370,13 @@ RETURNS void AS $q$MODULE_PATHNAME$q$, $q$phasevec_assert$q$ LANGUAGE C VOLATILE
 -- (seventeenth review) A refutation retires the claim: its proof goes with it, so no verify(), verify_one() or
 -- adopt() judges it again, and it reads 'refuted', with no horizon, while its text is the refuted one; an assert()
 -- makes it a claim again. Until then the proof stayed: the next verify() past p_every judged it again and served it
--- 'verified', and adopt() asserted every refuted claim again (yggdrasil retires a deleted memory with refute()).
+-- 'verified', and adopt() asserted every refuted claim again (an application retires a deleted note with refute()).
 -- (eighteenth review) Retired is a state of its own (retired_at, _claim_state), on every path:
 --   * a replaced claim is retired too, behind its replacement: until then refute() of a replaced key did nothing, no
 --     error, and unsupersede() brought it back 'verified';
 --   * the text it is about is recorded on every refute(): only a claim refute() inserted had it, and a claim
---     asserted before 0.20.0 (no text) or with no proof read 'unproven' after refute(), not 'refuted' (yggdrasil
---     went on serving every memory deleted after the update).
+--     asserted before 0.20.0 (no text) or with no proof read 'unproven' after refute(), not 'refuted' (an application
+--     went on serving every note deleted after the update).
 -- (nineteenth review, 53) verified_at and retired_at never move back: a transaction that began before a verdict was
 -- recorded (its now() is earlier) stamps that verdict's time, not its own.
 -- (twenty-fifth review, RT25PC-AUTH-1) C (src/phasevec_truth.c), through _refute_set as the owner:
@@ -2493,7 +2493,7 @@ $d$;
 --    then read 'unproven', and brief() and truth_coverage() served what refute() had retired.
 --  * (eighteenth review) A claim refute() refuted under 0.19.0 is retired, as refute() retires one
 --    now: under 0.19.0 refute() left its proof, and after this update adopt() asserted it again and
---    the next verify() served it 'verified' (yggdrasil: every memory deleted before the update came
+--    the next verify() served it 'verified' (an application: every note deleted before the update came
 --    back current). 0.19.0 recorded 'refuted' in two places, and their columns tell them apart:
 --    refute() always gave a reason (last_error) and stamped verified_at and changed_at with one
 --    now(); verify() recorded a proof's false with no reason, and its error (or NULL) at a
@@ -2506,7 +2506,7 @@ $d$;
 --    is retired too, and reads 'refuted' if it is ever unsuperseded. What the columns cannot show
 --    is a claim refute() refuted and the next verify() then judged 'verified' under 0.19.0: that is
 --    a verified claim now (back to 'unproven' above); the application that refuted it refutes it
---    again (yggdrasil: T2c of its procedure).
+--    again (in its own upgrade procedure).
 --  * (twenty-sixth review, RT27-CYCLE-019) 0.19.0 took a supersede() that closed a cycle (9 -> 10,
 --    then 10 -> 9), and every key on it read 'replaced' and left brief() for good; 0.20.0 refuses
 --    one (supersede()), and until this review one 0.19.0 wrote survived the update and migrate().
