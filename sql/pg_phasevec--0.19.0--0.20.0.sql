@@ -2930,6 +2930,13 @@ CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.sources
 CREATE TRIGGER phasevec_copied AFTER INSERT ON phasevec.readings
     FOR EACH STATEMENT EXECUTE FUNCTION phasevec._copied();
 
+-- (package review) phasevec._find_ivf_hide (0.14's find_ivf, renamed in 0.15.0) is SECURITY DEFINER
+-- and was executable by PUBLIC: an administrator who revoked find_ivf() from PUBLIC, as this
+-- page says to where keys are sensitive, left the same answer one name away. find_ivf() (the
+-- owner's) calls it.
+REVOKE ALL ON FUNCTION phasevec._find_ivf_hide(text, bigint, smallint[], int, boolean, int, bit, int)
+    FROM PUBLIC;
+
 -- (package review, RT29PU-1) The update's own helpers go, and only then do the caller's
 -- lock_timeout and deadlock_timeout come back (the update's own from _update_lock, above): until
 -- then they came back before these DROP FUNCTIONs, and a wait of an event trigger they fire (while

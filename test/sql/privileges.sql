@@ -10,7 +10,8 @@ INSERT INTO docs VALUES (1, $t$one$t$), (2, $t$two$t$), (3, $t$three$t$);
 SELECT phasevec.watch($w$docs$w$, $w$docs$w$::regclass, $k$id$k$, $r$r.body$r$, $n$r1$n$) > 0 AS watch;
 
 -- the SECURITY DEFINER functions still executable by PUBLIC: only the search surface, open since 0.16.0 to
--- whoever the owner gives USAGE on the schema (security.sql); no internal one but the renamed 0.14 find_ivf
+-- whoever the owner gives USAGE on the schema (security.sql); no internal one (package review: not
+-- the renamed 0.14 find_ivf, _find_ivf_hide, either)
 SELECT p.oid::regprocedure AS open_to_public
   FROM pg_proc p JOIN pg_depend d ON d.classid = $c$pg_proc$c$::regclass AND d.objid = p.oid AND d.deptype = $d$e$d$
   JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = $e$pg_phasevec$e$

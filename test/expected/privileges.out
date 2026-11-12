@@ -18,20 +18,20 @@ SELECT phasevec.watch($w$docs$w$, $w$docs$w$::regclass, $k$id$k$, $r$r.body$r$, 
 (1 row)
 
 -- the SECURITY DEFINER functions still executable by PUBLIC: only the search surface, open since 0.16.0 to
--- whoever the owner gives USAGE on the schema (security.sql); no internal one but the renamed 0.14 find_ivf
+-- whoever the owner gives USAGE on the schema (security.sql); no internal one (package review: not
+-- the renamed 0.14 find_ivf, _find_ivf_hide, either)
 SELECT p.oid::regprocedure AS open_to_public
   FROM pg_proc p JOIN pg_depend d ON d.classid = $c$pg_proc$c$::regclass AND d.objid = p.oid AND d.deptype = $d$e$d$
   JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = $e$pg_phasevec$e$
  WHERE p.prosecdef AND has_function_privilege($r$public$r$, p.oid, $x$EXECUTE$x$)
  ORDER BY 1::text;
-                                   open_to_public                                    
--------------------------------------------------------------------------------------
- phasevec._find_ivf_hide(text,bigint,smallint[],integer,boolean,integer,bit,integer)
+                                open_to_public                                 
+-------------------------------------------------------------------------------
  phasevec.search(text,text,integer,boolean,integer,integer)
  phasevec.find_npu(text,smallint[],integer,boolean)
  phasevec.find(text,bigint,smallint[],integer,boolean,integer,bit)
  phasevec.find_ivf(text,bigint,smallint[],integer,boolean,integer,bit,integer)
-(5 rows)
+(4 rows)
 
 SELECT has_function_privilege($r$public$r$, $f$phasevec._forget(int, text)$f$, $x$EXECUTE$x$) AS forget,
        has_function_privilege($r$public$r$, $f$phasevec._brief_keys(text)$f$, $x$EXECUTE$x$) AS brief_keys,
