@@ -329,7 +329,8 @@ Open findings of the last red-team pass (round 30) against this code, not fixed 
   phasevec's functions.
 
 The full list of limits as each review left them, including the ones of the update procedure, is
-in [doc/review-history.md](doc/review-history.md).
+in [doc/review-history.md](doc/review-history.md). To look for more, [fuzz/](fuzz/README.md)
+runs random sequences of claim operations against a model and replays past findings.
 
 ## Project
 
@@ -340,6 +341,8 @@ in [doc/review-history.md](doc/review-history.md).
   accepted for now.
 * Tests: `test/installcheck.sh` (the regression suite, against a throwaway cluster) and the
   multi-session `test/*.sh` suites.
+* [fuzz/](fuzz/README.md): a model-based fuzzer of the claim lifecycle, with its spec, threat
+  model and the replays of what it found.
 
 ## License
 

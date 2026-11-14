@@ -1,0 +1,18 @@
+[
+  {"op": "start", "version": "0.20.0"},
+  {"op": "assert", "author": "fz_author", "k": "1", "proof": "true", "expired": false},
+  {"op": "verify", "role": "fz_owner"},
+  {"op": "reinsert", "k": "1", "text": "ok one", "tenant": "a", "txn": true},
+  {"op": "assert", "author": "fz_author", "k": "1", "proof": "false", "expired": false},
+  {"op": "refute", "k": "2"},
+  {"op": "reinsert", "k": "2", "text": "nope", "tenant": "a", "txn": false},
+  {"op": "assert", "author": "fz_author_b", "k": "2", "proof": "true", "expired": false},
+  {"op": "update_grant", "on": false},
+  {"op": "steward", "on": true},
+  {"op": "refute", "k": "3"},
+  {"op": "steward", "on": false},
+  {"op": "unsupersede", "k": "3"},
+  {"op": "rebind", "all": false},
+  {"op": "refute", "k": "2"},
+  {"op": "adopt"}
+]

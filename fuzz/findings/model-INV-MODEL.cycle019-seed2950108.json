@@ -1,0 +1,19 @@
+[
+ {
+  "op": "start",
+  "version": "0.19.0"
+ },
+ {
+  "op": "supersede",
+  "old": "4",
+  "new": "3"
+ },
+ {
+  "op": "supersede",
+  "old": "3",
+  "new": "4"
+ },
+ {
+  "op": "restore_upgrade"
+ }
+]

@@ -1,0 +1,7 @@
+[
+ {"op": "start", "version": "0.20.0"},
+ {"op": "assert", "author": "fz_author_b", "k": "1", "proof": "true", "expired": false},
+ {"op": "drop_role"},
+ {"op": "steward", "on": true},
+ {"op": "conc_refute_adopt", "k": "1"}
+]

@@ -1,0 +1,1 @@
+[{"op":"start","version":"0.20.0"},{"op":"assert","author":"fz_author","k":"1","proof":"ok","expired":false},{"op":"verify","role":"fz_owner"},{"op":"conc_refute_old_txn","k":"1"}]

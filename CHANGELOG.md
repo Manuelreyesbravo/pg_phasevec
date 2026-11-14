@@ -4,6 +4,11 @@ All dates are of the commit that set the version. 0.19.0 and 0.20.0 were never t
 changed ships in 0.20.0. The review-by-review account, with the test that plays each finding, is
 in [doc/review-history.md](doc/review-history.md).
 
+## Unreleased
+
+* `fuzz/`: the model-based fuzzer of the claim lifecycle, with its spec, threat model and the
+  replays of the findings it was used on; run against 0.20.0 (fdd19cb). No code change.
+
 ## 0.20.0 -- unreleased (preview)
 
 A rewrite of the truth layer and of the update procedure, after twenty-eight internal reviews and

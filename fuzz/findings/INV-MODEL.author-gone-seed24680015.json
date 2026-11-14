@@ -1,0 +1,20 @@
+[
+ {
+  "op": "start",
+  "version": "0.20.0"
+ },
+ {
+  "op": "assert",
+  "author": "fz_author_b",
+  "k": "4",
+  "proof": "false",
+  "expired": false
+ },
+ {
+  "op": "verify",
+  "role": "fz_author_b"
+ },
+ {
+  "op": "drop_role"
+ }
+]

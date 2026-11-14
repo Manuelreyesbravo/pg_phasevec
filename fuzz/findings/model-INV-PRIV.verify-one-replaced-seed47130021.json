@@ -1,0 +1,27 @@
+[
+ {
+  "op": "start",
+  "version": "0.19.0"
+ },
+ {
+  "op": "upgrade"
+ },
+ {
+  "op": "assert",
+  "author": "fz_author",
+  "k": "2",
+  "proof": "false",
+  "expired": false
+ },
+ {
+  "op": "supersede",
+  "old": "2",
+  "new": "4"
+ },
+ {
+  "op": "unauthorized",
+  "role": "fz_author_b",
+  "what": "verify_one_other",
+  "k": "2"
+ }
+]

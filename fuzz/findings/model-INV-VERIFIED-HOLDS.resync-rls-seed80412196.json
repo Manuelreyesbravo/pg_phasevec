@@ -1,0 +1,23 @@
+[
+ {
+  "op": "start",
+  "version": "0.20.0"
+ },
+ {
+  "op": "assert",
+  "author": "fz_author_b",
+  "k": "1",
+  "proof": "ok",
+  "expired": false
+ },
+ {
+  "op": "conc_edit_verify",
+  "k": "3",
+  "a": "nope",
+  "b": "ok two"
+ },
+ {
+  "op": "rls",
+  "on": true
+ }
+]

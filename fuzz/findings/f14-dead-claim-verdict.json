@@ -1,0 +1,14 @@
+[
+ {"op": "start", "version": "0.20.0"},
+ {"op": "supersede", "old": "1", "new": "2"},
+ {"op": "assert", "author": "fz_author", "k": "3", "proof": "true", "expired": true},
+ {"op": "reinsert", "k": "1", "text": "ok one", "tenant": "b", "txn": false},
+ {"op": "reinsert", "k": "3", "text": "ok two", "tenant": "b", "txn": true},
+ {"op": "refute", "k": "4"},
+ {"op": "rebind", "all": false},
+ {"op": "supersede", "old": "1", "new": "2"},
+ {"op": "unsupersede", "k": "3"},
+ {"op": "steward", "on": true},
+ {"op": "refute", "k": "4"},
+ {"op": "adopt"}
+]

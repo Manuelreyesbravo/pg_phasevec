@@ -1,0 +1,27 @@
+[
+ {
+  "op": "start",
+  "version": "0.19.0"
+ },
+ {
+  "op": "refute",
+  "k": "4"
+ },
+ {
+  "op": "write",
+  "sub": "delete",
+  "k": "4",
+  "text": "ok two",
+  "tenant": "b"
+ },
+ {
+  "op": "upgrade"
+ },
+ {
+  "op": "write",
+  "sub": "insert",
+  "k": "4",
+  "text": "ok one",
+  "tenant": "a"
+ }
+]

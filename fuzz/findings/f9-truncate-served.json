@@ -1,0 +1,7 @@
+[
+ {"op": "start", "version": "0.20.0"},
+ {"op": "assert", "author": "fz_author", "k": "1", "proof": "true", "expired": false},
+ {"op": "verify", "role": "fz_owner"},
+ {"op": "truncate"},
+ {"op": "write", "sub": "insert", "k": "1", "text": "nope", "tenant": "a"}
+]

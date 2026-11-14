@@ -1,0 +1,1 @@
+[{"op":"start","version":"0.20.0"},{"op":"assert","author":"fz_author","k":"1","proof":"ok","expired":false},{"op":"supersede","old":"1","new":"2"},{"op":"refute","k":"1"},{"op":"unsupersede","k":"1"},{"op":"verify","role":"fz_author"}]

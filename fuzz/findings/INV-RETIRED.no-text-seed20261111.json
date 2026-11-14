@@ -1,0 +1,39 @@
+[
+ {
+  "op": "start",
+  "version": "0.20.0"
+ },
+ {
+  "op": "write",
+  "sub": "delete",
+  "k": "2",
+  "text": "nope",
+  "tenant": "a"
+ },
+ {
+  "op": "write",
+  "sub": "insert",
+  "k": "5",
+  "text": "ok one",
+  "tenant": "a"
+ },
+ {
+  "op": "verify_one",
+  "role": "fz_owner",
+  "k": "4"
+ },
+ {
+  "op": "adopt"
+ },
+ {
+  "op": "assert",
+  "author": "fz_author",
+  "k": "5",
+  "proof": "none",
+  "expired": false
+ },
+ {
+  "op": "refute",
+  "k": "5"
+ }
+]

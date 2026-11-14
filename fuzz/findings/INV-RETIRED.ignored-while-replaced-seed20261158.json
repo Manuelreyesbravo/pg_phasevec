@@ -1,0 +1,19 @@
+[
+ {
+  "op": "start",
+  "version": "0.20.0"
+ },
+ {
+  "op": "supersede",
+  "old": "2",
+  "new": "3"
+ },
+ {
+  "op": "refute",
+  "k": "2"
+ },
+ {
+  "op": "unsupersede",
+  "k": "2"
+ }
+]

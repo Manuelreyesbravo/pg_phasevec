@@ -1,0 +1,27 @@
+[
+ {
+  "op": "start",
+  "version": "0.20.0"
+ },
+ {
+  "op": "assert",
+  "author": "fz_author_b",
+  "k": "4",
+  "proof": "ok",
+  "expired": false
+ },
+ {
+  "op": "drop_role"
+ },
+ {
+  "op": "conc_assert_assert",
+  "k": "4",
+  "p1": "true",
+  "p2": "true",
+  "verify": false
+ },
+ {
+  "op": "verify",
+  "role": "fz_owner"
+ }
+]

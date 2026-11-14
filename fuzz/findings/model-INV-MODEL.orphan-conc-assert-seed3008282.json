@@ -1,0 +1,27 @@
+[
+ {
+  "op": "start",
+  "version": "0.19.0"
+ },
+ {
+  "op": "restore_upgrade"
+ },
+ {
+  "op": "assert",
+  "author": "fz_author_b",
+  "k": "1",
+  "proof": "ok",
+  "expired": true
+ },
+ {
+  "op": "rebind",
+  "all": true
+ },
+ {
+  "op": "conc_assert_assert",
+  "k": "1",
+  "p1": "true",
+  "p2": "ok",
+  "verify": false
+ }
+]

@@ -1,0 +1,54 @@
+[
+ {
+  "op": "start",
+  "version": "0.20.0"
+ },
+ {
+  "op": "conc_refute_old_txn",
+  "k": "5"
+ },
+ {
+  "op": "rls",
+  "on": false
+ },
+ {
+  "op": "write",
+  "sub": "update",
+  "k": "5",
+  "text": "ok two",
+  "tenant": "a"
+ },
+ {
+  "op": "verify_one",
+  "role": "fz_author_b",
+  "k": "1"
+ },
+ {
+  "op": "conc_assert_verify",
+  "k": "3",
+  "author": "fz_author",
+  "proof": "false"
+ },
+ {
+  "op": "rls",
+  "on": true
+ },
+ {
+  "op": "assert",
+  "author": "fz_author_b",
+  "k": "3",
+  "proof": "ok",
+  "expired": false
+ },
+ {
+  "op": "verify",
+  "role": "fz_author_b"
+ },
+ {
+  "op": "write",
+  "sub": "tenant",
+  "k": "3",
+  "text": "ok one",
+  "tenant": "a"
+ }
+]

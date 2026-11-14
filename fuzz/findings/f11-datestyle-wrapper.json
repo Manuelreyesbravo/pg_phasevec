@@ -1,0 +1,12 @@
+[
+ {"op": "start", "version": "0.20.0"},
+ {"op": "env_assert", "via": "wrapper", "author": "fz_author", "caller": "fz_reader", "k": "1",
+  "proof": "ds", "sp": "fz_s2, public", "ds": "SQL, DMY", "vrole": "fz_owner", "vsp": "fz_s1, public",
+  "vds": "German"},
+ {"op": "env_assert", "via": "wrapper_local", "author": "fz_author", "caller": "fz_author_b", "k": "2",
+  "proof": "ds", "sp": null, "ds": "German", "vrole": "fz_author", "vsp": null, "vds": "SQL, DMY"},
+ {"op": "env_assert", "via": "wrapper", "author": "fz_author", "caller": "fz_author", "k": "3",
+  "proof": "ds", "sp": null, "ds": "SQL, DMY", "vrole": "fz_owner", "vsp": null, "vds": null},
+ {"op": "env_assert", "via": "wrapper", "author": "fz_author", "caller": "fz_reader", "k": "4",
+  "proof": "sp", "sp": "fz_s2, public", "ds": null, "vrole": "fz_owner", "vsp": "fz_s2, public", "vds": null}
+]

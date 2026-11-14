@@ -1,0 +1,7 @@
+[
+ {"op": "start", "version": "0.19.0"},
+ {"op": "v19_assert", "k": "1", "proof": "true"},
+ {"op": "upgrade"},
+ {"op": "steward", "on": true},
+ {"op": "conc_refute_adopt", "k": "1"}
+]
